@@ -7,7 +7,10 @@ empty scenario) by both runners.  The traces must be byte-identical.
 
     python3 tests/conformance.py [--no-asan] [-v] [PATTERN...]
 
-By default the ASan/UBSan build (c/fsrun-asan) is checked as well.
+By default the ASan/UBSan build (c/fsrun-asan) is checked as well, plus the
+reduced builds (FS_NO_FLOAT / FS_NO_TIME / FS_NO_STR, see c/Makefile): a program
+runs on each one whose left-out features it does not need (identical trace) and
+must be refused at load by the others.
 Exit status is non-zero on any mismatch.
 """
 
@@ -17,7 +20,11 @@ import glob
 import os
 import subprocess
 import sys
+import struct
 import tempfile
+
+# reduced runner -> feature flags (bytecode.FLAG_*) it leaves out
+VARIANTS = {"fsrun-nofloat": 2, "fsrun-notime-nostr": 4 | 8, "fsrun-min": 2 | 4 | 8}
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CDIR = os.path.join(ROOT, "c")
@@ -52,7 +59,8 @@ def main():
     runners = [os.path.join(CDIR, "fsrun")]
     if not args.no_asan:
         runners.append(os.path.join(CDIR, "fsrun-asan"))
-    build([os.path.basename(r) for r in runners])
+    variants = [] if args.no_asan else list(VARIANTS)
+    build([os.path.basename(r) for r in runners] + variants)
 
     passed, failed = [], []
     with tempfile.TemporaryDirectory() as tmp:
@@ -79,6 +87,22 @@ def main():
                         pout.splitlines(True), cout.splitlines(True), "python", tag, n=2))
                     if cerr:
                         print(cerr)
+            with open(fsb, "rb") as f:
+                (flags,) = struct.unpack_from("<H", f.read(8), 6)
+            for var in variants:
+                crc, cout, cerr = run([os.path.join(CDIR, var), fsb] + extra)
+                if flags & VARIANTS[var]:
+                    if crc == 0 or "needs a feature" not in cerr:
+                        ok = False
+                        print("FAIL %s [%s]: should be refused (flags %#x), rc=%d %s"
+                              % (name, var, flags, crc, cerr.strip()))
+                elif cout != pout or (prc == 0) != (crc == 0):
+                    ok = False
+                    print("FAIL %s [%s] (python rc=%d, c rc=%d)" % (name, var, prc, crc))
+                    sys.stdout.writelines(difflib.unified_diff(
+                        pout.splitlines(True), cout.splitlines(True), "python", var, n=2))
+                    if cerr:
+                        print(cerr)
             if prc != 0:
                 print("note %s: python runner exited with %d: %s" % (name, prc, perr.strip().splitlines()[-1:]))
             if ok:
@@ -90,7 +114,7 @@ def main():
 
     print("conformance: %d passed, %d failed (%d programs, runners: %s)"
           % (len(passed), len(failed), len(passed) + len(failed),
-             ", ".join(os.path.basename(r) for r in runners)))
+             ", ".join([os.path.basename(r) for r in runners] + variants)))
     return 1 if failed else 0
 
 

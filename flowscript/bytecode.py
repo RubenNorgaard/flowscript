@@ -10,6 +10,13 @@ from .values import pack_value, unpack_value, TYPE_NAMES, NONE_TYPE, show, BUILT
 MAGIC = b"FSB1"
 FORMAT_VERSION = 2
 FLAG_DEBUG = 1
+# Features the program needs from the VM.  A C VM built without one (FS_NO_FLOAT,
+# FS_NO_TIME, FS_NO_STR) refuses images that set its flag.
+FLAG_FLOAT = 2       # float values
+FLAG_TIME = 4        # time values
+FLAG_STR = 8         # strings made at run time (string slots); literals need no flag
+FEATURES = [(FLAG_FLOAT, "float", "FS_NO_FLOAT"), (FLAG_TIME, "time", "FS_NO_TIME"),
+            (FLAG_STR, "run-time strings", "FS_NO_STR")]
 NONE16 = 0xFFFF
 
 EV_BOOT, EV_ENTER, EV_EXIT = 0, 1, 2
@@ -130,7 +137,7 @@ class Program:
             b = s.encode("utf-8", "surrogateescape")
             strs += struct.pack("<H", len(b)) + b + b"\x00"
         header = MAGIC + struct.pack(
-            "<HHHHHHHHHHHHI", FORMAT_VERSION, FLAG_DEBUG if debug else 0, name_idx,
+            "<HHHHHHHHHHHHI", FORMAT_VERSION, (FLAG_DEBUG if debug else 0) | features(self), name_idx,
             self.version & 0xFFFF, len(strings), len(self.globals), len(self.externs),
             len(self.events), len(self.states), len(self.timers), len(self.funcs),
             len(self.handlers), len(self.code))
@@ -201,6 +208,45 @@ class Program:
         p.name = None if name_idx == NONE16 else p.strings[name_idx]
         p.version = pver
         return p
+
+
+def features(prog):
+    """FLAG_FLOAT | FLAG_TIME | FLAG_STR bits for what `prog` can ever produce.
+
+    Every value of those kinds starts at a typed declaration (global, extern, event),
+    a typed constant push, CONCAT or a built-in, so scanning them is exact.
+    """
+    from .values import FLOAT, TIME, STR, type_of
+    need = set()
+    for v in prog.globals:
+        need.add(type_of(v))
+    for _n, _a, ts, r in prog.externs:
+        need.update(ts)
+        if r == STR:
+            need.add("str-result")
+        need.add(r)
+    for _n, _a, ts in prog.events:
+        need.update(ts)
+        if STR in ts:
+            need.add("str-result")          # the host's strings are copied into slots
+    pc = 0
+    while pc < len(prog.code):
+        name, val, size = decode(prog.code, pc)
+        if name == "PUSHF":
+            need.add(FLOAT)
+        elif name == "PUSHT":
+            need.add(TIME)
+        elif name == "CONCAT":
+            need.add("str-result")
+        elif name == "BUILTIN" and 0 <= val < len(BUILTINS):
+            _bn, ps, r = BUILTINS[val]
+            need.update(ps)
+            need.add(r)
+            if r == STR:
+                need.add("str-result")
+        pc += size
+    return ((FLAG_FLOAT if FLOAT in need else 0) | (FLAG_TIME if TIME in need else 0) |
+            (FLAG_STR if "str-result" in need else 0))
 
 
 def decode(code, pc):

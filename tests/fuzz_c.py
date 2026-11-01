@@ -62,9 +62,13 @@ def main():
     ap.add_argument("-n", "--iterations", type=int, default=3000)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--timeout", type=float, default=5.0)
+    ap.add_argument("--runner", default="fsrun-asan",
+                    help="sanitized build in c/ to attack, e.g. fsrun-min (feature switches)")
     args = ap.parse_args()
 
-    if subprocess.run(["make", "-s", "-C", CDIR, "fsrun-asan"]).returncode != 0:
+    global FSRUN
+    FSRUN = os.path.join(CDIR, args.runner)
+    if subprocess.run(["make", "-s", "-C", CDIR, args.runner]).returncode != 0:
         sys.exit("fuzz: build failed")
     rng = random.Random(args.seed)
     stats = {"ok": 0, "rejected": 0, "timeout": 0, "crash": 0}

@@ -5,7 +5,9 @@
  */
 #include "flowscript.h"
 
+#if FS_HAS_FLOAT
 #include <math.h>
+#endif
 #include <string.h>
 
 /* ---- opcodes (flowscript/bytecode.py) -------------------------------------- */
@@ -52,30 +54,38 @@ static int32_t s32(uint32_t u)
     return (int32_t)u;
 }
 
+#if FS_HAS_TIME
 static int64_t s64(uint64_t u)
 {
     if (u & 0x8000000000000000u)
         return -(int64_t)(~u) - 1;
     return (int64_t)u;
 }
+#endif
 
+#if FS_HAS_FLOAT
 static double f64(uint64_t u)
 {
     double d;
     memcpy(&d, &u, sizeof(d));
     return d;
 }
+#endif
 
 #define EMPTY_STR INT32_MIN     /* fs_value.as.s of the empty string constant */
 
-static fs_value v_str(int32_t ref) { fs_value v; v.type = FS_STR; v.as.t = 0; v.as.s = ref; return v; }
+static fs_value v_str(int32_t ref) { fs_value v = fs_int(0); v.type = FS_STR; v.as.s = ref; return v; }
 
 static fs_value zero_of(int type)
 {
     switch (type) {
+#if FS_HAS_FLOAT
     case FS_FLOAT: return fs_float(0.0);
+#endif
     case FS_STR:   return v_str(EMPTY_STR);
+#if FS_HAS_TIME
     case FS_TIME:  return fs_time(0);
+#endif
     default:       return fs_int(0);
     }
 }
@@ -84,6 +94,7 @@ static fs_value zero_of(int type)
 static int ptype(uint32_t packed, int i) { return (int)((packed >> (2 * i)) & 3u); }
 
 /* ---- value rules (flowscript/values.py: same arithmetic, same text) ----------- */
+#if FS_HAS_FLOAT
 static const double P10[23] = {
     1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
     1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
@@ -127,12 +138,20 @@ static int64_t digits15(double a, int d)
     return (int64_t)(m + 0.5);
 }
 
+#endif /* FS_HAS_FLOAT */
+
 /* Python str(int) */
 static int fmt_i64(int64_t v, char *out)
 {
     char tmp[24];
     int n = 0, len = 0;
+#if FS_HAS_TIME || FS_HAS_FLOAT
+    /* times, and the 15-digit mantissas of fmt_float */
     uint64_t u = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+#else
+    /* only int32 values: 32-bit division, no 64-bit runtime helper */
+    uint32_t u = v < 0 ? 0u - (uint32_t)v : (uint32_t)v;
+#endif
     do {
         tmp[n++] = (char)('0' + (int)(u % 10u));
         u /= 10u;
@@ -145,6 +164,7 @@ static int fmt_i64(int64_t v, char *out)
     return len;
 }
 
+#if FS_HAS_FLOAT
 /* values.fmt_float; out needs 32 bytes */
 static int fmt_float(double x, char *out)
 {
@@ -298,6 +318,8 @@ int fs_parse_float(const char *s, size_t n, double *out)
     return 0;
 }
 
+#endif /* FS_HAS_FLOAT */
+
 /* values.parse_int: [+-]digits within int32 */
 static int parse_i32(const char *s, size_t n, int32_t *out)
 {
@@ -323,6 +345,7 @@ static int parse_i32(const char *s, size_t n, int32_t *out)
     return 0;
 }
 
+#if FS_HAS_TIME
 #define DAY_MS 86400000LL
 
 static int64_t floor_div(int64_t a, int64_t b)
@@ -492,6 +515,9 @@ int fs_parse_time(const char *s, size_t n, int64_t *out)
     return 0;
 }
 
+#endif /* FS_HAS_TIME */
+
+#if FS_HAS_FLOAT
 /* values.fround: half away from zero, exactly */
 static double fround(double x)
 {
@@ -515,6 +541,7 @@ static double fdiv(double a, double b)
     }
     return a / b;
 }
+#endif /* FS_HAS_FLOAT */
 
 /* Text of a string in traces: values.quote */
 static int quote(const char *b, int n, char *out, int size)
@@ -540,6 +567,23 @@ static int quote(const char *b, int n, char *out, int size)
 }
 
 /* ---- image validation -------------------------------------------------------- */
+/* Is values of type t supported by this build?  (FS_NO_STR keeps str literals.) */
+static int type_built(int t)
+{
+    return (t != FS_FLOAT || FS_HAS_FLOAT) && (t != FS_TIME || FS_HAS_TIME);
+}
+
+/* The n packed parameter types are all built.  host_str: the values come from
+ * the host (event arguments), so a str would be copied into a string slot. */
+static int types_built(uint32_t packed, int n, int host_str)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (!type_built(ptype(packed, i)) || (host_str && ptype(packed, i) == FS_STR && !FS_HAS_STR))
+            return 0;
+    return 1;
+}
+
 /* Reserve `n` bytes at *off; returns pointer or NULL if out of bounds. */
 static const uint8_t *take(const uint8_t *img, size_t len, size_t *off, size_t n)
 {
@@ -556,7 +600,9 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     fs_emit_fn on_emit;
     fs_fault_fn on_fault;
     fs_timer_fn on_timer;
+#if FS_HAS_TIME
     fs_clock_fn clock;
+#endif
     void *user;
     size_t off, n;
     uint16_t ns, flags;
@@ -568,13 +614,17 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     on_emit = vm->on_emit;
     on_fault = vm->on_fault;
     on_timer = vm->on_timer;
+#if FS_HAS_TIME
     clock = vm->clock;
+#endif
     user = vm->user;
     memset(vm, 0, sizeof(*vm));
     vm->on_emit = on_emit;
     vm->on_fault = on_fault;
     vm->on_timer = on_timer;
+#if FS_HAS_TIME
     vm->clock = clock;
+#endif
     vm->user = user;
     vm->handler = -1;
     vm->state = vm->pending = vm->transition = -1;
@@ -588,6 +638,9 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     if (rd16(img + 4) != 2)
         return FS_ERR_VERSION;
     flags = rd16(img + 6);
+    if (((flags & 2u) && !FS_HAS_FLOAT) || ((flags & 4u) && !FS_HAS_TIME) ||
+        ((flags & 8u) && !FS_HAS_STR))
+        return FS_ERR_FEATURE;
     vm->prog_name = rd16(img + 8);
     vm->prog_version = rd16(img + 10);
     ns = vm->n_strings = rd16(img + 12);
@@ -649,6 +702,8 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
         const uint8_t *g = vm->globals_init + 9 * i;
         if (g[0] > FS_TIME)
             return FS_ERR_INDEX;
+        if (!type_built(g[0]))
+            return FS_ERR_FEATURE;
         if (g[0] == FS_STR && rd64(g + 1) >= ns)
             return FS_ERR_INDEX;
     }
@@ -657,12 +712,18 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
             return FS_ERR_INDEX;
         if (vm->externs_tab[8 * i + 2] > 16 || vm->externs_tab[8 * i + 3] > FS_NONE_TYPE)
             return FS_ERR_LIMIT;
+        if (!types_built(rd32(vm->externs_tab + 8 * i + 4), vm->externs_tab[8 * i + 2], 0) ||
+            (vm->externs_tab[8 * i + 3] != FS_NONE_TYPE && !type_built(vm->externs_tab[8 * i + 3])) ||
+            (vm->externs_tab[8 * i + 3] == FS_STR && !FS_HAS_STR))
+            return FS_ERR_FEATURE;
     }
     for (i = 0; i < vm->n_events; i++) {
         if (rd16(vm->events_tab + 6 * i) >= ns)
             return FS_ERR_INDEX;
         if (vm->events_tab[6 * i + 2] > FS_MAX_EVENT_ARGS)
             return FS_ERR_LIMIT;
+        if (!types_built(rd16(vm->events_tab + 6 * i + 4), vm->events_tab[6 * i + 2], 1))
+            return FS_ERR_FEATURE;
     }
     for (i = 0; i < vm->n_states; i++)
         if (rd16(vm->states_tab + 2 * i) >= ns)
@@ -706,13 +767,19 @@ void fs_reset(fs_vm *vm)
         const uint8_t *g = vm->globals_init + 9 * i;
         uint64_t u = rd64(g + 1);
         switch (g[0]) {
-        case FS_INT:   vm->globals[i] = fs_int(s32((uint32_t)u)); break;
+#if FS_HAS_FLOAT
         case FS_FLOAT: vm->globals[i] = fs_float(f64(u)); break;
+#endif
         case FS_STR:   vm->globals[i] = v_str((int32_t)u); break;
-        default:       vm->globals[i] = fs_time(s64(u)); break;
+#if FS_HAS_TIME
+        case FS_TIME:  vm->globals[i] = fs_time(s64(u)); break;
+#endif
+        default:       vm->globals[i] = fs_int(s32((uint32_t)u)); break;   /* fs_load checked the type */
         }
     }
+#if FS_HAS_STR
     memset(vm->strs, 0, sizeof(vm->strs));
+#endif
     vm->sp = 0;
     vm->nframes = 0;
     vm->pc = 0;
@@ -935,7 +1002,11 @@ static int str_valid(const fs_vm *vm, int32_t ref)
         return 1;
     if (ref >= 0)
         return ref < vm->n_strings;
+#if FS_HAS_STR
     return -1 - ref < FS_STR_SLOTS && vm->strs[-1 - ref].used;
+#else
+    return 0;
+#endif
 }
 
 const char *fs_str(const fs_vm *vm, fs_value v, uint16_t *len_out)
@@ -949,18 +1020,29 @@ const char *fs_str(const fs_vm *vm, fs_value v, uint16_t *len_out)
     }
     if (v.as.s >= 0)
         return fs_string(vm, v.as.s, len_out);
+#if FS_HAS_STR
     if (len_out)
         *len_out = vm->strs[-1 - v.as.s].len;
     return vm->strs[-1 - v.as.s].data;
+#else
+    return NULL;                          /* str_valid() already refused it */
+#endif
 }
 
 int fs_strings_in_use(const fs_vm *vm)
 {
-    int i, n = 0;
+    int n = 0;
+#if FS_HAS_STR
+    int i;
     for (i = 0; vm && i < FS_STR_SLOTS; i++)
         n += vm->strs[i].used;
+#else
+    (void)vm;
+#endif
     return n;
 }
+
+#if FS_HAS_STR
 
 static void mark(fs_vm *vm, const fs_value *v)
 {
@@ -1013,16 +1095,21 @@ static int alloc_str(fs_vm *vm, const char *p, size_t n, fs_value *out)
     }
     return FS_FAULT_NO_STRINGS;
 }
+#endif /* FS_HAS_STR */
 
 /* A value from the host as type t (vm.py host_value).  Returns 0 or a fault code. */
 static int host_value(fs_vm *vm, fs_value v, int t, fs_value *out)
 {
+#if FS_HAS_FLOAT
     if (t == FS_FLOAT && v.type == FS_INT) {
         *out = fs_float((double)v.as.i);
         return 0;
     }
+#endif
+#if FS_HAS_STR
     if (t == FS_STR && v.type == FS_CSTR)
         return alloc_str(vm, v.as.c, strlen(v.as.c), out);
+#endif
     if (v.type != t)
         return FS_FAULT_TYPE;
     if (t == FS_STR && !str_valid(vm, v.as.s))
@@ -1039,15 +1126,21 @@ int fs_format(const fs_vm *vm, fs_value v, char *buf, int size)
         return 0;
     switch (v.type) {
     case FS_INT:   n = fmt_i64(v.as.i, tmp); break;
+#if FS_HAS_FLOAT
     case FS_FLOAT: n = fmt_float(v.as.f, tmp); break;
+#endif
+#if FS_HAS_TIME
     case FS_TIME:  n = fmt_time(v.as.t, tmp); break;
+#endif
     case FS_STR: {
         uint16_t len = 0;
         const char *p = fs_str(vm, v, &len);
         return quote(p ? p : "", p ? len : 0, buf, size);
     }
+#if FS_HAS_STR
     case FS_CSTR:
         return quote(v.as.c, (int)strlen(v.as.c), buf, size);
+#endif
     default:
         n = 0;
         tmp[0] = 0;
@@ -1103,8 +1196,13 @@ int fs_post(fs_vm *vm, int event, const fs_value *args, int argc)
 
 void fs_set_clock(fs_vm *vm, fs_clock_fn fn)
 {
+#if FS_HAS_TIME
     if (vm)
         vm->clock = fn;
+#else
+    (void)vm;
+    (void)fn;
+#endif
 }
 
 #define FS_REM_LIMIT ((int64_t)1 << 62)   /* keeps int64 math free of overflow */
@@ -1324,6 +1422,8 @@ static const char *sbytes(const fs_vm *vm, fs_value v, int *len)
 static int binop(fs_vm *vm, uint8_t op, fs_value a, fs_value b, fs_value *r)
 {
     int cmp = op >= OP_EQ && op <= OP_GE;
+    if (op == OP_CONCAT && !FS_HAS_STR)
+        return FS_FAULT_BAD_OPCODE;      /* left out of this build (FS_NO_STR) */
     if (op == OP_CONCAT && !(a.type == FS_STR && b.type == FS_STR))
         return FS_FAULT_TYPE;            /* strings are joined by CONCAT, numbers by ADD */
     if (a.type == FS_INT && b.type == FS_INT) {
@@ -1363,6 +1463,7 @@ static int binop(fs_vm *vm, uint8_t op, fs_value a, fs_value b, fs_value *r)
         *r = fs_int(v);
         return 0;
     }
+#if FS_HAS_FLOAT
     if (a.type == FS_FLOAT && b.type == FS_FLOAT) {
         double x = a.as.f, y = b.as.f;
         switch (op) {
@@ -1380,10 +1481,13 @@ static int binop(fs_vm *vm, uint8_t op, fs_value a, fs_value b, fs_value *r)
         default: return FS_FAULT_TYPE;
         }
     }
+#endif
     if (a.type == FS_STR && b.type == FS_STR && (op == OP_CONCAT || cmp)) {
-        int la, lb, c, err;
+        int la, lb, c;
         const char *pa = sbytes(vm, a, &la), *pb = sbytes(vm, b, &lb);
+#if FS_HAS_STR
         if (op == OP_CONCAT) {
+            int err;
             fs_value s;
             if (la + lb > FS_STR_LEN)
                 return FS_FAULT_STR_LONG;
@@ -1395,6 +1499,7 @@ static int binop(fs_vm *vm, uint8_t op, fs_value a, fs_value b, fs_value *r)
             *r = s;
             return 0;
         }
+#endif
         c = memcmp(pa, pb, (size_t)(la < lb ? la : lb));
         if (c == 0)
             c = la - lb;
@@ -1408,6 +1513,7 @@ static int binop(fs_vm *vm, uint8_t op, fs_value a, fs_value b, fs_value *r)
         }
         return 0;
     }
+#if FS_HAS_TIME
     if (a.type == FS_TIME && b.type == FS_INT && (op == OP_ADD || op == OP_SUB)) {
         uint64_t t = (uint64_t)a.as.t, d = (uint64_t)(int64_t)b.as.i;
         *r = fs_time(s64(op == OP_ADD ? t + d : t - d));
@@ -1434,6 +1540,7 @@ static int binop(fs_vm *vm, uint8_t op, fs_value a, fs_value b, fs_value *r)
         }
         return 0;
     }
+#endif
     return FS_FAULT_TYPE;
 }
 
@@ -1456,17 +1563,25 @@ static uint32_t builtin_types(unsigned id, int *argc)
     return t;
 }
 
+#if FS_HAS_STR
 static int new_text(fs_vm *vm, const char *p, int n, fs_value *r)
 {
     return alloc_str(vm, p, (size_t)n, r);
 }
+#endif
 
 /* values.call_builtin; a = arguments (still on the stack). */
+/* Built-ins that need a left-out feature are not compiled in: they fall to
+ * `default` and fault like an unknown id (fs_load already refuses images
+ * whose feature flags ask for them). */
 static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
 {
+#if FS_HAS_STR
     char tmp[48];
+#endif
     int n;
     switch (id) {
+#if FS_HAS_FLOAT
     case 0: *r = fs_float((double)a[0].as.i); return 0;
     case 1: {
         double f;
@@ -1476,7 +1591,9 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
         *r = fs_float(f);
         return 0;
     }
+#if FS_HAS_TIME
     case 2: *r = fs_float((double)a[0].as.t / 1000.0); return 0;
+#endif
     case 3: {
         double x = a[0].as.f;
         if (x != x || x >= 2147483648.0 || x <= -2147483649.0)
@@ -1484,6 +1601,7 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
         *r = fs_int((int32_t)x);
         return 0;
     }
+#endif /* FS_HAS_FLOAT */
     case 4: {
         int32_t v;
         const char *p = sbytes(vm, a[0], &n);
@@ -1492,9 +1610,16 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
         *r = fs_int(v);
         return 0;
     }
+#if FS_HAS_STR
     case 5: n = fmt_i64(a[0].as.i, tmp); return new_text(vm, tmp, n, r);
+#if FS_HAS_FLOAT
     case 6: n = fmt_float(a[0].as.f, tmp); return new_text(vm, tmp, n, r);
+#endif
+#if FS_HAS_TIME
     case 7: n = fmt_time(a[0].as.t, tmp); return new_text(vm, tmp, n, r);
+#endif
+#endif /* FS_HAS_STR */
+#if FS_HAS_TIME
     case 8: {
         int64_t t;
         const char *p = sbytes(vm, a[0], &n);
@@ -1519,7 +1644,9 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
         *r = fs_int(s32((uint32_t)(uint64_t)f[id - 13]));
         return 0;
     }
+#endif /* FS_HAS_TIME */
     case 21: sbytes(vm, a[0], &n); *r = fs_int(n); return 0;
+#if FS_HAS_STR
     case 22: {
         int32_t start = a[1].as.i, count = a[2].as.i, end;
         const char *p = sbytes(vm, a[0], &n);
@@ -1536,6 +1663,7 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
         memcpy(vm->strs[-1 - r->as.s].data, p + start, (size_t)(end - start));
         return 0;
     }
+#endif
     case 23: {
         int lb, i, found = -1;
         const char *p = sbytes(vm, a[0], &n), *q = sbytes(vm, a[1], &lb);
@@ -1549,9 +1677,12 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
         return 0;
     }
     case 24: *r = fs_int(s32(a[0].as.i < 0 ? 0u - (uint32_t)a[0].as.i : (uint32_t)a[0].as.i)); return 0;
+#if FS_HAS_FLOAT
     case 25: *r = fs_float(fabs(a[0].as.f)); return 0;
+#endif
     case 26: *r = fs_int(a[1].as.i < a[0].as.i ? a[1].as.i : a[0].as.i); return 0;
     case 27: *r = fs_int(a[1].as.i > a[0].as.i ? a[1].as.i : a[0].as.i); return 0;
+#if FS_HAS_FLOAT
     case 28: *r = fs_float(a[1].as.f < a[0].as.f ? a[1].as.f : a[0].as.f); return 0;
     case 29: *r = fs_float(a[1].as.f > a[0].as.f ? a[1].as.f : a[0].as.f); return 0;
     case 30: *r = fs_float(floor(a[0].as.f)); return 0;
@@ -1561,6 +1692,7 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
     case 34: *r = fs_float(exp(a[0].as.f)); return 0;
     case 35: *r = fs_float(log(a[0].as.f)); return 0;
     case 36: *r = fs_float(pow(a[0].as.f, a[1].as.f)); return 0;
+#endif
     default: return FS_FAULT_BAD_OPCODE;
     }
 }
@@ -1634,11 +1766,19 @@ static int execute(fs_vm *vm)
         PUSH(fs_int(arg < 0x80 ? (int32_t)arg : (int32_t)arg - 256));
         break;
     case OP_PUSHF:
+#if FS_HAS_FLOAT
         PUSH(fs_float(f64(rd64(code + pc + 1))));
         break;
+#else
+        FAULT(FS_FAULT_BAD_OPCODE);
+#endif
     case OP_PUSHT:
+#if FS_HAS_TIME
         PUSH(fs_time(s64(rd64(code + pc + 1))));
         break;
+#else
+        FAULT(FS_FAULT_BAD_OPCODE);
+#endif
     case OP_PUSHS:
         if (arg >= vm->n_strings)
             FAULT(FS_FAULT_BAD_OPCODE);
@@ -1696,8 +1836,10 @@ static int execute(fs_vm *vm)
         POP(v);
         if (v.type == FS_INT)
             PUSH(fs_int(s32(0u - (uint32_t)v.as.i)));
+#if FS_HAS_FLOAT
         else if (v.type == FS_FLOAT)
             PUSH(fs_float(-v.as.f));
+#endif
         else
             FAULT(FS_FAULT_TYPE);
         break;

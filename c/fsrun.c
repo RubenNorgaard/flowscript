@@ -163,7 +163,14 @@ static fs_value stub(fs_vm *v, const fs_value *args, int argc, void *user)
         return fs_int(0);
     }
     if (!stub_set[idx])
-        r = ret == FS_STR ? fs_empty_str() : ret == FS_FLOAT ? fs_float(0.0) : ret == FS_TIME ? fs_time(0) : fs_int(0);
+        r = ret == FS_STR ? fs_empty_str() :
+#if FS_HAS_FLOAT
+            ret == FS_FLOAT ? fs_float(0.0) :
+#endif
+#if FS_HAS_TIME
+            ret == FS_TIME ? fs_time(0) :
+#endif
+            fs_int(0);
     else
         r = stub_value[idx];
     printf(") -> ");
@@ -239,6 +246,7 @@ static int is_nl(int c)
     return c == '\n' || c == '\r' || c == '\v' || c == '\f' || (c >= 0x1c && c <= 0x1e);
 }
 
+#if FS_HAS_STR
 static int hexval(int c)
 {
     if (c >= '0' && c <= '9') return c - '0';
@@ -284,6 +292,7 @@ static int unquote(const char *text, char *out, int size)
     out[len] = 0;
     return len;
 }
+#endif
 
 /* values.parse_literal: the text of a value of type t.  Strings go to buf. */
 static fs_value parse_value(int t, const char *text, char *buf, int size)
@@ -291,12 +300,15 @@ static fs_value parse_value(int t, const char *text, char *buf, int size)
     switch (t) {
     case FS_INT:
         return fs_int(parse_wrapped(text));
+#if FS_HAS_FLOAT
     case FS_FLOAT: {
         double f;
         if (fs_parse_float(text, strlen(text), &f))
             die("not a float", text);
         return fs_float(f);
     }
+#endif
+#if FS_HAS_STR
     case FS_STR:
         if (unquote(text, buf, size) < 0) {
             if ((int)strlen(text) >= size)
@@ -304,7 +316,9 @@ static fs_value parse_value(int t, const char *text, char *buf, int size)
             strcpy(buf, text);
         }
         return fs_cstr(buf);
-    default: {
+#endif
+#if FS_HAS_TIME
+    case FS_TIME: {
         const char *d = text[0] == '-' ? text + 1 : text;
         int64_t ms;
         if (*d) {
@@ -325,6 +339,12 @@ static fs_value parse_value(int t, const char *text, char *buf, int size)
             die("not a time (use YYYY-MM-DDTHH:MM:SSZ or ms)", text);
         return fs_time(ms);
     }
+#endif
+    default:
+        (void)buf;
+        (void)size;
+        die("value type left out of this build (FS_NO_*)", text);
+        return fs_int(0);
     }
 }
 
@@ -430,7 +450,11 @@ static void exec_line(char *line)
     } else if (strcmp(w[0], "clock") == 0) {
         if (n < 2)
             die("clock needs a time", NULL);
+#if FS_HAS_TIME
         clock_ms = parse_value(FS_TIME, w[1], NULL, 0).as.t;
+#else
+        die("clock: times are left out of this build (FS_NO_TIME)", NULL);
+#endif
     } else if (strcmp(w[0], "dump") == 0) {
         dump();
     } else {
@@ -467,7 +491,10 @@ int main(int argc, char **argv)
     img = read_file(argv[1], &len);
     rc = fs_load(&vm, (const uint8_t *)img, len);
     if (rc != FS_OK) {
-        fprintf(stderr, "fsrun: %s: invalid bytecode image (error %d)\n", argv[1], rc);
+        if (rc == FS_ERR_FEATURE)
+            fprintf(stderr, "fsrun: %s: needs a feature this build left out (FS_NO_*)\n", argv[1]);
+        else
+            fprintf(stderr, "fsrun: %s: invalid bytecode image (error %d)\n", argv[1], rc);
         return 1;
     }
     for (i = 0; i < vm.n_externs; i++)

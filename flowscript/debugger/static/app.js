@@ -140,7 +140,12 @@
     for (const x of ram.rows) h.push(`<tr><td class="mono">${x.macro}</td><td class="n">${x.default}</td><td class="n"><b>${x.minimum === null ? "–" : x.minimum}</b></td><td colspan="2" class="muted">${esc(x.why)}</td></tr>`);
     h.push(`</table>`);
     if (ram.cflags) h.push(`<div class="sz-flags"><span class="muted">build flags</span> <code>${esc(ram.cflags)}</code></div>`);
-    h.push(`<h4>C VM code <b>~${Math.round(r.vm_code_bytes / 1024)} KB</b> <span class="muted">flowscript.c, fixed, independent of the program</span></h4>`);
+    h.push(`<div class="muted">values: ${ram.value_bytes} B each with the defaults, ${ram.minimum_value_bytes} B with the switches below</div>`);
+    h.push(`<h4>Features <span class="muted">C VM switches: leave out what this program never uses</span></h4><table class="sz">`);
+    for (const sw of ram.switches) h.push(`<tr><td class="mono">${sw.macro}</td><td colspan="4">${sw.allowed ? `<b>allowed</b> <span class="muted">uses no ${esc(sw.feature)}</span>` : `<span class="muted">not allowed: uses ${esc(sw.feature)}</span>`}</td></tr>`);
+    h.push(`</table>`);
+    const kb = (b) => (b / 1024).toFixed(1);
+    h.push(`<h4>C VM code <b>~${kb(r.minimum_vm_code_bytes)} KB</b> <span class="muted">flowscript.c, Cortex-M4 -Os, with the switches this program allows (all features: ~${kb(r.vm_code_bytes)} KB${ram.switches.some((x) => x.macro === "FS_NO_FLOAT" && x.allowed) ? "" : ", plus soft-float and libm"})</span></h4>`);
     if (r.hints.length) h.push(`<h4>Hints</h4><ul class="sz-hints">${r.hints.map((t) => `<li>${esc(t)}</li>`).join("")}</ul>`);
     el.innerHTML = h.join("");
   }

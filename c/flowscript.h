@@ -52,6 +52,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -92,6 +93,32 @@ extern "C" {
 #define FS_STR_LEN 64           /* bytes per run-time string (+ a NUL)      */
 #endif
 
+/* ---- optional features ---------------------------------------------------
+ * Define any of these to leave a feature out of the VM: less code, and smaller
+ * values (int + str only: 8 bytes each instead of 16).  An image that needs a
+ * left-out feature is refused by fs_load() with FS_ERR_FEATURE; the compiler
+ * records what a program needs, and `flowscript size` lists the switches it allows.
+ *   FS_NO_FLOAT  float values (also drops the libm dependency)
+ *   FS_NO_TIME   time values and now()
+ *   FS_NO_STR    strings made at run time: +, str(), substr(), str results and
+ *                arguments from the host.  String literals ("text") still work.
+ */
+#if defined(FS_NO_FLOAT)
+#define FS_HAS_FLOAT 0
+#else
+#define FS_HAS_FLOAT 1
+#endif
+#if defined(FS_NO_TIME)
+#define FS_HAS_TIME 0
+#else
+#define FS_HAS_TIME 1
+#endif
+#if defined(FS_NO_STR)
+#define FS_HAS_STR 0
+#else
+#define FS_HAS_STR 1
+#endif
+
 /* ---- return / error codes ------------------------------------------------ */
 #define FS_OK             0
 #define FS_ERR_MAGIC     (-1)   /* not an FSB1 image                          */
@@ -106,6 +133,7 @@ extern "C" {
 #define FS_ERR_NOTFOUND  (-9)   /* fs_bind: no extern with that name          */
 #define FS_ERR_NOTLOADED (-10)  /* no valid image loaded                       */
 #define FS_ERR_MEM       (-11)  /* fs_post: no room for a string argument (fault 11/12 reported) */
+#define FS_ERR_FEATURE   (-12)  /* the image needs a feature this build left out (FS_NO_*) */
 
 /* ---- fs_step() results ----------------------------------------------------- */
 #define FS_IDLE       0         /* nothing to do                               */
@@ -144,19 +172,31 @@ typedef struct {
     uint8_t type;               /* FS_INT, FS_FLOAT, FS_STR, FS_TIME (FS_CSTR from the host) */
     union {
         int32_t i;              /* FS_INT                                         */
+#if FS_HAS_FLOAT
         double f;               /* FS_FLOAT                                       */
+#endif
+#if FS_HAS_TIME
         int64_t t;              /* FS_TIME: ms since 1970-01-01T00:00:00Z (UTC)    */
+#endif
         int32_t s;              /* FS_STR: >= 0 image string, < 0 run-time slot   */
+#if FS_HAS_STR
         const char *c;          /* FS_CSTR                                        */
+#endif
     } as;
 } fs_value;
 
-static inline fs_value fs_int(int32_t i) { fs_value v; v.type = FS_INT; v.as.t = 0; v.as.i = i; return v; }
+static inline fs_value fs_int(int32_t i) { fs_value v; memset(&v, 0, sizeof(v)); v.type = FS_INT; v.as.i = i; return v; }
+#if FS_HAS_FLOAT
 static inline fs_value fs_float(double f) { fs_value v; v.type = FS_FLOAT; v.as.f = f; return v; }
+#endif
+#if FS_HAS_TIME
 static inline fs_value fs_time(int64_t ms) { fs_value v; v.type = FS_TIME; v.as.t = ms; return v; }
+#endif
+#if FS_HAS_STR
 /* A C string handed to the VM, which copies it into a string slot (the pointer
  * only has to be valid until the extern returns / fs_post returns). */
 static inline fs_value fs_cstr(const char *s) { fs_value v; v.type = FS_CSTR; v.as.c = s ? s : ""; return v; }
+#endif
 
 #define FS_NONE16 0xFFFFu
 
@@ -238,7 +278,9 @@ struct fs_vm {
     fs_emit_fn   on_emit;
     fs_fault_fn  on_fault;
     fs_timer_fn  on_timer;      /* NULL: built-in timers driven by fs_tick() */
+#if FS_HAS_TIME
     fs_clock_fn  clock;         /* NULL: now() is 0                          */
+#endif
     void        *user;
 
     /* --- run-time state --- */
@@ -266,7 +308,9 @@ struct fs_vm {
     fs_qentry queue[FS_QUEUE_SIZE];
     int      q_head, q_count;
     fs_timer timers[FS_MAX_TIMERS];
+#if FS_HAS_STR
     fs_strslot strs[FS_STR_SLOTS];
+#endif
 };
 
 /* ---- loading & binding ---------------------------------------------------- */
@@ -296,7 +340,8 @@ void fs_start(fs_vm *vm);
  * with pc -1, or the current pc inside a handler) or FS_ERR_MEM (no room for a
  * string argument: fault 11 or 12 reported the same way). */
 int  fs_post(fs_vm *vm, int event, const fs_value *args, int argc);
-/* The clock now() reads (NULL: now() is 0).  Kept across fs_load(). */
+/* The clock now() reads (NULL: now() is 0).  Kept across fs_load().
+ * Does nothing in a FS_NO_TIME build. */
 void fs_set_clock(fs_vm *vm, fs_clock_fn fn);
 /* Advance all running timers by ms (SPEC 8.3); expired timers queue events. */
 void fs_tick(fs_vm *vm, int32_t ms);    /* built-in timers only (no-op with a timer handler) */
@@ -345,8 +390,12 @@ fs_value fs_empty_str(void);
 int  fs_format(const fs_vm *vm, fs_value v, char *buf, int size);
 /* Text -> value with the VM's own rules (same as float("...") / time("...")).
  * Return 0 on success, -1 if the text is invalid. */
+#if FS_HAS_FLOAT
 int  fs_parse_float(const char *s, size_t len, double *out);
+#endif
+#if FS_HAS_TIME
 int  fs_parse_time(const char *s, size_t len, int64_t *out);
+#endif
 int  fs_strings_in_use(const fs_vm *vm);
 /* Index of the extern currently being called (valid inside fs_extern_fn). */
 int  fs_current_extern(const fs_vm *vm);

@@ -424,6 +424,11 @@ Header (32 bytes)
   0  u8[4]  magic "FSB1"
   4  u16    format version (2)
   6  u16    flags            bit0: debug section present
+                              bit1: needs float values     (refused by FS_NO_FLOAT builds)
+                              bit2: needs time values      (refused by FS_NO_TIME builds)
+                              bit3: makes strings at run time: CONCAT, a built-in returning
+                                    str, an extern returning str or an event with a str
+                                    parameter (refused by FS_NO_STR builds)
   8  u16    program name     (string index, 0xFFFF = none)
  10  u16    program version
  12  u16    n_strings

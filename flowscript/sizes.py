@@ -9,7 +9,7 @@ Three separate budgets matter on a device:
 * the **C interpreter code** (flowscript.c) – fixed, independent of the program.
 """
 
-from .bytecode import Program, decode, BUILTIN_EVENTS
+from .bytecode import Program, decode, BUILTIN_EVENTS, features, FEATURES, FLAG_STR
 from .values import BUILTINS
 
 # C VM defaults (c/flowscript.h)
@@ -18,8 +18,29 @@ DEFAULTS = {
     "FS_MAX_GLOBALS": 256, "FS_MAX_TIMERS": 16, "FS_MAX_EVENT_ARGS": 8,
     "FS_STR_SLOTS": 16, "FS_STR_LEN": 64,
 }
-VALUE = (16, 8)              # fs_value: type byte + 8-byte union (double/int64 align 8)
-VM_CODE_BYTES = 16 * 1024    # flowscript.c, -Os Thumb-2 (approx., see README), plus the C library's float routines
+SWITCHES = ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR")   # c/flowscript.h feature switches
+# flowscript.c code + constants in bytes, Cortex-M4 Thumb-2, clang -Os (measured, see README),
+# by the switches that are set.  Builds with floats also link soft-float and libm routines.
+VM_CODE_BYTES = {
+    (): 16611, ("FS_NO_FLOAT",): 14035, ("FS_NO_TIME",): 13289, ("FS_NO_STR",): 15721,
+    ("FS_NO_FLOAT", "FS_NO_TIME"): 9809, ("FS_NO_FLOAT", "FS_NO_STR"): 13103,
+    ("FS_NO_TIME", "FS_NO_STR"): 12421, ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR"): 8867,
+}
+
+
+def value_layout(cfg, ptr=4):
+    """(sizeof, alignof) of fs_value: a type byte + a union that shrinks with the switches."""
+    members = [(4, 4)]                                   # int32 i, s
+    if not cfg.get("FS_NO_FLOAT") or not cfg.get("FS_NO_TIME"):
+        members.append((8, 8))                           # double f / int64 t
+    if not cfg.get("FS_NO_STR"):
+        members.append((ptr, ptr))                       # const char *c (host strings)
+    union = (max(m[0] for m in members), max(m[1] for m in members))
+    return _layout([(1, 1), union])
+
+
+def vm_code_bytes(cfg):
+    return VM_CODE_BYTES[tuple(k for k in SWITCHES if cfg.get(k))]
 
 # net stack effect of instructions that just fall through (CALL/XCALL/EMIT/RET handled apart)
 _EFFECT = {
@@ -53,16 +74,21 @@ def fs_vm_size(cfg, ptr=4):
     i32 = (4, 4)
     u16 = (2, 2)
     u8 = (1, 1)
-    qentry, qalign = _layout([u16, (VALUE[0] * cfg["FS_MAX_EVENT_ARGS"], VALUE[1])])
+    vsize, valign = value_layout(cfg, ptr)
+    qentry, qalign = _layout([u16, (vsize * cfg["FS_MAX_EVENT_ARGS"], valign)])
     timer, talign = _layout([u8, u8, (2, 2), i32, (8, 8)])
     strslot, salign = _layout([u16, u8, u8, (cfg["FS_STR_LEN"] + 1, 1)])
     fields = [P, P] + [P] * 9 + [i32] + [u16] * 10 + [u8]
-    fields += [(ptr * cfg["FS_MAX_EXTERNS"], ptr), P, P, P, P, P]  # bound, on_emit/fault/timer, clock, user
-    fields += [(VALUE[0] * cfg["FS_MAX_GLOBALS"], VALUE[1]), (VALUE[0] * cfg["FS_STACK_SIZE"], VALUE[1]), i32,
+    fields += [(ptr * cfg["FS_MAX_EXTERNS"], ptr), P, P, P]   # bound, on_emit/fault/timer
+    fields += [] if cfg.get("FS_NO_TIME") else [P]               # clock
+    fields += [P]                                                # user
+    fields += [(vsize * cfg["FS_MAX_GLOBALS"], valign), (vsize * cfg["FS_STACK_SIZE"], valign), i32,
                (8 * cfg["FS_MAX_FRAMES"], 4)]
     fields += [i32] * 7 + [u8, u8] + [i32] * 4
     fields += [(qentry * cfg["FS_QUEUE_SIZE"], qalign), i32, i32,
-               (timer * cfg["FS_MAX_TIMERS"], talign), (strslot * cfg["FS_STR_SLOTS"], salign)]
+               (timer * cfg["FS_MAX_TIMERS"], talign)]
+    if not cfg.get("FS_NO_STR"):
+        fields.append((strslot * cfg["FS_STR_SLOTS"], salign))
     return _layout(fields)[0]
 
 
@@ -70,14 +96,7 @@ def makes_strings(prog):
     """Can this program create run-time strings (so it needs the string slots)?
     Yes if it joins strings (CONCAT), calls str() / substr(), has an extern returning
     a str or an event with a str parameter (the host's strings are copied in)."""
-    from .values import STR
-    if any(e[3] == STR for e in prog.externs) or any(STR in e[2] for e in prog.events):
-        return True
-    for pc in _pcs(prog):
-        op, arg, _size = decode(prog.code, pc)
-        if op == "CONCAT" or (op == "BUILTIN" and arg in (5, 6, 7, 22)):
-            return True
-    return False
+    return bool(features(prog) & FLAG_STR)
 
 
 def _pcs(prog):
@@ -306,15 +325,26 @@ def size_report(prog, debug=False, image=None):
     minimum["FS_MAX_EXTERNS"] = max(1, len(prog.externs))
     minimum["FS_MAX_TIMERS"] = max(1, len(prog.timers))
     minimum["FS_MAX_EVENT_ARGS"] = max([1] + [e[1] for e in prog.events])
+    # feature switches: leave out what the program never uses
+    need = features(prog)
+    switches = []
+    for flag, what, macro in FEATURES:
+        needed = bool(need & flag)
+        switches.append({"macro": macro, "allowed": not needed, "feature": what})
+        if not needed:
+            minimum[macro] = 1
     if makes_strings(prog):
         why["FS_STR_SLOTS"] = why["FS_STR_LEN"] = "the program makes strings: size for its data"
     else:
         minimum["FS_STR_SLOTS"] = minimum["FS_STR_LEN"] = 1
-        why["FS_STR_SLOTS"] = why["FS_STR_LEN"] = "the program never makes a string at run time"
+        why["FS_STR_SLOTS"] = why["FS_STR_LEN"] = "left out with FS_NO_STR"
     for k in ("FS_STACK_SIZE", "FS_MAX_FRAMES", "FS_MAX_GLOBALS", "FS_MAX_EXTERNS",
               "FS_MAX_TIMERS", "FS_MAX_EVENT_ARGS", "FS_STR_SLOTS", "FS_STR_LEN"):
         if not (unbounded and k in ("FS_STACK_SIZE", "FS_MAX_FRAMES")):
             shown[k] = minimum[k]
+    if minimum.get("FS_NO_STR"):              # no slots at all: their sizes do not matter
+        shown["FS_STR_SLOTS"] = shown["FS_STR_LEN"] = None
+    flags = ["-D%s" % sw["macro"] for sw in switches if sw["allowed"]]
     why["FS_QUEUE_SIZE"] = "depends on how many events the host posts between runs"
     ram = {
         "rows": [{"macro": k, "default": DEFAULTS[k], "minimum": shown[k], "why": why.get(k, "")}
@@ -323,9 +353,12 @@ def size_report(prog, debug=False, image=None):
                            "FS_QUEUE_SIZE")],
         "default_bytes": fs_vm_size(DEFAULTS),
         "minimum_bytes": fs_vm_size(minimum),
-        "queue_entry_bytes": _layout([(2, 2), (VALUE[0] * minimum["FS_MAX_EVENT_ARGS"], VALUE[1])])[0],
-        "cflags": " ".join("-D%s=%d" % (k, shown[k]) for k in sorted(shown)
-                           if shown[k] is not None and shown[k] != DEFAULTS[k]),
+        "queue_entry_bytes": _layout([(2, 2), (value_layout(minimum)[0] * minimum["FS_MAX_EVENT_ARGS"],
+                                               value_layout(minimum)[1])])[0],
+        "value_bytes": value_layout(DEFAULTS)[0], "minimum_value_bytes": value_layout(minimum)[0],
+        "switches": switches,
+        "cflags": " ".join(flags + ["-D%s=%d" % (k, shown[k]) for k in sorted(shown)
+                                    if shown[k] is not None and shown[k] != DEFAULTS[k]]),
         "unbounded": unbounded,
     }
 
@@ -384,7 +417,8 @@ def size_report(prog, debug=False, image=None):
         "debug_bytes": dbg_bytes,
         "sections": [{"name": n, "bytes": b, "detail": d} for n, b, d in sections],
         "routines": routines, "strings": string_rows, "strings_by_role": by_role,
-        "ram": ram, "vm_code_bytes": VM_CODE_BYTES, "hints": hints,
+        "ram": ram, "vm_code_bytes": vm_code_bytes(DEFAULTS),
+        "minimum_vm_code_bytes": vm_code_bytes(minimum), "hints": hints,
     }
 
 
@@ -437,7 +471,18 @@ def format_report(rep, title=""):
     if ram["cflags"]:
         w("  build flags: %s" % ram["cflags"])
     w("")
-    w("C VM CODE  ~%d KB (flowscript.c), fixed, independent of the program" % (rep["vm_code_bytes"] // 1024))
+    w("  values: %d bytes each with the defaults, %d with the switches above"
+      % (ram["value_bytes"], ram["minimum_value_bytes"]))
+    w("")
+    w("FEATURES  (C VM switches: leave out what the program never uses)")
+    for sw in ram["switches"]:
+        w("  %-12s %s" % (sw["macro"], "allowed: the program uses no %s" % sw["feature"]
+                          if sw["allowed"] else "not allowed: the program uses %s" % sw["feature"]))
+    w("")
+    w("C VM CODE  ~%.1f KB (flowscript.c, Cortex-M4 -Os) with all features, ~%.1f KB with the "
+      "switches this program allows" % (rep["vm_code_bytes"] / 1024, rep["minimum_vm_code_bytes"] / 1024))
+    if not any(sw["macro"] == "FS_NO_FLOAT" and sw["allowed"] for sw in ram["switches"]):
+        w("  plus the C library's soft-float and libm routines")
     if rep["hints"]:
         w("")
         w("HINTS")

@@ -5,3 +5,6 @@ __pycache__/
 c/fsrun
 c/fsrun-asan
 c/test_api
+c/fsrun-nofloat
+c/fsrun-notime-nostr
+c/fsrun-min

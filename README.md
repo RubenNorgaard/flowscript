@@ -226,18 +226,49 @@ tests/                  unit tests, round-trip tests, C/Python conformance, fuzz
 
 ```sh
 python3 -m unittest discover -s tests     # compiler, VM, round trip
-cd c && make test                         # C API test + C/Python conformance (normal + ASan/UBSan)
+cd c && make test                         # C API test + C/Python conformance (normal, ASan/UBSan,
+                                          #   and the reduced FS_NO_* builds)
 cd c && make fuzz                         # corrupt-image fuzzing against the ASan build
+python3 tests/fuzz_c.py --runner fsrun-min  # ... or against a reduced build
 cd c && make size                         # code size of the VM
 ```
 
-C VM footprint (default sizes): **about 16 KB** of code for Cortex-M4 (`-Os`, Thumb-2;
-16,258 bytes of `.text` measured with clang; v1, ints only, was 6.6 KB), plus the C
-library's double-precision routines (soft-float on a Cortex-M4) and `floor ceil sqrt exp
-log pow fmod`; no data/bss of its own; a `fs_vm` struct of 9,216 bytes RAM on a 32-bit
-target with the default `FS_*` macros in `flowscript.h` (every value is 16 bytes: a type
-tag and an 8-byte double/int64). Most of that is headroom: see below. Build with
+C VM footprint (default sizes): **about 16 KB** of code for Cortex-M4 (`-Os`, Thumb-2,
+code + constants measured with clang; v1, ints only, was 6.6 KB), plus the C library's
+double-precision routines (soft-float on a Cortex-M4) and `floor ceil sqrt exp log pow
+fmod`; no data/bss of its own; a `fs_vm` struct of 9,216 bytes RAM on a 32-bit target
+with the default `FS_*` macros in `flowscript.h` (every value is 16 bytes: a type tag and
+an 8-byte double/int64). Most of that is headroom: see below. Build with
 `-ffp-contract=off` (fused multiply-add would change float results) and link `-lm`.
+
+### Feature switches
+
+Define these when building the C VM to leave out what your programs never use:
+
+| Switch | Leaves out | Still works |
+|---|---|---|
+| `FS_NO_FLOAT` | `float` values, the float built-ins, soft-float and libm | everything else; no `-lm` needed |
+| `FS_NO_TIME` | `time` values, `now()` and the date built-ins | `start t every 30s` (timers are not times) |
+| `FS_NO_STR` | strings made at run time: `+` on strings, `str()`, `substr()`, `str` results and event arguments from the host, the string slots | string literals, e.g. `log("started", 3)`, `len()` and `find()` on them |
+
+The compiler records in the image which of these a program needs, and `fs_load()`
+refuses an image that needs a left-out feature with `FS_ERR_FEATURE`, so a mismatch
+is caught at download, not in the field. `flowscript size` lists the switches a
+program allows and includes them in its suggested build flags.
+
+| Switches | VM code (Cortex-M4 `-Os`) | value size |
+|---|---|---|
+| none | 16.2 KB + soft-float and libm | 16 bytes |
+| `FS_NO_STR` | 15.4 KB + soft-float and libm | 16 bytes |
+| `FS_NO_TIME` | 13.0 KB + soft-float and libm | 16 bytes |
+| `FS_NO_FLOAT` | 13.7 KB | 16 bytes |
+| `FS_NO_FLOAT FS_NO_TIME` | 9.6 KB | 8 bytes |
+| all three | **8.7 KB**, needing only `memcpy memset memcmp strlen` | 8 bytes |
+
+Values only shrink once both 8-byte types (float and time) are gone. Every combination
+compiles warning-free (`make switches`), and the conformance test runs each program on
+three reduced builds, checking identical traces where the program is allowed and a
+refusal where it is not.
 
 ## Optimizing size
 
@@ -249,12 +280,14 @@ debugger's bytecode pane) shows the three budgets separately:
   (or wherever the host keeps the download), not RAM.
 * **RAM** (`sizeof(fs_vm)`): computed for the defaults and for the smallest `FS_*`
   settings this program runs with. Stack and call depth come from a worst-case analysis of
-  the bytecode; the report prints ready-to-use `-D` build flags. For the GPS example that
-  is 720 bytes instead of 9,216 (it never makes a string at run time, so it gets a
-  single 1-byte string slot). These settings are also load-time limits, so size them
+  the bytecode; the report prints ready-to-use `-D` build flags, including the feature
+  switches. For the GPS example that is 464 bytes instead of 9,216: it uses no floats,
+  times or run-time strings, so all three switches apply, values are 8 bytes and there
+  are no string slots. These settings are also load-time limits, so size them
   for the largest program you plan to download. Recursion has no static bound and keeps
   the defaults.
-* **C VM code**: fixed (about 16 KB + the C library's float routines), independent of the program.
+* **C VM code**: independent of the program, but set by the feature switches: about
+  16 KB with everything, 8.7 KB with all three switches (see the table above).
 
 It also lists concrete savings: unused externs, functions, events, timers and globals,
 globals that could be constants, the cost of names, and the debug section (`-g`).

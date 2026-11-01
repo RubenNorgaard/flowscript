@@ -2,7 +2,7 @@
 import glob, os, shutil, subprocess, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from flowscript import compile_source, Program
-from flowscript.sizes import size_report, fs_vm_size, DEFAULTS
+from flowscript.sizes import size_report, fs_vm_size, DEFAULTS, SWITCHES
 from flowscript.runner import run_scenario
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
@@ -40,6 +40,10 @@ class Report(unittest.TestCase):
         self.assertIsNone(mins["FS_QUEUE_SIZE"])
         self.assertIn("-DFS_STACK_SIZE=4", rep["ram"]["cflags"])
         self.assertEqual(rep["ram"]["default_bytes"], 9216)
+        # the GPS tracker uses no floats, times or run-time strings: all three switches apply
+        self.assertTrue(rep["ram"]["cflags"].startswith("-DFS_NO_FLOAT -DFS_NO_TIME -DFS_NO_STR "))
+        self.assertEqual(rep["ram"]["minimum_bytes"], 464)
+        self.assertEqual(rep["ram"]["minimum_value_bytes"], 8)
 
     def test_recursion_has_no_bound(self):
         rep = size_report(compile_source("func f(int n) -> int:\n  return f(n)\nany_state:\n  on boot:\n    f(1)\n")[1])
@@ -66,8 +70,11 @@ class AgainstC(unittest.TestCase):
             with open(src, "w") as f:
                 f.write('#include "flowscript.h"\n#include <stdio.h>\n'
                         'int main(void){printf("%u\\n",(unsigned)sizeof(fs_vm));return 0;}\n')
-            for cfg in (DEFAULTS, dict(DEFAULTS, FS_STACK_SIZE=3, FS_MAX_EXTERNS=5, FS_MAX_TIMERS=1,
-                                       FS_MAX_EVENT_ARGS=1, FS_QUEUE_SIZE=3, FS_MAX_FRAMES=2)):
+            small = dict(DEFAULTS, FS_STACK_SIZE=3, FS_MAX_EXTERNS=5, FS_MAX_TIMERS=1,
+                         FS_MAX_EVENT_ARGS=1, FS_QUEUE_SIZE=3, FS_MAX_FRAMES=2)
+            # every combination of the feature switches, on the default and a small config
+            combos = [{k: 1 for k, bit in zip(SWITCHES, (1, 2, 4)) if m & bit} for m in range(8)]
+            for cfg in [dict(base, **sw) for base in (DEFAULTS, small) for sw in combos]:
                 flags = ["-D%s=%d" % kv for kv in cfg.items()]
                 exe = os.path.join(tmp, "sz")
                 subprocess.check_call([CC, "-I", os.path.join(ROOT, "c")] + flags + [src, "-o", exe])
