@@ -1,0 +1,25 @@
+# Every push and pull request; publish.yml runs it too before a release.
+name: test
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Python tests (compiler, VM, host API, SVG, sizes against the C compiler)
+        run: python -m unittest discover -s tests
+      - name: C VM tests (API test, C/Python conformance, every feature switch, C23)
+        run: make -C c test PYTHON=python

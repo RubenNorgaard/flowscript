@@ -12,26 +12,14 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python: ["3.9", "3.12"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - name: Python tests (compiler, VM, host API, SVG, sizes against the C compiler)
-        run: python -m unittest discover -s tests
-      - name: C VM tests (API test, C/Python conformance, every feature switch)
-        run: make -C c test
+    uses: ./.github/workflows/test.yml
 
   build:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: The tag must match the package version
@@ -43,7 +31,7 @@ jobs:
           python -m pip install --upgrade build twine
           python -m build
           python -m twine check dist/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: dist
           path: dist/
@@ -55,7 +43,7 @@ jobs:
     permissions:
       id-token: write            # trusted publishing
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: dist
           path: dist/

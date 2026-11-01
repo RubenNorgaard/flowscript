@@ -540,8 +540,8 @@ int fs_parse_time(const char *s, size_t n, int64_t *out)
 #endif /* FS_HAS_TIME */
 
 #if FS_HAS_FLOAT
-/* values.fround: half away from zero, exactly */
-static double fround(double x)
+/* values.fround: half away from zero, exactly (not "fround": keep clear of C23 math names) */
+static double round_half_away(double x)
 {
     double a, t;
     if (x != x || x == INFINITY || x == -INFINITY)
@@ -553,8 +553,8 @@ static double fround(double x)
     return copysign(t, x);
 }
 
-/* values.fdiv: IEEE without relying on the compiler for x / 0 */
-static double fdiv(double a, double b)
+/* values.fdiv: IEEE without relying on the compiler for x / 0 (C23 <math.h> has its own fdiv) */
+static double ieee_div(double a, double b)
 {
     if (b == 0.0) {
         if (a != a || a == 0.0)
@@ -1493,7 +1493,7 @@ static int binop(fs_vm *vm, uint8_t op, fs_value a, fs_value b, fs_value *r)
         case OP_ADD: *r = fs_float(x + y); return 0;
         case OP_SUB: *r = fs_float(x - y); return 0;
         case OP_MUL: *r = fs_float(x * y); return 0;
-        case OP_DIV: *r = fs_float(fdiv(x, y)); return 0;
+        case OP_DIV: *r = fs_float(ieee_div(x, y)); return 0;
         case OP_MOD: *r = fs_float(fmod(x, y)); return 0;
         case OP_EQ: *r = fs_int(x == y); return 0;
         case OP_NE: *r = fs_int(x != y); return 0;
@@ -1714,7 +1714,7 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
     case 29: *r = fs_float(a[1].as.f > a[0].as.f ? a[1].as.f : a[0].as.f); return 0;
     case 30: *r = fs_float(floor(a[0].as.f)); return 0;
     case 31: *r = fs_float(ceil(a[0].as.f)); return 0;
-    case 32: *r = fs_float(fround(a[0].as.f)); return 0;
+    case 32: *r = fs_float(round_half_away(a[0].as.f)); return 0;
     case 33: *r = fs_float(sqrt(a[0].as.f)); return 0;
     case 34: *r = fs_float(exp(a[0].as.f)); return 0;
     case 35: *r = fs_float(log(a[0].as.f)); return 0;
