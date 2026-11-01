@@ -18,25 +18,46 @@ DEFAULTS = {
     "FS_MAX_GLOBALS": 256, "FS_MAX_TIMERS": 16, "FS_MAX_EVENT_ARGS": 8,
     "FS_STR_SLOTS": 16, "FS_STR_LEN": 64,
 }
-SWITCHES = ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR")   # c/flowscript.h feature switches
-# flowscript.c code + constants in bytes, Cortex-M4 Thumb-2, clang -Os (measured, see README),
-# by the switches that are set.  Builds with floats also link soft-float and libm routines.
+SWITCHES = ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT")   # c/flowscript.h switches
+# VM code + constants in bytes kept by a Cortex-M4 link (clang -Os, --gc-sections; the host
+# does not call fs_format/fs_parse_*), by the switches that are set.  Measured with
+# c/codesize.py.  Builds with floats also link soft-float and libm routines.
 VM_CODE_BYTES = {
-    (): 16611, ("FS_NO_FLOAT",): 14035, ("FS_NO_TIME",): 13289, ("FS_NO_STR",): 15721,
-    ("FS_NO_FLOAT", "FS_NO_TIME"): 9809, ("FS_NO_FLOAT", "FS_NO_STR"): 13103,
-    ("FS_NO_TIME", "FS_NO_STR"): 12421, ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR"): 8867,
+    (): 16087,
+    ("FS_NO_FLOAT",): 13495,
+    ("FS_NO_TIME",): 12801,
+    ("FS_NO_STR",): 13841,
+    ("FS_NO_TEXT",): 12817,
+    ("FS_NO_FLOAT", "FS_NO_TIME"): 9421,
+    ("FS_NO_FLOAT", "FS_NO_STR"): 11877,
+    ("FS_NO_FLOAT", "FS_NO_TEXT"): 11955,
+    ("FS_NO_TIME", "FS_NO_STR"): 10979,
+    ("FS_NO_TIME", "FS_NO_TEXT"): 11083,
+    ("FS_NO_STR", "FS_NO_TEXT"): 11811,
+    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR"): 8383,
+    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_TEXT"): 9421,
+    ("FS_NO_FLOAT", "FS_NO_STR", "FS_NO_TEXT"): 10747,
+    ("FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT"): 10065,
+    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT"): 8383,
 }
 
 
-def value_layout(cfg, ptr=4):
-    """(sizeof, alignof) of fs_value: a type byte + a union that shrinks with the switches."""
-    members = [(4, 4)]                                   # int32 i, s
+def cell_layout(cfg):
+    """(sizeof, alignof) of fs_cell, the payload the VM stores (its type tag is a separate byte)."""
     if not cfg.get("FS_NO_FLOAT") or not cfg.get("FS_NO_TIME"):
-        members.append((8, 8))                           # double f / int64 t
-    if not cfg.get("FS_NO_STR"):
-        members.append((ptr, ptr))                       # const char *c (host strings)
-    union = (max(m[0] for m in members), max(m[1] for m in members))
-    return _layout([(1, 1), union])
+        return (8, 8)                                    # double f / int64 t
+    return (4, 4)                                        # int32 i, s
+
+
+def stored_value_bytes(cfg):
+    """RAM per value held by the VM (globals, stack, queued event arguments): cell + tag."""
+    return cell_layout(cfg)[0] + 1
+
+
+def queue_entry_layout(cfg):
+    n = cfg["FS_MAX_EVENT_ARGS"]
+    csize, calign = cell_layout(cfg)
+    return _layout([(csize * n, calign), (2, 2), (n, 1)])   # args, event, types
 
 
 def vm_code_bytes(cfg):
@@ -74,19 +95,20 @@ def fs_vm_size(cfg, ptr=4):
     i32 = (4, 4)
     u16 = (2, 2)
     u8 = (1, 1)
-    vsize, valign = value_layout(cfg, ptr)
-    qentry, qalign = _layout([u16, (vsize * cfg["FS_MAX_EVENT_ARGS"], valign)])
+    csize, calign = cell_layout(cfg)
+    qentry, qalign = queue_entry_layout(cfg)
     timer, talign = _layout([u8, u8, (2, 2), i32, (8, 8)])
     strslot, salign = _layout([u16, u8, u8, (cfg["FS_STR_LEN"] + 1, 1)])
     fields = [P, P] + [P] * 9 + [i32] + [u16] * 10 + [u8]
     fields += [(ptr * cfg["FS_MAX_EXTERNS"], ptr), P, P, P]   # bound, on_emit/fault/timer
     fields += [] if cfg.get("FS_NO_TIME") else [P]               # clock
     fields += [P]                                                # user
-    fields += [(vsize * cfg["FS_MAX_GLOBALS"], valign), (vsize * cfg["FS_STACK_SIZE"], valign), i32,
+    fields += [(csize * cfg["FS_MAX_GLOBALS"], calign), (csize * cfg["FS_STACK_SIZE"], calign), i32,
                (8 * cfg["FS_MAX_FRAMES"], 4)]
     fields += [i32] * 7 + [u8, u8] + [i32] * 4
     fields += [(qentry * cfg["FS_QUEUE_SIZE"], qalign), i32, i32,
-               (timer * cfg["FS_MAX_TIMERS"], talign)]
+               (timer * cfg["FS_MAX_TIMERS"], talign),
+               (cfg["FS_MAX_GLOBALS"], 1), (cfg["FS_STACK_SIZE"], 1)]     # gtypes, stypes
     if not cfg.get("FS_NO_STR"):
         fields.append((strslot * cfg["FS_STR_SLOTS"], salign))
     return _layout(fields)[0]
@@ -353,9 +375,8 @@ def size_report(prog, debug=False, image=None):
                            "FS_QUEUE_SIZE")],
         "default_bytes": fs_vm_size(DEFAULTS),
         "minimum_bytes": fs_vm_size(minimum),
-        "queue_entry_bytes": _layout([(2, 2), (value_layout(minimum)[0] * minimum["FS_MAX_EVENT_ARGS"],
-                                               value_layout(minimum)[1])])[0],
-        "value_bytes": value_layout(DEFAULTS)[0], "minimum_value_bytes": value_layout(minimum)[0],
+        "queue_entry_bytes": queue_entry_layout(minimum)[0],
+        "value_bytes": stored_value_bytes(DEFAULTS), "minimum_value_bytes": stored_value_bytes(minimum),
         "switches": switches,
         "cflags": " ".join(flags + ["-D%s=%d" % (k, shown[k]) for k in sorted(shown)
                                     if shown[k] is not None and shown[k] != DEFAULTS[k]]),
@@ -479,7 +500,7 @@ def format_report(rep, title=""):
         w("  %-12s %s" % (sw["macro"], "allowed: the program uses no %s" % sw["feature"]
                           if sw["allowed"] else "not allowed: the program uses %s" % sw["feature"]))
     w("")
-    w("C VM CODE  ~%.1f KB (flowscript.c, Cortex-M4 -Os) with all features, ~%.1f KB with the "
+    w("C VM CODE  ~%.1f KB (flowscript.c, Cortex-M4 -Os, linked) with all features, ~%.1f KB with the "
       "switches this program allows" % (rep["vm_code_bytes"] / 1024, rep["minimum_vm_code_bytes"] / 1024))
     if not any(sw["macro"] == "FS_NO_FLOAT" and sw["allowed"] for sw in ram["switches"]):
         w("  plus the C library's soft-float and libm routines")

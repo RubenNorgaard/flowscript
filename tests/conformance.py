@@ -24,7 +24,8 @@ import struct
 import tempfile
 
 # reduced runner -> feature flags (bytecode.FLAG_*) it leaves out
-VARIANTS = {"fsrun-nofloat": 2, "fsrun-notime-nostr": 4 | 8, "fsrun-min": 2 | 4 | 8}
+VARIANTS = {"fsrun-nofloat": 2, "fsrun-notime-nostr": 4 | 8, "fsrun-notext": 16,
+            "fsrun-min": 2 | 4 | 8 | 16}
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CDIR = os.path.join(ROOT, "c")

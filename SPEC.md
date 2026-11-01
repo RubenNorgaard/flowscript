@@ -429,6 +429,9 @@ Header (32 bytes)
                               bit3: makes strings at run time: CONCAT, a built-in returning
                                     str, an extern returning str or an event with a str
                                     parameter (refused by FS_NO_STR builds)
+                              bit4: converts floats or times to or from text: str(float),
+                                    str(time), float(str), time(str)
+                                    (refused by FS_NO_TEXT builds)
   8  u16    program name     (string index, 0xFFFF = none)
  10  u16    program version
  12  u16    n_strings

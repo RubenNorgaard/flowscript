@@ -102,6 +102,11 @@ extern "C" {
  *   FS_NO_TIME   time values and now()
  *   FS_NO_STR    strings made at run time: +, str(), substr(), str results and
  *                arguments from the host.  String literals ("text") still work.
+ *   FS_NO_TEXT   text conversion of floats and times in scripts: str(float),
+ *                str(time), float("..."), time("...").  The types stay, and so do
+ *                int <-> text.  fs_format() and fs_parse_float()/fs_parse_time()
+ *                remain for the host; a device that never calls them should link
+ *                with -ffunction-sections -Wl,--gc-sections so they are dropped.
  */
 #if defined(FS_NO_FLOAT)
 #define FS_HAS_FLOAT 0
@@ -117,6 +122,11 @@ extern "C" {
 #define FS_HAS_STR 0
 #else
 #define FS_HAS_STR 1
+#endif
+#if defined(FS_NO_TEXT)
+#define FS_HAS_TEXT 0
+#else
+#define FS_HAS_TEXT 1
 #endif
 
 /* ---- return / error codes ------------------------------------------------ */
@@ -198,6 +208,21 @@ static inline fs_value fs_time(int64_t ms) { fs_value v; v.type = FS_TIME; v.as.
 static inline fs_value fs_cstr(const char *s) { fs_value v; v.type = FS_CSTR; v.as.c = s ? s : ""; return v; }
 #endif
 
+/* How the VM stores a value inside fs_vm: the payload only.  The type tag lives
+ * in a parallel byte array (gtypes, stypes, fs_qentry.types), so a stored value
+ * costs sizeof(fs_cell) + 1 bytes instead of sizeof(fs_value).  Hosts never
+ * see cells: every API call takes and returns fs_value. */
+typedef union {
+    int32_t i;
+    int32_t s;
+#if FS_HAS_FLOAT
+    double f;
+#endif
+#if FS_HAS_TIME
+    int64_t t;
+#endif
+} fs_cell;
+
 #define FS_NONE16 0xFFFFu
 
 typedef struct fs_vm fs_vm;
@@ -230,8 +255,9 @@ typedef struct {
 } fs_frame;
 
 typedef struct {
+    fs_cell  args[FS_MAX_EVENT_ARGS];   /* int 0 beyond the event's argc */
     uint16_t event;
-    fs_value args[FS_MAX_EVENT_ARGS];   /* int 0 beyond the event's argc */
+    uint8_t  types[FS_MAX_EVENT_ARGS];  /* type tag of each argument     */
 } fs_qentry;
 
 typedef struct {
@@ -252,6 +278,9 @@ typedef struct {
 /*
  * The VM.  Defined here so the host can allocate it statically.  All fields
  * may be READ by a host/debugger; they must only be modified via the API.
+ * Globals, stack slots and queued arguments are stored as fs_cell payloads
+ * with their type tags in separate arrays: read them as values with
+ * fs_global() and fs_stack_at().
  */
 struct fs_vm {
     /* --- image (pointers into the caller's buffer, never copied) --- */
@@ -284,8 +313,8 @@ struct fs_vm {
     void        *user;
 
     /* --- run-time state --- */
-    fs_value globals[FS_MAX_GLOBALS];
-    fs_value stack[FS_STACK_SIZE];
+    fs_cell  globals[FS_MAX_GLOBALS];   /* payloads; type tags in gtypes   */
+    fs_cell  stack[FS_STACK_SIZE];      /* payloads; type tags in stypes   */
     int      sp;                /* number of values on the stack.  May exceed
                                    FS_STACK_SIZE only when a handler declares
                                    more locals than that (as in vm.py); such
@@ -308,6 +337,8 @@ struct fs_vm {
     fs_qentry queue[FS_QUEUE_SIZE];
     int      q_head, q_count;
     fs_timer timers[FS_MAX_TIMERS];
+    uint8_t  gtypes[FS_MAX_GLOBALS];    /* type tag of each global          */
+    uint8_t  stypes[FS_STACK_SIZE];     /* type tag of each stack slot      */
 #if FS_HAS_STR
     fs_strslot strs[FS_STR_SLOTS];
 #endif

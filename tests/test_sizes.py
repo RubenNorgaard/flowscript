@@ -39,11 +39,11 @@ class Report(unittest.TestCase):
         self.assertEqual(mins["FS_MAX_EXTERNS"], 6)
         self.assertIsNone(mins["FS_QUEUE_SIZE"])
         self.assertIn("-DFS_STACK_SIZE=4", rep["ram"]["cflags"])
-        self.assertEqual(rep["ram"]["default_bytes"], 9216)
+        self.assertEqual(rep["ram"]["default_bytes"], 6080)
         # the GPS tracker uses no floats, times or run-time strings: all three switches apply
         self.assertTrue(rep["ram"]["cflags"].startswith("-DFS_NO_FLOAT -DFS_NO_TIME -DFS_NO_STR "))
-        self.assertEqual(rep["ram"]["minimum_bytes"], 464)
-        self.assertEqual(rep["ram"]["minimum_value_bytes"], 8)
+        self.assertEqual(rep["ram"]["minimum_bytes"], 384)
+        self.assertEqual(rep["ram"]["minimum_value_bytes"], 5)
 
     def test_recursion_has_no_bound(self):
         rep = size_report(compile_source("func f(int n) -> int:\n  return f(n)\nany_state:\n  on boot:\n    f(1)\n")[1])

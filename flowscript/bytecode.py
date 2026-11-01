@@ -15,8 +15,11 @@ FLAG_DEBUG = 1
 FLAG_FLOAT = 2       # float values
 FLAG_TIME = 4        # time values
 FLAG_STR = 8         # strings made at run time (string slots); literals need no flag
+FLAG_TEXT = 16       # text conversion of floats/times: str(float), str(time), float(s), time(s)
 FEATURES = [(FLAG_FLOAT, "float", "FS_NO_FLOAT"), (FLAG_TIME, "time", "FS_NO_TIME"),
-            (FLAG_STR, "run-time strings", "FS_NO_STR")]
+            (FLAG_STR, "run-time strings", "FS_NO_STR"),
+            (FLAG_TEXT, "float/time text conversion", "FS_NO_TEXT")]
+TEXT_BUILTINS = (1, 6, 7, 8)   # float(str), str(float), str(time), time(str)
 NONE16 = 0xFFFF
 
 EV_BOOT, EV_ENTER, EV_EXIT = 0, 1, 2
@@ -211,7 +214,7 @@ class Program:
 
 
 def features(prog):
-    """FLAG_FLOAT | FLAG_TIME | FLAG_STR bits for what `prog` can ever produce.
+    """FLAG_FLOAT | FLAG_TIME | FLAG_STR | FLAG_TEXT bits for what `prog` can ever use.
 
     Every value of those kinds starts at a typed declaration (global, extern, event),
     a typed constant push, CONCAT or a built-in, so scanning them is exact.
@@ -244,9 +247,11 @@ def features(prog):
             need.add(r)
             if r == STR:
                 need.add("str-result")
+            if val in TEXT_BUILTINS:
+                need.add("text")
         pc += size
     return ((FLAG_FLOAT if FLOAT in need else 0) | (FLAG_TIME if TIME in need else 0) |
-            (FLAG_STR if "str-result" in need else 0))
+            (FLAG_STR if "str-result" in need else 0) | (FLAG_TEXT if "text" in need else 0))
 
 
 def decode(code, pc):

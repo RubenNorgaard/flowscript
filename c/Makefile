@@ -4,7 +4,7 @@
 #   make test     API unit test + conformance test against the Python VM
 #   make fuzz     run the bytecode fuzzer against ./fsrun-asan
 #   make size     size of flowscript.o built with -Os
-#   make switches check that every FS_NO_FLOAT / FS_NO_TIME / FS_NO_STR combination compiles
+#   make switches check that every FS_NO_FLOAT / FS_NO_TIME / FS_NO_STR / FS_NO_TEXT combination compiles
 
 CC      ?= cc
 CFLAGS  ?= -std=c99 -Wall -Wextra -pedantic -O2 -ffp-contract=off
@@ -30,19 +30,21 @@ fsrun-nofloat: fsrun.c flowscript.c flowscript.h
 fsrun-notime-nostr: fsrun.c flowscript.c flowscript.h
 	$(CC) $(ASANFLAGS) -DFS_NO_TIME -DFS_NO_STR -Werror -o $@ fsrun.c flowscript.c -lm
 
-fsrun-min: fsrun.c flowscript.c flowscript.h
-	$(CC) $(ASANFLAGS) -DFS_NO_FLOAT -DFS_NO_TIME -DFS_NO_STR -Werror -o $@ fsrun.c flowscript.c
+fsrun-notext: fsrun.c flowscript.c flowscript.h
+	$(CC) $(ASANFLAGS) -DFS_NO_TEXT -Werror -o $@ fsrun.c flowscript.c -lm
 
-VARIANTS = fsrun-nofloat fsrun-notime-nostr fsrun-min
+fsrun-min: fsrun.c flowscript.c flowscript.h
+	$(CC) $(ASANFLAGS) -DFS_NO_FLOAT -DFS_NO_TIME -DFS_NO_STR -DFS_NO_TEXT -Werror -o $@ fsrun.c flowscript.c
+
+VARIANTS = fsrun-nofloat fsrun-notime-nostr fsrun-notext fsrun-min
 
 # every combination of the switches must compile without warnings
 switches:
-	@for f in "" "-DFS_NO_FLOAT" "-DFS_NO_TIME" "-DFS_NO_STR" "-DFS_NO_FLOAT -DFS_NO_TIME" \
-	          "-DFS_NO_FLOAT -DFS_NO_STR" "-DFS_NO_TIME -DFS_NO_STR" \
-	          "-DFS_NO_FLOAT -DFS_NO_TIME -DFS_NO_STR"; do \
+	@for a in "" -DFS_NO_FLOAT; do for b in "" -DFS_NO_TIME; do for c in "" -DFS_NO_STR; do \
+	 for d in "" -DFS_NO_TEXT; do f="$$a $$b $$c $$d"; \
 	  $(CC) -std=c99 -Wall -Wextra -pedantic -Werror -O2 -ffp-contract=off $$f -c -o /dev/null flowscript.c || exit 1; \
 	  $(CC) -std=c99 -Wall -Wextra -pedantic -Werror -O2 -ffp-contract=off $$f -c -o /dev/null fsrun.c || exit 1; \
-	done; echo "switches: all 8 combinations compile"
+	done; done; done; done; echo "switches: all 16 combinations compile"
 
 flowscript.o: flowscript.c flowscript.h
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -Os -ffp-contract=off -c -o $@ flowscript.c

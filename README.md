@@ -230,16 +230,22 @@ cd c && make test                         # C API test + C/Python conformance (n
                                           #   and the reduced FS_NO_* builds)
 cd c && make fuzz                         # corrupt-image fuzzing against the ASan build
 python3 tests/fuzz_c.py --runner fsrun-min  # ... or against a reduced build
+python3 c/codesize.py                     # VM code size for every switch combination
 cd c && make size                         # code size of the VM
 ```
 
 C VM footprint (default sizes): **about 16 KB** of code for Cortex-M4 (`-Os`, Thumb-2,
-code + constants measured with clang; v1, ints only, was 6.6 KB), plus the C library's
-double-precision routines (soft-float on a Cortex-M4) and `floor ceil sqrt exp log pow
-fmod`; no data/bss of its own; a `fs_vm` struct of 9,216 bytes RAM on a 32-bit target
-with the default `FS_*` macros in `flowscript.h` (every value is 16 bytes: a type tag and
-an 8-byte double/int64). Most of that is headroom: see below. Build with
-`-ffp-contract=off` (fused multiply-add would change float results) and link `-lm`.
+what a `--gc-sections` link keeps, measured with `c/codesize.py`; v1, ints only, was
+6.6 KB), plus the C library's double-precision routines (soft-float on a Cortex-M4) and
+`floor ceil sqrt exp log pow fmod`; no data/bss of its own; a `fs_vm` struct of 6,080
+bytes RAM on a 32-bit target with the default `FS_*` macros in `flowscript.h`. Most of
+that is headroom: see below. Build with `-ffp-contract=off` (fused multiply-add would
+change float results) and link `-lm`.
+
+Inside the VM a value is stored as a payload cell (8 bytes: a double or an int64 time
+fits) plus a 1-byte type tag kept in a separate array, so each global, stack slot and
+queued event argument costs 9 bytes rather than the 16 a tagged struct would take after
+padding. Hosts never see this: the API passes `fs_value` structs.
 
 ### Feature switches
 
@@ -250,25 +256,33 @@ Define these when building the C VM to leave out what your programs never use:
 | `FS_NO_FLOAT` | `float` values, the float built-ins, soft-float and libm | everything else; no `-lm` needed |
 | `FS_NO_TIME` | `time` values, `now()` and the date built-ins | `start t every 30s` (timers are not times) |
 | `FS_NO_STR` | strings made at run time: `+` on strings, `str()`, `substr()`, `str` results and event arguments from the host, the string slots | string literals, e.g. `log("started", 3)`, `len()` and `find()` on them |
+| `FS_NO_TEXT` | text conversion of floats and times in scripts: `str(float)`, `str(time)`, `float("...")`, `time("...")` | both types and all their arithmetic; `int` to and from text |
 
 The compiler records in the image which of these a program needs, and `fs_load()`
 refuses an image that needs a left-out feature with `FS_ERR_FEATURE`, so a mismatch
 is caught at download, not in the field. `flowscript size` lists the switches a
 program allows and includes them in its suggested build flags.
 
-| Switches | VM code (Cortex-M4 `-Os`) | value size |
-|---|---|---|
-| none | 16.2 KB + soft-float and libm | 16 bytes |
-| `FS_NO_STR` | 15.4 KB + soft-float and libm | 16 bytes |
-| `FS_NO_TIME` | 13.0 KB + soft-float and libm | 16 bytes |
-| `FS_NO_FLOAT` | 13.7 KB | 16 bytes |
-| `FS_NO_FLOAT FS_NO_TIME` | 9.6 KB | 8 bytes |
-| all three | **8.7 KB**, needing only `memcpy memset memcmp strlen` | 8 bytes |
+`fs_format()`, `fs_parse_float()` and `fs_parse_time()` stay available to the host in
+every build (the test runner prints its traces with them). A device that never calls
+them should link with `-ffunction-sections -Wl,--gc-sections`, so they and, with
+`FS_NO_TEXT`, all the text code are dropped; the figures below assume that.
 
-Values only shrink once both 8-byte types (float and time) are gone. Every combination
-compiles warning-free (`make switches`), and the conformance test runs each program on
-three reduced builds, checking identical traces where the program is allowed and a
-refusal where it is not.
+| Switches | VM code (Cortex-M4 `-Os`) | RAM per stored value |
+|---|---|---|
+| none | 15.7 KB + soft-float and libm | 9 bytes |
+| `FS_NO_STR` | 13.5 KB + soft-float and libm | 9 bytes |
+| `FS_NO_TEXT` | 12.5 KB + soft-float and libm | 9 bytes |
+| `FS_NO_STR FS_NO_TEXT` (e.g. `pct_pid`) | 11.5 KB + soft-float and libm | 9 bytes |
+| `FS_NO_TIME` | 12.5 KB + soft-float and libm | 9 bytes |
+| `FS_NO_FLOAT` | 13.2 KB | 9 bytes |
+| `FS_NO_FLOAT FS_NO_TIME` | 9.2 KB | 5 bytes |
+| `FS_NO_FLOAT FS_NO_TIME FS_NO_STR` (e.g. the GPS tracker) | **8.2 KB**, needing only `memcpy memset memcmp strlen` | 5 bytes |
+
+`python3 c/codesize.py` prints all 16 combinations. Every combination compiles
+warning-free (`make switches`), and the conformance test runs each program on four
+reduced builds, checking identical traces where the program is allowed and a refusal
+where it is not.
 
 ## Optimizing size
 
@@ -281,13 +295,13 @@ debugger's bytecode pane) shows the three budgets separately:
 * **RAM** (`sizeof(fs_vm)`): computed for the defaults and for the smallest `FS_*`
   settings this program runs with. Stack and call depth come from a worst-case analysis of
   the bytecode; the report prints ready-to-use `-D` build flags, including the feature
-  switches. For the GPS example that is 464 bytes instead of 9,216: it uses no floats,
-  times or run-time strings, so all three switches apply, values are 8 bytes and there
-  are no string slots. These settings are also load-time limits, so size them
+  switches. For the GPS example that is 384 bytes instead of 6,080: it uses no floats,
+  times or run-time strings, so those switches apply, a stored value is 5 bytes and
+  there are no string slots. These settings are also load-time limits, so size them
   for the largest program you plan to download. Recursion has no static bound and keeps
   the defaults.
 * **C VM code**: independent of the program, but set by the feature switches: about
-  16 KB with everything, 8.7 KB with all three switches (see the table above).
+  16 KB with everything, 8.2 KB with the smallest set (see the table above).
 
 It also lists concrete savings: unused externs, functions, events, timers and globals,
 globals that could be constants, the cost of names, and the debug section (`-g`).

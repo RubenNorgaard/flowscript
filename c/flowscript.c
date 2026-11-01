@@ -90,6 +90,28 @@ static fs_value zero_of(int type)
     }
 }
 
+/* ---- stored values: payload cell + separate type tag ------------------------- */
+static fs_value cell_value(uint8_t type, fs_cell c)
+{
+    fs_value v = fs_int(0);
+    v.type = type;
+    memcpy(&v.as, &c, sizeof(c));       /* every cell member is also in fs_value.as */
+    return v;
+}
+
+static fs_cell value_cell(fs_value v)
+{
+    fs_cell c;
+    memcpy(&c, &v.as, sizeof(c));
+    return c;
+}
+
+static fs_value gget(const fs_vm *vm, int i) { return cell_value(vm->gtypes[i], vm->globals[i]); }
+static void gset(fs_vm *vm, int i, fs_value v) { vm->gtypes[i] = v.type; vm->globals[i] = value_cell(v); }
+static void sset(fs_vm *vm, int i, fs_value v) { vm->stypes[i] = v.type; vm->stack[i] = value_cell(v); }
+static fs_value qget(const fs_qentry *e, int j) { return cell_value(e->types[j], e->args[j]); }
+static void qset(fs_qentry *e, int j, fs_value v) { e->types[j] = v.type; e->args[j] = value_cell(v); }
+
 /* parameter type i (2 bits each) */
 static int ptype(uint32_t packed, int i) { return (int)((packed >> (2 * i)) & 3u); }
 
@@ -639,7 +661,7 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
         return FS_ERR_VERSION;
     flags = rd16(img + 6);
     if (((flags & 2u) && !FS_HAS_FLOAT) || ((flags & 4u) && !FS_HAS_TIME) ||
-        ((flags & 8u) && !FS_HAS_STR))
+        ((flags & 8u) && !FS_HAS_STR) || ((flags & 16u) && !FS_HAS_TEXT))
         return FS_ERR_FEATURE;
     vm->prog_name = rd16(img + 8);
     vm->prog_version = rd16(img + 10);
@@ -768,13 +790,13 @@ void fs_reset(fs_vm *vm)
         uint64_t u = rd64(g + 1);
         switch (g[0]) {
 #if FS_HAS_FLOAT
-        case FS_FLOAT: vm->globals[i] = fs_float(f64(u)); break;
+        case FS_FLOAT: gset(vm, (int)i, fs_float(f64(u))); break;
 #endif
-        case FS_STR:   vm->globals[i] = v_str((int32_t)u); break;
+        case FS_STR:   gset(vm, (int)i, v_str((int32_t)u)); break;
 #if FS_HAS_TIME
-        case FS_TIME:  vm->globals[i] = fs_time(s64(u)); break;
+        case FS_TIME:  gset(vm, (int)i, fs_time(s64(u))); break;
 #endif
-        default:       vm->globals[i] = fs_int(s32((uint32_t)u)); break;   /* fs_load checked the type */
+        default:       gset(vm, (int)i, fs_int(s32((uint32_t)u))); break;   /* fs_load checked the type */
         }
     }
 #if FS_HAS_STR
@@ -924,14 +946,14 @@ fs_value fs_stack_at(const fs_vm *vm, int i)
 {
     if (!vm || i < 0 || i >= vm->sp || i >= FS_STACK_SIZE)
         return fs_int(0);
-    return vm->stack[i];
+    return cell_value(vm->stypes[i], vm->stack[i]);
 }
 
 fs_value fs_global(const fs_vm *vm, int i)
 {
     if (!vm || !vm->loaded || i < 0 || i >= vm->n_globals)
         return fs_int(0);
-    return vm->globals[i];
+    return gget(vm, i);
 }
 
 const fs_frame *fs_frame_at(const fs_vm *vm, int i)
@@ -1044,10 +1066,10 @@ int fs_strings_in_use(const fs_vm *vm)
 
 #if FS_HAS_STR
 
-static void mark(fs_vm *vm, const fs_value *v)
+static void mark(fs_vm *vm, uint8_t type, fs_cell c)
 {
-    if (v->type == FS_STR && v->as.s < 0 && v->as.s != EMPTY_STR && -1 - v->as.s < FS_STR_SLOTS)
-        vm->strs[-1 - v->as.s].mark = 1;
+    if (type == FS_STR && c.s < 0 && c.s != EMPTY_STR && -1 - c.s < FS_STR_SLOTS)
+        vm->strs[-1 - c.s].mark = 1;
 }
 
 /* Mark and sweep: a slot stays in use while a global, the stack or the queue refers to it. */
@@ -1057,13 +1079,13 @@ static void collect(fs_vm *vm)
     for (i = 0; i < FS_STR_SLOTS; i++)
         vm->strs[i].mark = 0;
     for (i = 0; i < vm->n_globals; i++)
-        mark(vm, &vm->globals[i]);
+        mark(vm, vm->gtypes[i], vm->globals[i]);
     for (i = 0; i < top; i++)
-        mark(vm, &vm->stack[i]);
+        mark(vm, vm->stypes[i], vm->stack[i]);
     for (i = 0; i < vm->q_count; i++) {
         const fs_qentry *e = &vm->queue[(vm->q_head + i) % FS_QUEUE_SIZE];
         for (j = 0; j < FS_MAX_EVENT_ARGS; j++)
-            mark(vm, &e->args[j]);
+            mark(vm, e->types[j], e->args[j]);
     }
     for (i = 0; i < FS_STR_SLOTS; i++)
         if (!vm->strs[i].mark)
@@ -1178,11 +1200,13 @@ int fs_post(fs_vm *vm, int event, const fs_value *args, int argc)
     n = vm->events_tab[6 * event + 2];          /* <= FS_MAX_EVENT_ARGS */
     types = rd16(vm->events_tab + 6 * event + 4);
     for (i = 0; i < FS_MAX_EVENT_ARGS; i++)
-        e->args[i] = fs_int(0);
+        qset(e, i, fs_int(0));
     for (i = 0; i < n; i++) {
         int t = ptype(types, i), err;
-        fs_value v = (args && i < argc) ? args[i] : zero_of(t);
-        err = host_value(vm, v, t, &e->args[i]);
+        fs_value v = (args && i < argc) ? args[i] : zero_of(t), stored;
+        err = host_value(vm, v, t, &stored);
+        if (!err)
+            qset(e, i, stored);
         if (err) {
             vm->q_count--;
             if (err == FS_FAULT_TYPE)
@@ -1297,13 +1321,14 @@ static int handler_state(const fs_vm *vm, int h)
     return st == FS_NONE16 ? -1 : st;
 }
 
-static void begin(fs_vm *vm, int h, const fs_value *args)
+/* e: the queued event whose arguments start the handler, or NULL */
+static void begin(fs_vm *vm, int h, const fs_qentry *e)
 {
     const uint8_t *p = vm->handlers_tab + 8 * h;
     int argc = p[4], nlocals = p[5], n, i;
     n = argc > nlocals ? argc : nlocals;
     for (i = 0; i < n && i < FS_STACK_SIZE; i++)
-        vm->stack[i] = (args && i < argc && i < FS_MAX_EVENT_ARGS) ? args[i] : fs_int(0);
+        sset(vm, i, (e && i < argc && i < FS_MAX_EVENT_ARGS) ? qget(e, i) : fs_int(0));
     vm->sp = n;       /* may exceed FS_STACK_SIZE: see fs_vm.sp */
     vm->handler = h;
     vm->frames[0].ret_pc = -1;
@@ -1357,7 +1382,7 @@ static int dispatch(fs_vm *vm)
         h = find_handler(vm, vm->state, e->event);
         if (h >= 0) {
             /* e stays valid: nothing is queued before begin() copies args */
-            begin(vm, h, e->args);
+            begin(vm, h, e);
             return 1;
         }
     }
@@ -1374,26 +1399,24 @@ static void finish(fs_vm *vm)
 
 /* ---- execution --------------------------------------------------------------------------- */
 /* Stack slot access; slots >= FS_STACK_SIZE are virtual int zeros (see fs_vm.sp). */
-#define SLOT(i) ((i) < FS_STACK_SIZE ? vm->stack[(i)] : fs_int(0))
+#define SLOT(i) ((i) < FS_STACK_SIZE ? cell_value(vm->stypes[(i)], vm->stack[(i)]) : fs_int(0))
 
 #define FAULT(c) do { fault = (c); goto faulted; } while (0)
 #define POP(v) do { if (vm->sp <= 0) FAULT(FS_FAULT_STACK_UNDERFLOW); \
                     vm->sp--; (v) = SLOT(vm->sp); } while (0)
 #define PUSH(v) do { fs_value pv_ = (v); if (vm->sp >= FS_STACK_SIZE) FAULT(FS_FAULT_STACK_OVERFLOW); \
-                     vm->stack[vm->sp++] = pv_; } while (0)
+                     sset(vm, vm->sp++, pv_); } while (0)
 #define POPINT(v) do { fs_value pi_; POP(pi_); if (pi_.type != FS_INT) FAULT(FS_FAULT_TYPE); (v) = pi_.as.i; } while (0)
 
-#define MAX_CALL_ARGS 16
+/* externs take at most 16 arguments (fs_load), built-ins 6, events FS_MAX_EVENT_ARGS */
+#define MAX_CALL_ARGS (FS_MAX_EVENT_ARGS > 16 ? FS_MAX_EVENT_ARGS : 16)
 
-/* The top n values (caller checked sp >= n) as a contiguous view, left on the
- * stack.  Values in virtual slots (see fs_vm.sp) are gathered into tmp
- * (MAX_CALL_ARGS entries); returns NULL if they do not fit there, which is
- * only possible for hand-crafted bytecode. */
+/* The top n values (caller checked sp >= n), left on the stack, gathered into
+ * tmp (MAX_CALL_ARGS entries) as fs_values for type checks and callbacks.
+ * Returns NULL if n does not fit, which only hand-crafted bytecode can cause. */
 static const fs_value *arg_view(fs_vm *vm, int n, fs_value *tmp)
 {
     int base = vm->sp - n, i;
-    if (base + n <= FS_STACK_SIZE)
-        return &vm->stack[base];
     if (n > MAX_CALL_ARGS)
         return NULL;
     for (i = 0; i < n; i++)
@@ -1583,6 +1606,7 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
     switch (id) {
 #if FS_HAS_FLOAT
     case 0: *r = fs_float((double)a[0].as.i); return 0;
+#if FS_HAS_TEXT
     case 1: {
         double f;
         const char *p = sbytes(vm, a[0], &n);
@@ -1591,6 +1615,7 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
         *r = fs_float(f);
         return 0;
     }
+#endif
 #if FS_HAS_TIME
     case 2: *r = fs_float((double)a[0].as.t / 1000.0); return 0;
 #endif
@@ -1612,14 +1637,15 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
     }
 #if FS_HAS_STR
     case 5: n = fmt_i64(a[0].as.i, tmp); return new_text(vm, tmp, n, r);
-#if FS_HAS_FLOAT
+#if FS_HAS_FLOAT && FS_HAS_TEXT
     case 6: n = fmt_float(a[0].as.f, tmp); return new_text(vm, tmp, n, r);
 #endif
-#if FS_HAS_TIME
+#if FS_HAS_TIME && FS_HAS_TEXT
     case 7: n = fmt_time(a[0].as.t, tmp); return new_text(vm, tmp, n, r);
 #endif
 #endif /* FS_HAS_STR */
 #if FS_HAS_TIME
+#if FS_HAS_TEXT
     case 8: {
         int64_t t;
         const char *p = sbytes(vm, a[0], &n);
@@ -1628,6 +1654,7 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
         *r = fs_time(t);
         return 0;
     }
+#endif
     case 9: case 10: {
         int64_t t;
         if (make_time(a[0].as.i, a[1].as.i, a[2].as.i, id == 10 ? a[3].as.i : 0,
@@ -1796,13 +1823,13 @@ static int execute(fs_vm *vm)
     case OP_LOADG:
         if (arg >= vm->n_globals)
             FAULT(FS_FAULT_BAD_OPCODE);
-        PUSH(vm->globals[arg]);
+        PUSH(gget(vm, (int)arg));
         break;
     case OP_STOREG:
         if (arg >= vm->n_globals)
             FAULT(FS_FAULT_BAD_OPCODE);
         POP(v);
-        vm->globals[arg] = v;
+        gset(vm, (int)arg, v);
         break;
     case OP_LOADL: {
         int i = vm->frames[vm->nframes - 1].base + (int)arg;
@@ -1818,7 +1845,7 @@ static int execute(fs_vm *vm)
         if (i >= vm->sp)
             FAULT(FS_FAULT_BAD_OPCODE);
         if (i < FS_STACK_SIZE)
-            vm->stack[i] = v;
+            sset(vm, i, v);
         break;
     }
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
