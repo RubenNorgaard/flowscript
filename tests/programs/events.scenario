@@ -1,0 +1,16 @@
+post three 1 2 3
+post three 1         # missing args are zero
+post three           # all missing
+post three 1 2 3 4 5 # extras ignored
+post few 10 20
+post noargs          # state handler wins: goto two
+post three 1 2 3
+post few 10 20
+post few
+post unhandled 1
+post flood 3
+post flood 16        # exactly fills the queue
+post flood 20        # 4 queue-full faults (handler continues)
+dump
+post noargs
+post three -1 -2 -3

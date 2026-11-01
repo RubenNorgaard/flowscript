@@ -1,0 +1,7 @@
+__pycache__/
+*.fsb
+*.o
+*.dSYM/
+c/fsrun
+c/fsrun-asan
+c/test_api

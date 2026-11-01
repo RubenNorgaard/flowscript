@@ -1,0 +1,9 @@
+tick 100        # a: blink
+post arm        # global handler starts slow: keeps running in b
+post go 2       # helper started, then a -> a: blink/helper/late stop, enter restarts blink
+tick 300        # blink x1, slow x1 (no catch-up), keep x1; helper and late stopped
+post go 1       # helper started again, then a -> b: blink, helper, late stop
+tick 1000       # b: only slow and keep fire
+dump
+post go 0       # b -> a: blink restarted
+tick 100

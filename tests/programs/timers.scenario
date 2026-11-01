@@ -1,0 +1,47 @@
+post cmd 1 100       # one-shot 100ms
+tick 50
+tick 49
+tick 1               # fires
+tick 1000            # stopped: nothing
+post cmd 1 100
+tick 60
+post cmd 1 100       # restart resets remaining
+tick 60
+tick 40              # fires
+post cmd 1 100
+post cmd 3 0         # stop
+tick 200
+post cmd 2 30        # periodic 30
+tick 30
+tick 29
+tick 1
+tick 95              # catch-up: fires once, remaining += period
+tick 5
+tick 1000            # fires once, remaining reset to period
+tick 29
+tick 1
+post cmd 2 10        # restart periodic
+tick 0
+tick 10
+post cmd 4 0
+tick 100
+post cmd 5 0         # zero period: fires on every tick, even tick 0
+tick 0
+tick 1
+post cmd 6 0
+post cmd 5 -5        # negative period
+tick 0
+tick -10
+post cmd 6 0
+post cmd 7 -1        # negative one-shot fires on next tick
+tick 0
+tick 49
+tick 1
+tick 1
+tick 2147483647
+tick -2147483648
+tick 50
+post cmd 2 1
+tick 2147483647
+tick 1
+dump

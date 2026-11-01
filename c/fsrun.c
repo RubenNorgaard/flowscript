@@ -1,0 +1,345 @@
+/*
+ * fsrun - run a FlowScript bytecode image against a scenario file and print
+ * the canonical trace (byte-identical to flowscript/runner.py).
+ *
+ *   fsrun program.fsb [scenario]
+ *
+ * Every extern is bound to a stub that prints "call NAME(args) -> r" and
+ * returns r (set with the scenario command "extern NAME VALUE", default 0).
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "flowscript.h"
+
+static fs_vm vm;
+static int64_t stub_value[FS_MAX_EXTERNS];
+static int last_state = -1;
+static int prepass;            /* first pass over the scenario: only look for host_timers */
+static int host_timers;
+
+static void die(const char *msg, const char *arg)
+{
+    fflush(stdout);
+    fprintf(stderr, "fsrun: %s%s%s\n", msg, arg ? ": " : "", arg ? arg : "");
+    exit(1);
+}
+
+static char *read_file(const char *path, size_t *len_out)
+{
+    FILE *f = fopen(path, "rb");
+    char *buf = NULL;
+    size_t len = 0, cap = 0, n;
+    if (!f)
+        die("cannot open", path);
+    for (;;) {
+        if (cap - len < 4096) {
+            char *nb;
+            cap = cap ? cap * 2 : 65536;
+            nb = realloc(buf, cap + 1);
+            if (!nb)
+                die("out of memory", NULL);
+            buf = nb;
+        }
+        n = fread(buf + len, 1, cap - len, f);
+        len += n;
+        if (n == 0)
+            break;
+    }
+    if (ferror(f))
+        die("read error", path);
+    fclose(f);
+    buf[len] = 0;
+    *len_out = len;
+    return buf;
+}
+
+/* Python int(s, 0).  Returns 0 on success; *wrapped gets the value modulo
+ * 2^32, *full the exact value (*full_ok = 0 if it does not fit in int64). */
+static int parse_int(const char *s, int32_t *wrapped, int64_t *full, int *full_ok)
+{
+    int neg = 0, base = 10, ndig = 0, prev_us = 0, overflow = 0, all_zero = 1, first;
+    uint64_t acc = 0;
+    uint32_t w;
+    if (*s == '+' || *s == '-')
+        neg = *s++ == '-';
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) base = 16, s += 2;
+    else if (s[0] == '0' && (s[1] == 'o' || s[1] == 'O')) base = 8, s += 2;
+    else if (s[0] == '0' && (s[1] == 'b' || s[1] == 'B')) base = 2, s += 2;
+    first = (base == 10) ? -1 : 0;
+    if (base != 10 && *s == '_')       /* "0x_1f" is valid */
+        s++, prev_us = 1;
+    for (; *s; s++) {
+        int d;
+        if (*s == '_') {
+            if (prev_us || ndig == 0)
+                return -1;
+            prev_us = 1;
+            continue;
+        }
+        if (*s >= '0' && *s <= '9') d = *s - '0';
+        else if (*s >= 'a' && *s <= 'z') d = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'Z') d = *s - 'A' + 10;
+        else return -1;
+        if (d >= base)
+            return -1;
+        if (first < 0)
+            first = d;
+        if (d)
+            all_zero = 0;
+        if (acc > (UINT64_MAX - (uint64_t)d) / (uint64_t)base)
+            overflow = 1;
+        acc = acc * (uint64_t)base + (uint64_t)d;
+        ndig++;
+        prev_us = 0;
+    }
+    if (ndig == 0 || prev_us)
+        return -1;
+    if (base == 10 && first == 0 && !all_zero)   /* "010" is invalid in Python */
+        return -1;
+    w = (uint32_t)acc;
+    if (neg)
+        w = 0u - w;
+    *wrapped = (w & 0x80000000u) ? -(int32_t)(~w) - 1 : (int32_t)w;
+    *full_ok = !overflow && acc <= (uint64_t)INT64_MAX;
+    *full = *full_ok ? (neg ? -(int64_t)acc : (int64_t)acc) : 0;
+    return 0;
+}
+
+static int32_t parse_wrapped(const char *s)
+{
+    int32_t w;
+    int64_t f;
+    int ok;
+    if (parse_int(s, &w, &f, &ok) != 0)
+        die("invalid integer", s);
+    return w;
+}
+
+static int64_t parse_full(const char *s)
+{
+    int32_t w;
+    int64_t f;
+    int ok;
+    if (parse_int(s, &w, &f, &ok) != 0)
+        die("invalid integer", s);
+    if (!ok)
+        die("integer out of range", s);
+    return f;
+}
+
+/* ---- callbacks ---------------------------------------------------------------- */
+static void print_args(const int32_t *args, int argc)
+{
+    int i;
+    for (i = 0; i < argc; i++)
+        printf(i ? ",%ld" : "%ld", (long)args[i]);
+}
+
+static int32_t stub(fs_vm *v, const int32_t *args, int argc, void *user)
+{
+    int idx = fs_current_extern(v);
+    int64_t r = stub_value[idx];
+    uint32_t w = (uint32_t)(uint64_t)r;
+    (void)user;
+    printf("call %s(", fs_extern_name(v, idx));
+    print_args(args, argc);
+    printf(") -> %lld\n", (long long)r);
+    return (w & 0x80000000u) ? -(int32_t)(~w) - 1 : (int32_t)w;
+}
+
+static void on_emit(fs_vm *v, int event, const int32_t *args, int argc, void *user)
+{
+    (void)user;
+    printf("emit %s(", fs_event_name(v, event));
+    print_args(args, argc);
+    printf(")\n");
+}
+
+static void on_fault(fs_vm *v, int code, int pc, void *user)
+{
+    (void)v;
+    (void)user;
+    printf("fault %d at %d\n", code, pc);
+}
+
+static void on_timer(fs_vm *v, int timer, int start, int32_t ms, int periodic, void *user)
+{
+    (void)user;
+    if (start)
+        printf("timer %s %s %ld\n", periodic ? "every" : "start", fs_timer_name(v, timer), (long)ms);
+    else
+        printf("timer stop %s\n", fs_timer_name(v, timer));
+}
+
+/* ---- scenario ------------------------------------------------------------------ */
+static void run(void)
+{
+    for (;;) {
+        int r = fs_step(&vm);
+        if (fs_state(&vm) != last_state) {
+            last_state = fs_state(&vm);
+            printf("state %s\n", fs_state_name(&vm, last_state));
+        }
+        if (r == FS_IDLE)
+            break;
+    }
+}
+
+static void dump(void)
+{
+    int i, n = fs_global_count(&vm);
+    for (i = 0; i < n; i++)
+        printf("global[%d] = %ld\n", i, (long)fs_global(&vm, i));
+}
+
+/* Python str.split()/strip() whitespace (ASCII subset) */
+static int is_ws(int c)
+{
+    return c == ' ' || (c >= '\t' && c <= '\r') || (c >= 0x1c && c <= 0x1f);
+}
+
+/* Python str.splitlines() line breaks (ASCII subset) */
+static int is_nl(int c)
+{
+    return c == '\n' || c == '\r' || c == '\v' || c == '\f' || (c >= 0x1c && c <= 0x1e);
+}
+
+#define MAX_WORDS 64
+
+static void exec_line(char *line)
+{
+    char *w[MAX_WORDS];
+    int n = 0, i;
+    char *p = strchr(line, '#');
+    if (p)
+        *p = 0;
+    p = line;
+    while (*p) {
+        while (*p && is_ws((unsigned char)*p))
+            *p++ = 0;
+        if (!*p)
+            break;
+        if (n == MAX_WORDS)
+            die("too many words in scenario line", NULL);
+        w[n++] = p;
+        while (*p && !is_ws((unsigned char)*p))
+            p++;
+    }
+    if (n == 0)
+        return;
+    if (prepass) {
+        if (strcmp(w[0], "host_timers") == 0)
+            host_timers = 1;
+        return;
+    }
+    if (strcmp(w[0], "host_timers") == 0) {
+        /* handled in the first pass */
+    } else if (strcmp(w[0], "fire") == 0) {
+        int t;
+        if (n < 2)
+            die("fire needs a timer", NULL);
+        for (t = 0; t < fs_timer_count(&vm); t++)
+            if (strcmp(fs_timer_name(&vm, t), w[1]) == 0)
+                break;
+        if (t == fs_timer_count(&vm))
+            die("unknown timer", w[1]);
+        if (fs_timer_expired(&vm, t) == FS_TIMER_STOPPED)
+            printf("fire %s ignored\n", w[1]);
+        run();
+    } else if (strcmp(w[0], "extern") == 0) {
+        int64_t val;
+        if (n < 3)
+            die("extern needs NAME VALUE", NULL);
+        val = parse_full(w[2]);
+        for (i = 0; i < vm.n_externs; i++)
+            if (strcmp(fs_extern_name(&vm, i), w[1]) == 0)
+                stub_value[i] = val;
+    } else if (strcmp(w[0], "post") == 0) {
+        int32_t args[MAX_WORDS];
+        int ev;
+        if (n < 2)
+            die("post needs an event", NULL);
+        ev = fs_event_id(&vm, w[1]);
+        if (ev < 0)
+            die("unknown event", w[1]);
+        for (i = 2; i < n; i++)
+            args[i - 2] = parse_wrapped(w[i]);
+        fs_post(&vm, ev, args, n - 2);
+        run();
+    } else if (strcmp(w[0], "tick") == 0) {
+        int64_t ms;
+        if (n < 2)
+            die("tick needs a value", NULL);
+        ms = parse_full(w[1]);
+        if (ms < INT32_MIN || ms > INT32_MAX)
+            die("tick value out of int32 range", w[1]);
+        fs_tick(&vm, (int32_t)ms);
+        run();
+    } else if (strcmp(w[0], "dump") == 0) {
+        dump();
+    } else {
+        die("unknown scenario command", w[0]);
+    }
+}
+
+static void exec_scenario(char *sc, size_t slen)
+{
+    char *p = sc, *line;
+    while (p < sc + slen) {
+        line = p;
+        while (p < sc + slen && !is_nl((unsigned char)*p))
+            p++;
+        if (p < sc + slen) {
+            if (*p == '\r' && p + 1 < sc + slen && p[1] == '\n')
+                *p++ = 0;
+            *p++ = 0;
+        }
+        exec_line(line);
+    }
+}
+
+int main(int argc, char **argv)
+{
+    size_t len, slen = 0;
+    char *img, *sc = NULL;
+    int rc, i;
+
+    if (argc < 2 || argc > 3) {
+        fprintf(stderr, "usage: fsrun program.fsb [scenario]\n");
+        return 2;
+    }
+    img = read_file(argv[1], &len);
+    rc = fs_load(&vm, (const uint8_t *)img, len);
+    if (rc != FS_OK) {
+        fprintf(stderr, "fsrun: %s: invalid bytecode image (error %d)\n", argv[1], rc);
+        return 1;
+    }
+    for (i = 0; i < vm.n_externs; i++)
+        fs_bind_index(&vm, i, stub);
+    fs_set_callbacks(&vm, on_emit, on_fault, NULL);
+    if (argc == 3)
+        sc = read_file(argv[2], &slen);
+    if (sc) {
+        char *copy = malloc(slen + 1);
+        if (!copy)
+            die("out of memory", NULL);
+        memcpy(copy, sc, slen + 1);
+        prepass = 1;
+        exec_scenario(copy, slen);
+        prepass = 0;
+        free(copy);
+    }
+    if (host_timers)
+        fs_set_timer_handler(&vm, on_timer);
+
+    fs_start(&vm);
+    run();
+    if (sc)
+        exec_scenario(sc, slen);
+    dump();
+    free(sc);
+    free(img);
+    return 0;
+}

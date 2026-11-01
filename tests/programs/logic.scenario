@@ -1,0 +1,14 @@
+post test
+extern a 1
+post test
+extern b 7
+post test
+extern a 0
+extern c -1
+post test
+extern a 2
+extern b 5
+extern c 0
+post test
+extern a 0x80000000
+post test

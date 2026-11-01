@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlowScript Debugger</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="toolbar">
+  <div class="brand"><span class="logo">◇</span> FlowScript <span id="filename" class="muted"></span></div>
+  <div class="group">
+    <button id="btn-compile" title="Compile source (Ctrl+Enter)">⚙ Compile</button>
+    <button id="btn-format" title="Reformat source from the model">≡ Format</button>
+    <button id="btn-save" title="Save source to file (Ctrl+S)">💾 Save</button>
+    <button id="btn-download" title="Download bytecode (.fsb)">⬇ .fsb</button>
+  </div>
+  <div class="group">
+    <button id="btn-reset" title="Reset VM (re-run boot)">⟲ Reset</button>
+    <button id="btn-instr" title="Step one instruction (F7)">Step instr</button>
+    <button id="btn-stmt" title="Step into: next flowchart node (F11)">Step node</button>
+    <button id="btn-over" title="Step over function calls (F10)">Step over</button>
+    <button id="btn-out" title="Step out of function (Shift+F11)">Step out</button>
+    <button id="btn-handler" title="Finish current handler">Finish</button>
+    <button id="btn-run" class="primary" title="Run until idle or breakpoint (F5)">▶ Run</button>
+  </div>
+  <div class="group">
+    <select id="ev-select" title="Event to post"></select>
+    <input id="ev-args" placeholder="args e.g. 1, 2" size="8" title="Event arguments, comma separated">
+    <button id="btn-post" title="Queue the event">Post</button>
+    <label class="chk" title="Run until idle after posting / ticking"><input type="checkbox" id="auto-run" checked> auto-run</label>
+  </div>
+  <div class="group">
+    <input id="tick-ms" value="1000" size="7" title="Milliseconds (units allowed: 30s, 5min, 1h)">
+    <button id="btn-tick" title="Advance VM time">Tick</button>
+    <button class="small" data-tick="1000">1s</button>
+    <button class="small" data-tick="30000">30s</button>
+    <button class="small" data-tick="3600000">1h</button>
+  </div>
+  <div id="status" class="status"></div>
+</header>
+
+<main id="views">
+  <section class="pane" id="pane-src">
+    <div class="pane-head"><span class="pane-title">1 · FlowScript</span><span id="src-info" class="muted"></span></div>
+    <div class="editor" id="editor">
+      <div class="gutter" id="gutter"></div>
+      <div class="code-wrap">
+        <pre class="code-hl" id="code-hl" aria-hidden="true"></pre>
+        <textarea id="code" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+      </div>
+    </div>
+    <div id="errors"></div>
+  </section>
+  <div class="splitter" data-split="0"></div>
+  <section class="pane" id="pane-bc">
+    <div class="pane-head"><span class="pane-title">2 · Bytecode</span>
+      <span class="seg" id="bc-mode">
+        <button data-mode="code" class="on" title="Disassembly">Code</button>
+        <button data-mode="size" title="Where the bytes go, RAM needed by the C VM, hints">Size</button>
+      </span>
+      <span id="bc-info" class="muted"></span></div>
+    <div class="bytecode" id="bytecode"></div>
+    <div class="sizeview hidden" id="sizeview"></div>
+  </section>
+  <div class="splitter" data-split="1"></div>
+  <section class="pane" id="pane-fc">
+    <div class="pane-head">
+      <span class="pane-title">3 · Flowchart</span>
+      <span class="seg" id="fc-mode">
+        <button data-mode="flow" class="on">Flow</button>
+        <button data-mode="states">States</button>
+      </span>
+      <span class="seg">
+        <button id="zoom-out" title="Zoom out">−</button>
+        <button id="zoom-fit" title="Reset zoom">100%</button>
+        <button id="zoom-in" title="Zoom in">+</button>
+      </span>
+      <label class="chk" title="Scroll to the executing node"><input type="checkbox" id="follow" checked> follow</label>
+      <label class="chk" title="Edit the program in the flowchart"><input type="checkbox" id="edit-mode"> edit</label>
+    </div>
+    <div class="chart-wrap" id="chart-wrap"><div id="chart"></div></div>
+    <div id="inspector" class="inspector hidden"></div>
+  </section>
+</main>
+
+<footer id="bottom">
+  <div class="panel">
+    <h3>Machine</h3>
+    <div id="machine"></div>
+  </div>
+  <div class="panel">
+    <h3>Globals</h3>
+    <div id="globals"></div>
+  </div>
+  <div class="panel">
+    <h3>Frames &amp; stack</h3>
+    <div id="frames"></div>
+  </div>
+  <div class="panel">
+    <h3>Host stubs <span class="muted">(extern return values)</span></h3>
+    <div id="externs"></div>
+  </div>
+  <div class="panel grow">
+    <h3>Trace <button class="small" id="btn-clear-log">clear</button></h3>
+    <div id="log"></div>
+  </div>
+</footer>
+
+<div id="menu" class="menu hidden"></div>
+<script src="chart.js"></script>
+<script src="edit.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+extern gps_has_fix 1
+extern battery_mv 3900
+extern gps_speed 50
+tick 3600000
+post ignition 1
+extern gps_speed 120
+tick 30000
+tick 30000
+tick 30000
+extern gps_speed 60
+tick 30000
+post ignition 0
+post motion 9
+tick 10000
+post button
+# no GPS fix while driving, then park: the 2 min fix timeout survives the state change
+extern gps_has_fix 0
+post ignition 1
+tick 30000
+post ignition 0
+tick 120000

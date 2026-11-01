@@ -1,0 +1,7 @@
+post chain 200     # 201 dispatches: fine
+post spin          # raise_event loop -> fault 9
+dump
+post chain 3
+post pingpong      # goto loop -> fault 9, stays in ping or pong
+dump
+post hello         # the VM still works afterwards

@@ -1,0 +1,31 @@
+post calc 2147483647 1
+post calc -2147483648 -1
+post calc 0x7fffffff 0x7fffffff
+post calc 65536 65536
+post calc 46341 46341
+post calc 4294967295 0x1FFFFFFFF   # values wrap to int32 on post
+post calc -5 3
+post divmod -7 2
+post divmod 7 -2
+post divmod -7 -2
+post divmod 7 2
+post divmod -2147483648 -1
+post divmod -2147483648 1
+post divmod -2147483648 2147483647
+post divmod 2147483647 -2147483648
+post divmod 5 0          # fault 3, handler aborted
+dump
+post divmod 0 0
+post divmod -1 3
+post shifts 1 31
+post shifts 1 32
+post shifts -1 31
+post shifts -8 1
+post shifts -2147483648 33
+post shifts 0x40000000 2
+post shifts -5 -1
+post shifts 12345 0
+post unary -2147483648
+post unary 0
+post unary 5
+post unary -1

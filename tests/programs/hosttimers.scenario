@@ -1,0 +1,12 @@
+host_timers
+fire beat         # periodic: stays running
+fire local
+fire once         # one-shot: fired, now stopped
+fire once         # stale: ignored
+fire beat
+post go           # leaving idle stops 'local' (owned by idle); 'once' already stopped
+fire local        # stale: ignored
+fire once         # busy's one-shot -> back to idle, timers restarted
+post halt         # global stop
+fire beat         # ignored
+tick 5000         # does nothing with host timers
