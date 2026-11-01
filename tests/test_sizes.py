@@ -89,7 +89,7 @@ class AgainstC(unittest.TestCase):
                 exe = os.path.join(tmp, "fsrun_min")
                 subprocess.check_call([CC, "-O1", "-I", os.path.join(ROOT, "c")] + flags +
                                       [os.path.join(ROOT, "c", "flowscript.c"),
-                                       os.path.join(ROOT, "c", "fsrun.c"), "-o", exe])
+                                       os.path.join(ROOT, "c", "fsrun.c"), "-o", exe, "-lm"])
                 fsb = os.path.join(tmp, "p.fsb")
                 with open(fsb, "wb") as f:
                     f.write(prog.to_bytes())
