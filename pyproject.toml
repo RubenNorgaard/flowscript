@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowscript-vm"
+dynamic = ["version"]
+description = "An event-driven scripting language whose programs are flowcharts: compiler, bytecode VM and SVG flowcharts"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ruben Nørgaard" }]
+keywords = ["scripting", "state machine", "flowchart", "bytecode", "virtual machine", "embedded"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Software Development :: Interpreters",
+    "Topic :: Software Development :: Embedded Systems",
+    "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/RubenNorgaard/flowscript"
+Specification = "https://github.com/RubenNorgaard/flowscript/blob/main/SPEC.md"
+
+[project.scripts]
+flowscript = "flowscript.cli:main"
+
+[tool.setuptools]
+packages = ["flowscript", "flowscript.debugger", "flowscript.debugger.static"]
+
+[tool.setuptools.package-data]
+"flowscript.debugger.static" = ["*.html", "*.js", "*.css"]
+
+[tool.setuptools.dynamic]
+version = { attr = "flowscript.__version__" }

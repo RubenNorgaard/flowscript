@@ -1,0 +1,6 @@
+include README.md SPEC.md LICENSE
+recursive-include flowscript/debugger/static *
+recursive-include examples *.fs *.scenario
+recursive-include tests *.py *.fs *.scenario
+include c/*.c c/*.h c/Makefile c/*.py
+global-exclude *.pyc __pycache__ *.fsb

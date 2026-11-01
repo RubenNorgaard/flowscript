@@ -84,6 +84,11 @@ class Program:
         # debug info (optional)
         self.lines = []        # (pc, line, node)
         self.global_names = []
+        # set by flowscript.compile(); None/empty for a program loaded from bytecode
+        self.source = None
+        self.ast = None
+        self.debug_info = None
+        self.warnings = []
 
     # -- helpers -------------------------------------------------------------
     def event_index(self, name):
@@ -110,6 +115,11 @@ class Program:
         return glob
 
     # -- serialisation ---------------------------------------------------------
+    def save(self, path, debug=False):
+        """Write the .fsb image (debug=True adds source lines and global names)."""
+        with open(path, "wb") as f:
+            f.write(self.to_bytes(debug))
+
     def to_bytes(self, debug=False):
         strings = list(self.strings)
 

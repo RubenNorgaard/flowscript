@@ -9,3 +9,6 @@ c/fsrun-nofloat
 c/fsrun-notime-nostr
 c/fsrun-min
 c/fsrun-notext
+build/
+dist/
+*.egg-info/

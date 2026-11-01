@@ -37,7 +37,63 @@ python3 -m flowscript ast examples/gps_tracker.fs       # the visual model as JS
 cd c && make && ./fsrun ../examples/gps_tracker.fsb ../examples/gps_tracker.scenario
 ```
 
-Requirements: Python 3.8+ (stdlib only), any C99 compiler. No other dependencies.
+Requirements: Python 3.9+ (stdlib only), any C99 compiler. No other dependencies.
+
+## Using FlowScript from Python
+
+```sh
+pip install flowscript-vm          # imports as `flowscript`; adds the `flowscript` command
+```
+
+A Python service can compile scripts, run them (from source or bytecode) and draw them:
+
+```python
+import time
+import flowscript
+
+program = flowscript.compile(source)          # flowscript.CompileError(.line, .col) on errors
+for w in program.warnings:                     # compiles, but probably not as intended
+    print(w.line, w.message)
+
+machine = flowscript.Machine(
+    program,                                   # or bytecode: flowscript.load(path_or_bytes)
+    externs={"param": settings.__getitem__,    # one Python callable per `extern`
+             "diag": diagnostics.__setitem__},
+    clock=time.time,                           # what now() returns (seconds, or a datetime)
+    on_event=lambda name, args: ...,           # every raise_event
+    on_fault=lambda fault: log.warning(fault), # also kept in machine.faults
+)
+machine.start()                                # on boot, then enter the initial state
+machine.send("tick")                           # post an event and run until idle
+machine.advance(1000)                          # let timers run for 1 s (or run them yourself:
+                                               #   on_timer=... and machine.timer_expired(name))
+machine.state                                  # "trading"
+machine["aggression"], machine.globals         # variables by name
+
+data = program.to_bytes()                      # the .fsb image the C VM runs; program.save(path)
+```
+
+Values cross the boundary as plain Python: `int`, `float`, `str` and timezone-aware
+`datetime` for FlowScript's `time`. The Python VM is the reference implementation: a
+program behaves exactly as on the C VM, including faults (a faulting handler is aborted
+and reported; the machine carries on).
+
+### Flowcharts as SVG
+
+```python
+svg = flowscript.to_svg(program)                          # the flowchart
+svg = flowscript.to_svg(program, view="states")           # the state diagram
+svg = flowscript.to_svg(program, state=machine.state,     # highlight the live state
+                        width="100%")                     # scale to the container
+```
+
+The result is a self-contained `<svg>` string: inline it in a page (in a Django template:
+`{{ svg|safe }}`) or save it as a file. It has no scripts and no external references.
+Its colours are CSS variables (`--fs-bg`, `--fs-fg`, `--fs-accent`, ... see
+`flowscript.svg.THEMES`) that the page may override, and `theme="auto"` (the default)
+follows `prefers-color-scheme` and a `data-theme="light"`/`"dark"` attribute on an
+ancestor such as `<html>`; `theme="dark"`/`"light"` fix it. Nodes carry `data-line` (the
+source line) and states `data-state`, for pages that add their own interaction.
 
 ## The language in one page
 
@@ -90,7 +146,7 @@ time, with int → float promotion and nothing else implicit; built-in conversio
 and math functions (`abs min max floor ceil round sqrt exp log pow`). Statements:
 `if/elif/else`, `while`, `goto_state`, `raise_event`, `start/stop`, `return`, functions,
 and the operators `or xor and not == != < <= > >= | ^ & << >> + - * / % ~`. That is the
-whole language. See [SPEC.md](SPEC.md) for the exact semantics and the bytecode format.
+whole language. See [SPEC.md](https://github.com/RubenNorgaard/flowscript/blob/main/SPEC.md) for the exact semantics and the bytecode format.
 
 Strings made at run time live in a fixed pool of slots inside the VM (`FS_STR_SLOTS` ×
 `FS_STR_LEN` bytes, default 16 × 64), reclaimed by a mark-and-sweep pass when the pool is
@@ -197,7 +253,7 @@ Like every VM call, `fs_timer_expired` and `fs_run` must not interrupt a running
 A timer belongs to the state whose handler started it and stops automatically when
 that state is left; in this mode the VM then calls `on_timer(..., start = 0, ...)`.
 
-See [`c/flowscript.h`](c/flowscript.h) for the full API and `c/fsrun.c` for a complete
+See [`c/flowscript.h`](https://github.com/RubenNorgaard/flowscript/blob/main/c/flowscript.h) for the full API and `c/fsrun.c` for a complete
 host. The loader validates the whole image and every run-time operand, faults abort only
 the current handler, each handler has an instruction budget, and a script that keeps
 itself busy forever (e.g. two states whose `enter` handlers `goto_state` each other) is stopped
@@ -208,7 +264,10 @@ firmware.
 
 ```
 SPEC.md                 language + bytecode specification (normative)
+pyproject.toml          the Python package (pip install flowscript-vm)
 flowscript/             Python toolchain
+  api.py                host API: compile(), load(), Machine
+  svg.py                SVG flowcharts and state diagrams (to_svg)
   lexer.py parser.py    source -> AST (= visual model, JSON)
   printer.py            AST -> canonical source
   compiler.py           AST -> bytecode + debug info
@@ -307,3 +366,7 @@ It also lists concrete savings: unused externs, functions, events, timers and gl
 globals that could be constants, the cost of names, and the debug section (`-g`).
 The struct layout is checked against the C compiler and the minimum settings against
 every test program (`tests/test_sizes.py`).
+
+## License
+
+MIT, see [LICENSE](https://github.com/RubenNorgaard/flowscript/blob/main/LICENSE).
