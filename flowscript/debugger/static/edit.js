@@ -14,7 +14,7 @@ const Edit = (function () {
   let tmpId = -1;
 
   const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-  const KEYWORDS = new Set("flow version extern event timer const var func on state initial any_state pass if elif else while goto_state raise_event start every stop return and or xor not true false".split(" "));
+  const KEYWORDS = new Set("flow version extern event timer const int float str time func on state initial any_state pass if elif else while goto_state raise_event start every stop return and or xor not true false".split(" "));
   const $ = (s) => document.querySelector(s);
   const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
@@ -62,20 +62,32 @@ const Edit = (function () {
     for (let i = 1; ; i++) if (!used.has(base + i)) return base + i;
   }
 
+  const TYPES = ["int", "float", "str", "time"];
+  // a literal of the zero value of a type, for new call/raise_event arguments
+  function zeroOf(t) {
+    if (t === "float") return { id: nid(), type: "num", line: 0, value: 0, text: "0.0" };
+    if (t === "str") return { id: nid(), type: "str", line: 0, value: "" };
+    if (t === "time") return { id: nid(), type: "callx", line: 0, name: "time", args: [1970, 1, 1].map((v) => ({ id: nid(), type: "num", line: 0, value: v, text: String(v) })) };
+    return num(0);
+  }
+  const zeros = (d) => (d.params || []).map((_, i) => zeroOf((d.ptypes || [])[i] || "int"));
+  // "int a, float b" <-> params + ptypes
+  const typedStr = (n) => (n.params || []).map((p, i) => ((n.ptypes || [])[i] || "int") + " " + p).join(", ");
+
   function stmtTemplate(type) {
     const ext = decls("extern"), timers = decls("timer"), events = decls("event"), states = decls("state"), vars = decls("var");
     const base = { id: nid(), line: 0, type };
     switch (type) {
       case "assign": return Object.assign(base, { target: vars.length ? vars[0].name : "x", value: num(0) });
-      case "local": return Object.assign(base, { name: uniqueName("tmp"), value: num(0) });
+      case "local": return Object.assign(base, { name: uniqueName("tmp"), vtype: "int", value: num(0) });
       case "call": {
         const f = ext[0] || decls("func")[0];
-        return Object.assign(base, { name: f ? f.name : "fn", args: f ? f.params.map(() => num(0)) : [] });
+        return Object.assign(base, { name: f ? f.name : "fn", args: f ? zeros(f) : [] });
       }
       case "if": return Object.assign(base, { branches: [{ cond: boolE(true), body: [] }], else_body: null });
       case "while": return Object.assign(base, { cond: boolE(false), body: [] });
       case "goto": return Object.assign(base, { state: states.length ? states[0].name : "somewhere" });
-      case "emit": { const e = events[0]; return Object.assign(base, { event: e ? e.name : "something", args: e ? e.params.map(() => num(0)) : [] }); }
+      case "emit": { const e = events[0]; return Object.assign(base, { event: e ? e.name : "something", args: e ? zeros(e) : [] }); }
       case "start": return Object.assign(base, { timer: timers.length ? timers[0].name : "t", every: false, ms: { id: nid(), type: "num", line: 0, value: 1000, text: "1s" } });
       case "stop": return Object.assign(base, { timer: timers.length ? timers[0].name : "t" });
       case "return": return Object.assign(base, { value: null });
@@ -84,7 +96,7 @@ const Edit = (function () {
   }
 
   const STMT_MENU = [
-    ["assign", "Process", "x = value"], ["local", "Local variable", "var tmp = 0"], ["call", "Call (I/O / sub-process)", "f(args)"],
+    ["assign", "Process", "x = value"], ["local", "Local variable", "int tmp = 0"], ["call", "Call (I/O / sub-process)", "f(args)"],
     ["if", "Decision", "if … else"], ["while", "Loop", "while …"], ["goto", "State transition", "goto_state S"],
     ["emit", "Raise event", "raise_event E"], ["start", "Start timer", "start T 1s"], ["stop", "Stop timer", "stop T"],
     ["return", "End / return", "return"], ["comment", "Annotation", "# note"],
@@ -168,11 +180,11 @@ const Edit = (function () {
     } else if (action === "state-var") {
       const st = items.find((i) => i.type === "state" && i.name === arg);
       st.vars = st.vars || [];
-      const v = { id: nid(), type: "var", line: 0, name: uniqueName("count"), value: num(0) };
+      const v = { id: nid(), type: "var", line: 0, name: uniqueName("count"), vtype: "int", value: num(0) };
       st.vars.push(v);
       commit(v);
     } else if (action === "func") {
-      insertItem({ id: nid(), type: "func", line: 0, name: uniqueName("func"), params: [], body: [] }, (i) => ["extern", "event", "timer", "const", "var", "func", "any_state"].includes(i.type));
+      insertItem({ id: nid(), type: "func", line: 0, name: uniqueName("func"), params: [], ptypes: [], returns: null, body: [] }, (i) => ["extern", "event", "timer", "const", "var", "func", "any_state"].includes(i.type));
     } else if (action === "state") {
       // two or more states need a marked start state: keep the current first one as the start
       const sts = decls("state");
@@ -188,11 +200,11 @@ const Edit = (function () {
         commit(it);
       };
       showMenu(x, y, [
-        ["extern", "host function", mk("extern", { name: uniqueName("host_fn"), params: [] })],
-        ["event", "host/script event", mk("event", { name: uniqueName("event"), params: [] })],
+        ["extern", "host function", mk("extern", { name: uniqueName("host_fn"), params: [], ptypes: [], returns: null })],
+        ["event", "host/script event", mk("event", { name: uniqueName("event"), params: [], ptypes: [] })],
         ["timer", "VM timer", mk("timer", { name: uniqueName("timer") })],
         ["const", "constant", mk("const", { name: uniqueName("CONST"), value: num(0) })],
-        ["var", "global variable", mk("var", { name: uniqueName("var"), value: num(0) })],
+        ["var", "global variable", mk("var", { name: uniqueName("var"), vtype: "int", value: num(0) })],
       ]);
     }
   }
@@ -225,7 +237,7 @@ const Edit = (function () {
     let title = n.type;
     switch (n.type) {
       case "assign": title = "Process (assignment)"; f.push(field("variable", "target", n.target), field("value", "value", S(n.value))); break;
-      case "local": title = "Local variable"; f.push(field("name", "name", n.name), field("initial value", "value", n.value ? S(n.value) : "")); break;
+      case "local": title = "Local variable"; f.push(field("type", "vtype", n.vtype || "int", "select", TYPES), field("name", "name", n.name), field("initial value (empty: 0, 0.0, \"\" or 1970-01-01)", "value", n.value ? S(n.value) : "")); break;
       case "call": title = "Call"; f.push(field("function", "name", n.name, "select", callables.includes(n.name) ? callables : [n.name].concat(callables)), field("arguments (comma separated)", "args", listStr(n.args))); break;
       case "if":
         title = "Decision";
@@ -245,13 +257,13 @@ const Edit = (function () {
         f.push(field("event", "event", n.event, "select", evs.includes(n.event) ? evs : [n.event].concat(evs)), field("parameter names (optional)", "params", (n.params || []).join(", ")));
         break;
       }
-      case "func": title = "Function"; f.push(field("name", "name", n.name), field("parameters", "params", n.params.join(", "))); break;
+      case "func": title = "Function"; f.push(field("name", "name", n.name), field("parameters (e.g. int n, float x)", "params", typedStr(n)), field("returns", "returns", n.returns || "nothing", "select", ["nothing"].concat(TYPES))); break;
       case "state": title = "State"; f.push(field("name", "name", n.name), field("initial state (the program starts here)", "initial", !!n.initial, "check")); break;
-      case "extern": title = "Host function (extern)"; f.push(field("name", "name", n.name), field("parameters", "params", n.params.join(", "))); break;
-      case "event": title = "Event"; f.push(field("name", "name", n.name), field("parameters", "params", n.params.join(", "))); break;
+      case "extern": title = "Host function (extern)"; f.push(field("name", "name", n.name), field("parameters (e.g. str msg, int level)", "params", typedStr(n)), field("returns", "returns", n.returns || "nothing", "select", ["nothing"].concat(TYPES))); break;
+      case "event": title = "Event"; f.push(field("name", "name", n.name), field("parameters (e.g. int level, float x)", "params", typedStr(n))); break;
       case "timer": title = "Timer"; f.push(field("name", "name", n.name)); break;
       case "const": title = "Constant"; f.push(field("name", "name", n.name), field("value", "value", S(n.value))); break;
-      case "var": title = index[n.id] && index[n.id].key === "vars" ? "State variable (reset on entry)" : "Global variable"; f.push(field("name", "name", n.name), field("initial value", "value", n.value ? S(n.value) : "")); break;
+      case "var": title = index[n.id] && index[n.id].key === "vars" ? "State variable (reset on entry)" : "Global variable"; f.push(field("type", "vtype", n.vtype || "int", "select", TYPES), field("name", "name", n.name), field("initial value (constant)", "value", n.value ? S(n.value) : "")); break;
       default:
         if (n.type === "binary" || n.type === "unary" || n.type === "num" || n.type === "name" || n.type === "callx" || n.type === "bool" || n.type === "str") {
           title = FC.isGate(n) ? (n.type === "unary" ? "NOT gate" : n.op.toUpperCase() + " gate") : "Condition input";
@@ -314,6 +326,18 @@ const Edit = (function () {
     if (!t) return [];
     return t.split(",").map((s) => checkName(s.trim(), "parameter name"));
   }
+  // "int a, float b" -> {params: [a, b], ptypes: [int, float]}
+  function typedParams(text) {
+    const t = (text || "").trim(), out = { params: [], ptypes: [] };
+    if (!t) return out;
+    for (const part of t.split(",")) {
+      const w = part.trim().split(/\s+/);
+      if (w.length !== 2 || !TYPES.includes(w[0])) throw new Error(`write each parameter as 'type name' (int, float, str or time): '${part.trim()}'`);
+      out.ptypes.push(w[0]);
+      out.params.push(checkName(w[1], "parameter name"));
+    }
+    return out;
+  }
   async function exprs(map) {
     // map: key -> text ; returns key -> expr (throws on error)
     const keys = Object.keys(map);
@@ -345,6 +369,7 @@ const Edit = (function () {
     switch (n.type) {
       case "assign": n.target = checkName(val("target").trim(), "variable"); n.value = (await exprs({ value: val("value") })).value; break;
       case "local": {
+        n.vtype = val("vtype");
         n.name = checkName(val("name").trim());
         const v = val("value").trim();
         n.value = v ? (await exprs({ value: v })).value : null;
@@ -366,8 +391,13 @@ const Edit = (function () {
       case "return": { const v = val("value").trim(); n.value = v ? (await exprs({ value: v })).value : null; break; }
       case "comment": n.text = val("text"); break;
       case "on": { n.event = val("event"); const p = val("params").trim(); n.params = p ? params(p) : null; break; }
-      case "func": case "extern": n.name = checkName(val("name").trim()); n.params = params(val("params")); break;
-      case "event": n.name = checkName(val("name").trim()); n.params = params(val("params")); break;
+      case "func": case "extern": {
+        n.name = checkName(val("name").trim());
+        Object.assign(n, typedParams(val("params")));
+        n.returns = val("returns") === "nothing" ? null : val("returns");
+        break;
+      }
+      case "event": n.name = checkName(val("name").trim()); Object.assign(n, typedParams(val("params"))); break;
       case "state": {
         const old = n.name;
         n.name = checkName(val("name").trim());
@@ -378,7 +408,7 @@ const Edit = (function () {
       }
       case "timer": n.name = checkName(val("name").trim()); break;
       case "const": n.name = checkName(val("name").trim()); n.value = (await exprs({ value: val("value") })).value; break;
-      case "var": { n.name = checkName(val("name").trim()); const v = val("value").trim(); n.value = v ? (await exprs({ value: v })).value : null; break; }
+      case "var": { n.vtype = val("vtype"); n.name = checkName(val("name").trim()); const v = val("value").trim(); n.value = v ? (await exprs({ value: v })).value : null; break; }
       default:
         if (isExpr(n)) { const e = (await exprs({ expr: val("expr") })).expr; replaceExpr(n, e); return e; }
     }

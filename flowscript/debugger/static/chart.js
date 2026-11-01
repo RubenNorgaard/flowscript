@@ -36,6 +36,11 @@ const FC = (function () {
     if (e.type === "num" && e.value < 0) return UNL;
     return ATOM;
   }
+  // "int a, float b"
+  function typedParams(it) {
+    return (it.params || []).map((p, i) => ((it.ptypes || [])[i] || "int") + " " + p).join(", ");
+  }
+
   function exprStr(e) {
     if (!e) return "";
     switch (e.type) {
@@ -230,7 +235,7 @@ const FC = (function () {
   function stmtLayout(s) {
     switch (s.type) {
       case "assign": return nodeLayout(s, "proc", s.target + " = " + exprStr(s.value));
-      case "local": return nodeLayout(s, "proc", "var " + s.name + (s.value ? " = " + exprStr(s.value) : ""));
+      case "local": return nodeLayout(s, "proc", (s.vtype || "int") + " " + s.name + (s.value ? " = " + exprStr(s.value) : ""));
       case "call": {
         const isFunc = (OPTS.funcs || new Set()).has(s.name);
         return nodeLayout(s, isFunc ? "sub" : "io", exprStr(s));
@@ -337,7 +342,7 @@ const FC = (function () {
   function routineLayout(node, stateName) {
     const isFunc = node.type === "func";
     const head = isFunc
-      ? "func " + node.name + "(" + (node.params || []).join(", ") + ")"
+      ? "func " + node.name + "(" + typedParams(node) + ")" + (node.returns ? " -> " + node.returns : "")
       : "on " + node.event + (node.params ? "(" + node.params.join(", ") + ")" : "");
     const H = nodeLayout(node, isFunc ? "sub" : "ev", head, { ids: [], head: node.id, minW: 120 });
     const B = seq(node.body, { node, key: "body" });
@@ -361,11 +366,11 @@ const FC = (function () {
     for (const it of ast.items) {
       let k = null, t = null;
       switch (it.type) {
-        case "extern": k = "extern"; t = it.name + "(" + it.params.join(", ") + ")"; break;
-        case "event": k = "event"; t = it.name + (it.params.length ? "(" + it.params.join(", ") + ")" : ""); break;
+        case "extern": k = "extern"; t = it.name + "(" + typedParams(it) + ")" + (it.returns ? " -> " + it.returns : ""); break;
+        case "event": k = "event"; t = it.name + (it.params.length ? "(" + typedParams(it) + ")" : ""); break;
         case "timer": k = "timer"; t = it.name; break;
         case "const": k = "const"; t = it.name + " = " + exprStr(it.value); break;
-        case "var": k = "var"; t = it.name + (it.value ? " = " + exprStr(it.value) : ""); break;
+        case "var": k = it.vtype || "int"; t = it.name + (it.value ? " = " + exprStr(it.value) : ""); break;
       }
       if (k) out.push({ k, t: clip(t, 38), node: it });
     }
@@ -462,14 +467,14 @@ const FC = (function () {
       const iy = top + 36;
       if (svars.length) {
         // state variables: a small card, reset to these values on every entry
-        const lines = svars.map((v) => v.name + " = " + (v.value ? exprStr(v.value) : "0"));
-        const w = Math.max(tw("state variables"), ...lines.map((l) => tw("var " + l))) + 28;
+        const lines = svars.map((v) => v.name + (v.value ? " = " + exprStr(v.value) : ""));
+        const w = Math.max(tw("state variables"), ...lines.map((l, i) => tw((svars[i].vtype || "int") + " " + l))) + 28;
         const h = svars.length * 17 + 30;
         P(`<rect class="decl-box" x="${f1(sx)}" y="${iy}" width="${f1(w)}" height="${h}" rx="6"><title>reset to these values each time the state is entered</title></rect>`);
         P(`<text class="small" x="${f1(sx + 10)}" y="${iy + 15}">state variables</text>`);
         svars.forEach((v, i) => {
           P(`<g class="nd" data-sel="${v.id}" data-ids="${v.id}" data-line="${v.line}"><rect class="sh" style="fill:transparent;stroke:none" x="${f1(sx + 4)}" y="${iy + 22 + i * 17}" width="${f1(w - 8)}" height="17"/>` +
-            `<text x="${f1(sx + 10)}" y="${iy + 35 + i * 17}"><tspan class="decl-k">var</tspan> <tspan class="decl-n">${esc(lines[i])}</tspan></text></g>`);
+            `<text x="${f1(sx + 10)}" y="${iy + 35 + i * 17}"><tspan class="decl-k">${esc(v.vtype || "int")}</tspan> <tspan class="decl-n">${esc(lines[i])}</tspan></text></g>`);
         });
         sx += w + 30;
         sh = Math.max(sh, h);

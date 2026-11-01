@@ -18,7 +18,7 @@ model, so you can edit either one.
  └──────────────────────────────────┘       └──────────────────────────────┘
                  │ compile
                  ▼
- bytecode (.fsb) ──▶  C VM (firmware)   flowscript.c, no malloc, ~6 KB Thumb-2
+ bytecode (.fsb) ──▶  C VM (firmware)   flowscript.c, no malloc, ~16 KB Thumb-2
                  └─▶  Python VM          reference implementation + debugger
 ```
 
@@ -44,20 +44,22 @@ Requirements: Python 3.8+ (stdlib only), any C99 compiler. No other dependencies
 ```flowscript
 flow tracker version 3          # name + version are stored in the bytecode
 
-extern gps_speed()              # functions the host provides (bound by name at load)
-extern send_position(reason)
-event ignition(active)          # events the host raises (up to 8 int args)
+extern gps_speed() -> int       # functions the host provides (bound by name at load)
+extern send_position(int reason, str note)   # no '-> type': returns nothing
+event ignition(int active)      # events the host raises (up to 8 typed args)
 timer report                    # VM-managed timer; also an event called "report"
-const LIMIT = 90                # compile-time constant
-var reports = 0                 # global variable (int32), handlers only
+const LIMIT = 90                # compile-time constant (any type)
+int reports = 0                 # global variables: int, float, str, time
+time since = time(2026, 1, 1)
 
-func notify(reason, count):     # sub-process: sees params, consts, externs, not vars
-  send_position(reason)
+func notify(int reason, int count) -> int:   # sub-process: sees params, consts, externs, not globals
+  send_position(reason, "report " + str(count))
   return count + 1              # the result goes back to the handler
 
 any_state:                      # handlers that apply in every state
   on boot:                      # runs once at start
     start report every 30s      # time units: ms, s, min, h
+    since = now()               # the host's clock
 
 initial state parked:           # the program starts here (required with 2+ states)
   on ignition(active):
@@ -65,13 +67,13 @@ initial state parked:           # the program starts here (required with 2+ stat
       goto_state driving        # ends the handler; runs exit/enter handlers
 
 state driving:
-  var slow_reports = 0          # state variable: only visible here, reset on each entry
+  int slow_reports = 0          # state variable: only visible here, reset on each entry
 
   on report:                    # replaces an any_state 'on report' here
-    var speed = gps_speed()     # local variable
-    if speed > LIMIT and not reports > 100:
+    float kmh = gps_speed() * 1.0   # local variable; ints promote to float
+    if kmh > LIMIT and not reports > 100:
       reports = notify(2, reports)
-    elif speed == 0:
+    elif kmh == 0 and now() - since > 10min:
       raise_event ignition(0)   # queued for the script + host notified
     else:
       slow_reports = slow_reports + 1
@@ -82,10 +84,18 @@ Blocks are defined by indentation, as in Python: a header line ends with `:` and
 body is indented below it (the formatter uses 2 spaces; tabs are rejected). `pass`
 marks an empty block. One statement per line, so every line is one flowchart node.
 
-One type (int32), `if/elif/else`, `while`, `goto_state`, `raise_event`, `start/stop`, `return`,
-functions, and the operators `or xor and not == != < <= > >= | ^ & << >> + - * / % ~`.
-That is the whole language. See [SPEC.md](SPEC.md) for the exact semantics and the
-bytecode format.
+Four types — `int` (int32), `float` (double), `str`, `time` (UTC, ms) — checked at compile
+time, with int → float promotion and nothing else implicit; built-in conversions
+(`int() float() str() time()`), string (`len substr find`), time (`now date year … weekday`)
+and math functions (`abs min max floor ceil round sqrt exp log pow`). Statements:
+`if/elif/else`, `while`, `goto_state`, `raise_event`, `start/stop`, `return`, functions,
+and the operators `or xor and not == != < <= > >= | ^ & << >> + - * / % ~`. That is the
+whole language. See [SPEC.md](SPEC.md) for the exact semantics and the bytecode format.
+
+Strings made at run time live in a fixed pool of slots inside the VM (`FS_STR_SLOTS` ×
+`FS_STR_LEN` bytes, default 16 × 64), reclaimed by a mark-and-sweep pass when the pool is
+full: no heap, and running out is a fault like any other. `examples/pct_pid.fs` is a
+larger program (a PID-steered market-making controller) using floats and times.
 
 | Statement | Flowchart symbol |
 |---|---|
@@ -133,18 +143,25 @@ change regenerates the script (and recompiles), so the two views never diverge.
 
 static fs_vm vm;                                    /* static, no heap */
 
-static int32_t x_gps_speed(fs_vm *vm, const int32_t *a, int n, void *u) { return gps_speed_kmh(); }
+static fs_value x_gps_speed(fs_vm *vm, const fs_value *a, int n, void *u) { return fs_int(gps_speed_kmh()); }
+static fs_value x_send(fs_vm *vm, const fs_value *a, int n, void *u) {
+    modem_send(a[0].as.i, fs_str(vm, a[1], NULL));  /* a str argument: valid during the call */
+    return fs_int(0);                               /* ignored: send_position returns nothing */
+}
+static int64_t utc_ms(fs_vm *vm, void *u) { return rtc_unix_ms(); }   /* now() */
 
 void logic_init(const uint8_t *image, size_t len) {
     if (fs_load(&vm, image, len) != FS_OK) { /* reject download, keep old logic */ }
     fs_bind(&vm, "gps_speed", x_gps_speed);
+    fs_bind(&vm, "send_position", x_send);
+    fs_set_clock(&vm, utc_ms);
     /* ... bind every extern; fs_unbound(&vm) names any you forgot ... */
     fs_start(&vm);
     fs_run(&vm, 100000);
 }
 
 void on_ignition(int on) {                         /* firmware event -> script */
-    int32_t arg = on;
+    fs_value arg = fs_int(on);                      /* fs_float(), fs_time(), fs_cstr("text") */
     fs_post(&vm, fs_event_id(&vm, "ignition"), &arg, 1);
     fs_run(&vm, 100000);
 }
@@ -214,9 +231,13 @@ cd c && make fuzz                         # corrupt-image fuzzing against the AS
 cd c && make size                         # code size of the VM
 ```
 
-C VM footprint (default sizes): **about 6 KB** of code for Cortex-M4 (`-Os`, Thumb-2; 5,782 bytes of `.text` measured with clang),
-no data/bss of its own, and a `fs_vm` struct of 2,648 bytes RAM on a 32-bit target with the
-default `FS_*` macros in `flowscript.h`. Most of that is headroom: see below.
+C VM footprint (default sizes): **about 16 KB** of code for Cortex-M4 (`-Os`, Thumb-2;
+16,258 bytes of `.text` measured with clang; v1, ints only, was 6.6 KB), plus the C
+library's double-precision routines (soft-float on a Cortex-M4) and `floor ceil sqrt exp
+log pow fmod`; no data/bss of its own; a `fs_vm` struct of 9,216 bytes RAM on a 32-bit
+target with the default `FS_*` macros in `flowscript.h` (every value is 16 bytes: a type
+tag and an 8-byte double/int64). Most of that is headroom: see below. Build with
+`-ffp-contract=off` (fused multiply-add would change float results) and link `-lm`.
 
 ## Optimizing size
 
@@ -229,10 +250,11 @@ debugger's bytecode pane) shows the three budgets separately:
 * **RAM** (`sizeof(fs_vm)`): computed for the defaults and for the smallest `FS_*`
   settings this program runs with. Stack and call depth come from a worst-case analysis of
   the bytecode; the report prints ready-to-use `-D` build flags. For the GPS example that
-  is 376 bytes instead of 2,648. These settings are also load-time limits, so size them
+  is 720 bytes instead of 9,216 (it never makes a string at run time, so it gets a
+  single 1-byte string slot). These settings are also load-time limits, so size them
   for the largest program you plan to download. Recursion has no static bound and keeps
   the defaults.
-* **C VM code**: fixed (about 6 KB), independent of the program.
+* **C VM code**: fixed (about 16 KB + the C library's float routines), independent of the program.
 
 It also lists concrete savings: unused externs, functions, events, timers and globals,
 globals that could be constants, the cost of names, and the debug section (`-g`).

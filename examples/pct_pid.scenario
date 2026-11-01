@@ -1,0 +1,15 @@
+# The stubbed param() returns one value for every setting: 0.5 here.
+clock 2026-11-01T06:00:00Z
+extern param 0.5
+extern lot_value 7.8
+extern pnl_today -0.001
+post tick
+tick 500
+post tick
+extern pnl_today 0.004
+tick 500
+post tick
+# a big loss: braking, then stopped (stop_pct = brake_pct = 0.5 here)
+extern pnl_today -0.01
+tick 500
+post tick

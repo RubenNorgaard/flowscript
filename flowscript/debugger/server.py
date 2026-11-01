@@ -8,6 +8,7 @@ Views (in the browser): source | bytecode | flowchart, all following the executi
 import json
 import os
 import threading
+import time
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -18,6 +19,18 @@ from ..printer import to_source, expr_to_str
 from ..compiler import compile_ast
 from ..bytecode import disassemble, FAULTS
 from ..vm import VM, IDLE, DISPATCHED, RUNNING, DONE, FAULT
+from .. import values as V
+
+
+def jv(v):
+    """A VM value for JSON: an int as a number, anything else as its canonical text
+    (floats can be nan/inf, which JSON can't carry)."""
+    if isinstance(v, int) and not isinstance(v, bool):
+        return v
+    try:
+        return V.show(v)
+    except TypeError:
+        return str(v)
 
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 LOG_LIMIT = 400
@@ -96,8 +109,9 @@ class Session:
         if not self.prog:
             self.vm = None
             return
-        externs = {name: self.make_extern(i, name) for i, (name, _) in enumerate(self.prog.externs)}
-        self.vm = VM(self.prog, externs, on_emit=self.on_emit, on_fault=self.on_fault)
+        externs = {e[0]: self.make_extern(i, e[0], e[3]) for i, e in enumerate(self.prog.externs)}
+        self.vm = VM(self.prog, externs, on_emit=self.on_emit, on_fault=self.on_fault,
+                     clock=lambda vm: int(time.time() * 1000))
         self.vm.start()
         self.add_log("sys", "VM started" + (" — initial state '%s'" % self.prog.states[0] if self.prog.states else ""))
 
@@ -106,23 +120,26 @@ class Session:
         if len(self.log) > LOG_LIMIT:
             del self.log[:len(self.log) - LOG_LIMIT]
 
-    def make_extern(self, idx, name):
+    def make_extern(self, idx, name, ret):
         def fn(vm, args):
-            r = self.extern_values.get(name, 0)
-            shown = []
-            node = self.node_by_id(self.dbg.pc_node.get(vm.cur_pc))
-            arg_nodes = (node or {}).get("args") or []
-            for i, a in enumerate(args):
-                if i < len(arg_nodes) and arg_nodes[i].get("type") == "str":
-                    shown.append(json.dumps(arg_nodes[i]["value"]))
-                else:
-                    shown.append(str(a))
-            self.add_log("call", "%s(%s) → %d" % (name, ", ".join(shown), r))
-            return r
+            shown = ", ".join(V.show(a) for a in args)
+            if ret == V.NONE_TYPE:
+                self.add_log("call", "%s(%s)" % (name, shown))
+                return 0
+            r = V.zero(ret)
+            text = self.extern_values.get(name)
+            if text not in (None, ""):
+                try:
+                    r = V.parse_literal(ret, str(text))
+                except ValueError as e:
+                    self.add_log("fault", "%s: return value %r is not a %s (%s): returning %s"
+                                 % (name, text, V.TYPE_NAMES[ret], e, V.show(r)))
+            self.add_log("call", "%s(%s) → %s" % (name, shown, V.show(r)))
+            return r.b if isinstance(r, V.Str) and text not in (None, "") else r
         return fn
 
     def on_emit(self, vm, name, args):
-        self.add_log("emit", "emit %s(%s)" % (name, ", ".join(map(str, args))))
+        self.add_log("emit", "emit %s(%s)" % (name, ", ".join(V.show(a) for a in args)))
 
     def on_fault(self, vm, code, pc):
         self.add_log("fault", "FAULT %d: %s at pc %s" % (code, FAULTS.get(code, "?"), pc))
@@ -263,12 +280,14 @@ class Session:
             "line": self.dbg.pc_line.get(vm.pc) if vm.active else None,
             "state": vm.state_name(),
             "pending": None if vm.pending is None else p.states[vm.pending],
-            "globals": [{"name": n, "value": v} for n, v in zip(p.global_names, vm.globals)],
-            "stack": list(vm.stack),
+            "globals": [{"name": n, "value": jv(v), "type": V.TYPE_NAMES[V.type_of(v)]}
+                        for n, v in zip(p.global_names, vm.globals)],
+            "stack": [jv(v) for v in vm.stack],
             "frames": [],
-            "queue": [{"event": p.events[e][0], "args": a} for e, a in vm.queue],
+            "queue": [{"event": p.events[e][0], "args": [jv(x) for x in a]} for e, a in vm.queue],
             "timers": [],
-            "values": {str(k): v for k, v in self.values.items()},
+            "values": {str(k): jv(v) for k, v in self.values.items()},
+            "strings_in_use": vm.strings_in_use(),
             "steps": vm.steps if vm.active else 0,
             "total_steps": self.total_steps,
             "log": self.log[-200:],
@@ -280,7 +299,7 @@ class Session:
                 fpc = vm.frames[i + 1][0] - 3 if i + 1 < len(vm.frames) else vm.pc
                 rt = self.dbg.routine_at(fpc)
                 base = fr[1]
-                local_vals = [{"name": nm, "value": vm.stack[base + j]}
+                local_vals = [{"name": nm, "value": jv(vm.stack[base + j])}
                               for j, nm in enumerate(rt["locals"] if rt else [])
                               if base + j < len(vm.stack)]
                 snap["frames"].append({"routine": rt["name"] if rt else "?", "pc": fpc,
@@ -305,6 +324,8 @@ class Session:
                     local_names[pc] = r["locals"]
             dis = disassemble(p, local_names)
             for ins in dis:
+                if isinstance(ins["arg"], float):
+                    ins["arg"] = V.fmt_float(ins["arg"])
                 ins["node"] = self.dbg.pc_node.get(ins["pc"])
                 ins["line"] = self.dbg.pc_line.get(ins["pc"])
                 ins["stmt"] = self.dbg.stmt_of.get(ins["node"], ins["node"])
@@ -312,8 +333,11 @@ class Session:
                 "disasm": dis,
                 "size": len(p.to_bytes()),
                 "code_size": len(p.code),
-                "events": [{"name": n, "argc": a} for n, a in p.events[3:]],
-                "externs": [{"name": n, "argc": a} for n, a in p.externs],
+                "events": [{"name": n, "argc": a, "types": [V.TYPE_NAMES[t] for t in ts]}
+                           for n, a, ts in p.events[3:]],
+                "externs": [{"name": n, "argc": a, "types": [V.TYPE_NAMES[t] for t in ts],
+                             "returns": None if r == V.NONE_TYPE else V.TYPE_NAMES[r]}
+                            for n, a, ts, r in p.externs],
                 "states": list(p.states),
                 "timers": [p.events[e][0] for e in p.timers],
                 "stmt_of": {str(k): v for k, v in self.dbg.stmt_of.items()},
@@ -419,9 +443,20 @@ def make_handler(session, lock):
                 r = s.step(body.get("mode", "instr"))
                 return {"snapshot": s.snapshot(r)}
             if route == "/api/vm/post":
-                args = [int(a) for a in body.get("args", [])]
-                ok = s.vm.post(body["event"], *args)
-                s.add_log("post", "post %s(%s)%s" % (body["event"], ", ".join(map(str, args)), "" if ok else " — queue full"))
+                ev = s.prog.event_index(body["event"])
+                types = s.prog.events[ev][2] if ev >= 0 else ()
+                try:
+                    args = [V.parse_literal(t, str(a)) for t, a in zip(types, body.get("args", []))]
+                except ValueError as e:
+                    s.add_log("fault", "post %s: %s" % (body["event"], e))
+                    return {"snapshot": s.snapshot("posted")}
+                try:
+                    ok = s.vm.post(body["event"], *[a.b if isinstance(a, V.Str) else a for a in args])
+                except TypeError as e:
+                    ok = False
+                    s.add_log("fault", "post %s: %s" % (body["event"], e))
+                s.add_log("post", "post %s(%s)%s" % (body["event"], ", ".join(V.show(a) for a in args),
+                                                     "" if ok else " — not queued"))
                 return {"snapshot": s.snapshot("posted")}
             if route == "/api/vm/tick":
                 ms = int(body.get("ms", 0))
@@ -429,14 +464,19 @@ def make_handler(session, lock):
                 s.add_log("tick", "tick %d ms" % ms)
                 return {"snapshot": s.snapshot("ticked")}
             if route == "/api/vm/extern":
-                s.extern_values[body["name"]] = int(body.get("value", 0))
+                s.extern_values[body["name"]] = str(body.get("value", ""))
                 return {"ok": True}
             if route == "/api/vm/breakpoints":
                 s.breakpoints = set(int(x) for x in body.get("lines", []))
                 return {"ok": True}
             if route == "/api/vm/set_global":
                 idx = s.prog.global_names.index(body["name"])
-                s.vm.globals[idx] = int(body["value"])
+                t = V.type_of(s.vm.globals[idx])
+                try:
+                    v = V.parse_literal(t, str(body["value"]))
+                    s.vm.set_global(idx, v.b if isinstance(v, V.Str) else v)
+                except (ValueError, V.ValueFault) as e:
+                    s.add_log("fault", "%s: %r is not a %s value (%s)" % (body["name"], body["value"], V.TYPE_NAMES[t], e))
                 return {"snapshot": s.snapshot("edited")}
             raise ValueError("unknown route %s" % route)
 

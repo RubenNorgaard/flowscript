@@ -15,7 +15,7 @@
  * Typical use
  * ---------------------------------------------------------------------------
  *
- *   static fs_vm vm;                         // ~6 KB with default sizes
+ *   static fs_vm vm;                         // ~9 KB RAM with default sizes
  *
  *   if (fs_load(&vm, image, image_len) != FS_OK) { ... reject download ... }
  *   fs_bind(&vm, "led", my_led);             // bind every extern by name

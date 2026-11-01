@@ -32,10 +32,10 @@
   }
 
   // ------------------------------------------------------------------ source editor
-  const KW = new Set("flow version extern event timer const var func on state initial any_state pass if elif else while goto_state raise_event start every stop return and or xor not true false".split(" "));
+  const KW = new Set("flow version extern event timer const int float str time func on state initial any_state pass if elif else while goto_state raise_event start every stop return and or xor not true false".split(" "));
   function highlightLine(line) {
     let out = "";
-    const re = /(#.*$)|("(?:[^"\\]|\\.)*"?)|(\b\d[\w]*\b)|([A-Za-z_]\w*)(\s*\()?|(==|!=|<=|>=|<<|>>|[-+*/%&|^~<>=(),:])|(\s+)|(.)/g;
+    const re = /(#.*$)|("(?:[^"\\]|\\.)*"?)|(\b\d[\w]*(?:\.\d[\d_]*)?(?:[eE][-+]?\d+)?\b)|([A-Za-z_]\w*)(\s*\()?|(->|==|!=|<=|>=|<<|>>|[-+*/%&|^~<>=(),:])|(\s+)|(.)/g;
     let m;
     while ((m = re.exec(line))) {
       if (m[1]) out += `<span class="tk-cmt">${esc(m[1])}</span>`;
@@ -241,7 +241,7 @@
     $("#machine").innerHTML = kv(m);
 
     $("#globals").innerHTML = `<div class="kv">` + (s.globals || []).map((g) =>
-      `<span class="k">${esc(g.name)}</span><span class="v"><input data-g="${esc(g.name)}" value="${g.value}" class="${prevGlobals[g.name] !== undefined && prevGlobals[g.name] !== g.value ? "chg" : ""}" style="${prevGlobals[g.name] !== undefined && prevGlobals[g.name] !== g.value ? "color:var(--cur)" : ""}"></span>`).join("") + `</div>` ||
+      `<span class="k" title="${esc(g.type || "")}">${esc(g.name)}</span><span class="v"><input data-g="${esc(g.name)}" value="${esc(String(g.value))}" title="${esc(g.type || "")}" class="${prevGlobals[g.name] !== undefined && prevGlobals[g.name] !== g.value ? "chg" : ""}" style="${prevGlobals[g.name] !== undefined && prevGlobals[g.name] !== g.value ? "color:var(--cur)" : ""}"></span>`).join("") + `</div>` ||
       "<span class='muted'>none</span>";
 
     let fr = "";
@@ -260,13 +260,38 @@
   function renderExterns() {
     const ev = data && data.externs ? data.externs : [];
     $("#externs").innerHTML = ev.length ? `<div class="kv">` + ev.map((e) =>
-      `<span class="k">${esc(e.name)}()</span><span class="v"><input data-x="${esc(e.name)}" value="${(data.extern_values || {})[e.name] || 0}" title="value returned by ${esc(e.name)}"></span>`).join("") + `</div>`
+      `<span class="k">${esc(e.name)}(${esc((e.types || []).join(", "))})</span><span class="v">` +
+      (e.returns ? `<input data-x="${esc(e.name)}" value="${esc(String((data.extern_values || {})[e.name] ?? ""))}" placeholder="${esc(e.returns)}" title="${esc(e.returns)} returned by ${esc(e.name)} (empty: the zero value)">`
+                 : `<span class='muted'>returns nothing</span>`) + `</span>`).join("") + `</div>`
       : "<span class='muted'>no externs</span>";
     const sel = $("#ev-select");
     const cur = sel.value;
     const evs = data && data.events ? data.events : [];
-    sel.innerHTML = evs.map((e) => `<option value="${esc(e.name)}" data-argc="${e.argc}">${esc(e.name)}${e.argc ? "(" + e.argc + ")" : ""}</option>`).join("");
+    sel.innerHTML = evs.map((e) => `<option value="${esc(e.name)}" data-argc="${e.argc}" data-types="${esc((e.types || []).join(", "))}">${esc(e.name)}${e.argc ? "(" + esc((e.types || []).join(", ")) + ")" : ""}</option>`).join("");
     if (evs.some((e) => e.name === cur)) sel.value = cur;
+    argHint();
+  }
+
+  // The selected event's parameter types as the placeholder of the arguments box.
+  function argHint() {
+    const o = $("#ev-select").selectedOptions[0];
+    const types = o ? o.dataset.types : "";
+    $("#ev-args").placeholder = types ? types + '  e.g. 1, 2.5, "text", 2026-11-01T12:00:00Z' : "no arguments";
+  }
+
+  // Comma separated arguments; a "quoted string" may contain commas (\" escapes a quote).
+  function splitArgs(text) {
+    const out = [];
+    let cur = "", q = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (q && c === "\\" && i + 1 < text.length) { cur += c + text[++i]; continue; }
+      if (c === '"') q = !q;
+      if (c === "," && !q) { out.push(cur.trim()); cur = ""; continue; }
+      cur += c;
+    }
+    if (cur.trim() || out.length) out.push(cur.trim());
+    return out;
   }
 
   // ------------------------------------------------------------------ apply results
@@ -337,7 +362,7 @@
   async function post() {
     const ev = $("#ev-select").value;
     if (!ev) return;
-    const args = $("#ev-args").value.split(",").map((s) => s.trim()).filter(Boolean).map(Number);
+    const args = splitArgs($("#ev-args").value);
     if (args.some(isNaN)) return setStatus("bad event arguments", "bad");
     const r = await api("/api/vm/post", { event: ev, args });
     if (r.snapshot) applySnap(r.snapshot);
@@ -446,6 +471,7 @@
     $("#btn-run").onclick = () => step("run");
     $("#btn-post").onclick = post;
     $("#ev-args").addEventListener("keydown", (ev) => { if (ev.key === "Enter") post(); });
+    $("#ev-select").addEventListener("change", argHint);
     $("#btn-tick").onclick = () => tick(parseMs($("#tick-ms").value));
     $("#tick-ms").addEventListener("keydown", (ev) => { if (ev.key === "Enter") tick(parseMs($("#tick-ms").value)); });
     $$("[data-tick]").forEach((b) => (b.onclick = () => tick(+b.dataset.tick)));
@@ -454,14 +480,14 @@
     $("#externs").addEventListener("change", async (ev) => {
       const i = ev.target.closest("[data-x]");
       if (!i) return;
-      const v = parseInt(i.value, 10) || 0;
+      const v = i.value.trim();
       await api("/api/vm/extern", { name: i.dataset.x, value: v });
       data.extern_values = Object.assign(data.extern_values || {}, { [i.dataset.x]: v });
     });
     $("#globals").addEventListener("change", async (ev) => {
       const i = ev.target.closest("[data-g]");
       if (!i) return;
-      const r = await api("/api/vm/set_global", { name: i.dataset.g, value: parseInt(i.value, 10) || 0 });
+      const r = await api("/api/vm/set_global", { name: i.dataset.g, value: i.value.trim() });
       if (r.snapshot) applySnap(r.snapshot, true);
     });
 

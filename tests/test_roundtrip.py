@@ -108,5 +108,44 @@ class RoundTrip(unittest.TestCase):
             self.assertEqual(a, b)
 
 
+TYPED = '''flow typed version 2
+
+extern f(int a, float b, str c, time d) -> str
+extern log(str s)
+event e(float x, str label)
+
+const RATE = 2.5e-3
+const START = time(2026, 1, 1)
+float total = -0.5
+str name = "a \\"b\\""
+time when
+
+func scale(float x, int n) -> float:
+  float y = x * n + RATE
+  return y
+
+state s:
+  int count = 0
+  time last
+
+  on e(x, label):
+    str t = f(1, x, label, now())
+    log(t + str(1.0e10) + name)
+'''
+
+
+class Typed(unittest.TestCase):
+    def test_typed_round_trip(self):
+        once = to_source(parse(TYPED))
+        self.assertEqual(once, to_source(parse(once)))
+        self.assertIn("extern f(int a, float b, str c, time d) -> str", once)
+        self.assertIn("func scale(float x, int n) -> float:", once)
+        self.assertIn("  float y = x * n + RATE", once)
+        self.assertIn("  time last", once)
+        self.assertIn("const RATE = 2.5e-3", once)
+        self.assertIn("float total = -0.5", once)
+        compile_source(once)
+
+
 if __name__ == "__main__":
     unittest.main()

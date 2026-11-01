@@ -19,7 +19,7 @@ DEFAULTS = {
     "FS_STR_SLOTS": 16, "FS_STR_LEN": 64,
 }
 VALUE = (16, 8)              # fs_value: type byte + 8-byte union (double/int64 align 8)
-VM_CODE_BYTES = 6 * 1024     # flowscript.c, -Os Thumb-2 (approx., see README)
+VM_CODE_BYTES = 16 * 1024    # flowscript.c, -Os Thumb-2 (approx., see README), plus the C library's float routines
 
 # net stack effect of instructions that just fall through (CALL/XCALL/EMIT/RET handled apart)
 _EFFECT = {

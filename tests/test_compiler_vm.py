@@ -311,3 +311,84 @@ class Rejected(unittest.TestCase):
         vm, trace = run("int z\nany_state:\n  on boot:\n    z = 1 / z\nstate a:\n  pass\n")
         self.assertEqual(trace, [("fault", 3)])
         self.assertEqual(vm.state_name(), "a")
+
+
+class Types(unittest.TestCase):
+    """Static types: int, float, str, time."""
+
+    def bad(self, src, fragment):
+        with self.assertRaises(FlowError) as cm:
+            compile_source(src)
+        self.assertIn(fragment, str(cm.exception))
+
+    def boot(self, body, decls=""):
+        return decls + "any_state:\n  on boot:\n" + "".join("    %s\n" % l for l in body.split("\n"))
+
+    def test_type_errors(self):
+        self.bad(self.boot("int x = 1.5"), "'x' is int: got float, expected int")
+        self.bad(self.boot('float f = "a"'), "got str, expected float")
+        self.bad(self.boot("int x = 1 + \"a\""), "cannot use '+' on int and str")
+        self.bad(self.boot("if 1.5:\n  pass"), "a condition must be an int")
+        self.bad(self.boot('if "a" and 1:\n  pass'), "'and' needs conditions (int), not str")
+        self.bad(self.boot("time t = now() + 1.5"), "cannot use '+' on time and float")
+        self.bad(self.boot("int x = ~1.5"), "'~' needs an int operand")
+        self.bad(self.boot("int x = len(5)"), "no len() takes (int)")
+        self.bad(self.boot("int x = f()", "extern f()\n"), "'f' returns nothing")
+        self.bad(self.boot("start t 1.5", "timer t\n"), "the timer duration (ms): got float")
+        self.bad(self.boot("raise_event e(1)", "event e(str s)\n"), "e(str s): got int, expected str")
+        self.bad("func f() -> int:\n  return\n", "must return a int value")
+        self.bad("func f():\n  return 1\n", "'f' returns nothing: declare its type")
+        self.bad("func f(x) -> int:\n  return x\n", "give the parameter a type: 'int x'")
+        self.bad("var x = 1\n", "declare variables with their type: 'int x'")
+        self.bad("const T = time(2026, 2, 30)\n", "invalid value in constant expression 'time'")
+        self.bad("str s = 5\n", "the initial value of 's' is int, expected str")
+        self.bad(self.boot("int x = 1.5s"), "time units need an integer")
+
+    def test_void_call_statement_compiles(self):
+        compile_source(self.boot("f()", "extern f()\n"))
+
+    def test_promotion_and_folding(self):
+        _ast, prog, _ = compile_source(
+            "const HALF = 1 / 2.0\nconst T = time(\"2026-11-01T12:00:00Z\") + 1000\n"
+            "const S = \"n=\" + str(3 * 4)\nfloat f = 3\nfloat g = HALF * 4\ntime t = T\nstr s = S\n")
+        from flowscript.values import Str, Time, make_time
+        self.assertEqual(prog.globals[:4], [3.0, 2.0, Time(make_time(2026, 11, 1, 12).ms + 1000), Str(b"n=12")])
+
+    def test_semantics(self):
+        got = []
+        src = ('extern out(str s)\nevent go(float x, str s)\nfloat total = 0\n'
+               'func avg(float a, float b) -> float:\n  return (a + b) / 2\n'
+               'any_state:\n  on go(x, s):\n    total = total + avg(x, 1)\n'
+               '    if x > 2:\n      str extra = "!" + s\n    out(s + str(total) + extra)\n')
+        vm, trace = run(src, [("go", 3, "a"), ("go", 0.5, "b")],
+                        {"out": lambda vm, a: got.append(a[0].text)})
+        self.assertEqual(got, ["a2.0!a", "b2.75"])     # 'extra' starts as "" when its branch is skipped
+        self.assertEqual(trace, [])
+
+    def test_strings_are_collected(self):
+        src = ("event go(int n)\nstr keep\nany_state:\n  on go(n):\n    while n > 0:\n"
+               "      keep = str(n) + \"-\" + str(n)\n      n = n - 1\n")
+        vm, trace = run(src, [("go", 500)])
+        self.assertEqual(trace, [])
+        self.assertEqual(vm.globals[0].text, "1-1")
+        self.assertLessEqual(vm.strings_in_use(), 16)  # garbage is reclaimed when the slots run out
+        vm.collect()
+        self.assertEqual(vm.strings_in_use(), 1)
+
+    def test_host_values(self):
+        src = "event e(float x, str s, time t)\nfloat x\nstr s\ntime t\nany_state:\n  on e(a, b, c):\n    x = a\n    s = b\n    t = c\n"
+        from flowscript.values import Time
+        vm, trace = run(src, [("e", 2, "hi", Time(5))])
+        self.assertEqual((vm.globals[0], vm.globals[1].text, vm.globals[2]), (2.0, "hi", Time(5)))
+        with self.assertRaises(TypeError):
+            vm.post("e", "no", "x", Time(0))
+        vm.post("e", 1.0, "x" * 65, Time(0))          # too long: fault 12, not queued
+        self.assertEqual(len(vm.queue), 0)
+
+    def test_clock(self):
+        src = "time t\nany_state:\n  on boot:\n    t = now()\n"
+        _ast, prog, _ = compile_source(src)
+        vm = VM(prog, clock=lambda vm: 1793534400000)
+        vm.start()
+        vm.run()
+        self.assertEqual(vm.globals[0].ms, 1793534400000)

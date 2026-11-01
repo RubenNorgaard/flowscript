@@ -133,20 +133,18 @@ class VM:
 
     def host_value(self, v, t):
         """A value from the host as type t (allocates a str). Raises ValueFault."""
-        if t == FLOAT and V.type_of(v) == INT and not isinstance(v, bool):
-            return float(v)
         if t == STR and isinstance(v, (str, bytes)):
             return self.alloc(v.encode("utf-8") if isinstance(v, str) else v)
-        if t == INT and isinstance(v, bool):
-            return int(v)
         try:
             vt = V.type_of(v)
         except TypeError:
             raise V.ValueFault(V.TYPE_MISMATCH)
+        if t == FLOAT and vt == INT:
+            return float(v)
         if vt != t:
             raise V.ValueFault(V.TYPE_MISMATCH)
         if vt == INT:
-            return wrap(v)
+            return wrap(int(v))
         if vt == STR and v.slot is not None and self.pool[v.slot] is None:
             raise V.ValueFault(V.TYPE_MISMATCH)       # a stale run-time string
         return v

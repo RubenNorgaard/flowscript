@@ -65,7 +65,7 @@ class _M:
         if t == "assign":
             n = self.node("proc", "%s = %s" % (s["target"], expr_to_str(s["value"])))
         elif t == "local":
-            n = self.node("proc", "var %s" % s["name"] + (" = " + expr_to_str(s["value"]) if s.get("value") else ""))
+            n = self.node("proc", "%s %s" % (s.get("vtype") or "int", s["name"]) + (" = " + expr_to_str(s["value"]) if s.get("value") else ""))
         elif t == "call":
             n = self.node("sub" if s["name"] in funcs else "io", expr_to_str(s))
         elif t == "emit":
@@ -90,7 +90,8 @@ def to_mermaid(ast):
     funcs = {i["name"] for i in ast["items"] if i["type"] == "func"}
     for it in ast["items"]:
         if it["type"] == "func":
-            m.routine(it, funcs, "func %s(%s)" % (it["name"], ", ".join(it["params"])))
+            params = ", ".join("%s %s" % (t, p) for t, p in zip(it.get("ptypes") or ["int"] * len(it["params"]), it["params"]))
+            m.routine(it, funcs, "func %s(%s)%s" % (it["name"], params, (" -> " + it["returns"]) if it.get("returns") else ""))
         elif it["type"] == "on":
             m.routine(it, funcs, "on " + it["event"])
         elif it["type"] == "any_state":
