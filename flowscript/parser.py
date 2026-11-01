@@ -8,7 +8,7 @@ carry a ``note`` (comment text shown as an annotation).
 
 import sys
 
-from .lexer import tokenize, FlowError
+from .lexer import tokenize, FlowError, TYPE_KEYWORDS
 
 BINARY_LEVELS = [
     ("or",),
@@ -104,7 +104,7 @@ class Parser:
             return "'%s'" % tok.value
         if tok.kind == "NAME":
             return "name '%s'" % tok.value
-        if tok.kind == "NUM":
+        if tok.kind in ("NUM", "FLOAT"):
             return "number"
         return tok.kind.lower()
 
@@ -196,43 +196,87 @@ class Parser:
             note = self.gather(items)
         return prog
 
-    def parse_params(self):
-        params = []
+    def parse_params(self, typed=False):
+        """'(a, b)' -> ([names], None) or, typed, '(int a, float b)' -> ([names], [types]).
+
+        Returns (None, None) if there is no parameter list."""
+        params, types = [], []
         if self.is_op("("):
             self.advance()
             if not self.is_op(")"):
                 while True:
+                    if typed:
+                        if not self.is_type():
+                            if self.tok.kind == "NAME":
+                                raise self.error("give the parameter a type: 'int %s' (int, float, str or time)"
+                                                 % self.tok.value)
+                            raise self.error("expected a parameter type (int, float, str or time)")
+                        types.append(self.advance().value)
                     params.append(self.expect_name("parameter name"))
                     if self.is_op(","):
                         self.advance()
                         continue
                     break
             self.expect_op(")")
-            return params
-        return None
+            return params, (types if typed else None)
+        return None, None
+
+    def is_type(self):
+        return self.tok.kind == "KW" and self.tok.value in TYPE_KEYWORDS
+
+    def parse_returns(self):
+        """Optional '-> type'."""
+        if not self.is_op("->"):
+            return None
+        self.advance()
+        if not self.is_type():
+            raise self.error("expected a return type after '->' (int, float, str or time)")
+        return self.advance().value
+
+    def var_hint(self):
+        """'var x' was FlowScript v1: point to the typed declarations."""
+        if self.tok.kind == "NAME" and self.tok.value == "var" and self.peek().kind == "NAME":
+            raise self.error("declare variables with their type: 'int %s', 'float %s', 'str %s' or 'time %s'"
+                             % ((self.peek().value,) * 4))
+
+    def parse_decl(self, node_type):
+        """'TYPE name [= expr]' (globals, state variables, locals)."""
+        t = self.advance()
+        name = self.expect_name("variable name")
+        value = None
+        if self.is_op("="):
+            self.advance()
+            value = self.parse_expr()
+        n = self.node(node_type, t, name=name, vtype=t.value, value=value)
+        self.end_of_line(n)
+        return n
 
     def parse_item(self):
         t = self.tok
         if t.kind == "INDENT":
             raise self.error("unexpected indentation")
         self.check_end()
+        self.var_hint()
         if t.kind != "KW":
-            raise self.error("expected a declaration (extern, event, timer, const, var, func, state, initial state, any_state)")
+            raise self.error("expected a declaration (extern, event, timer, const, int/float/str/time "
+                             "variable, func, state, initial state, any_state)")
         kw = t.value
+        if kw in TYPE_KEYWORDS:
+            return self.parse_decl("var")
         if kw == "extern":
             self.advance()
             name = self.expect_name("extern name")
-            params = self.parse_params()
+            params, types = self.parse_params(typed=True)
             if params is None:
                 raise self.error("extern needs a parameter list, e.g. extern %s()" % name)
-            n = self.node("extern", t, name=name, params=params)
+            n = self.node("extern", t, name=name, params=params, ptypes=types, returns=self.parse_returns())
             self.end_of_line(n)
             return n
         if kw == "event":
             self.advance()
             name = self.expect_name("event name")
-            params = self.parse_params() or []
-            n = self.node("event", t, name=name, params=params)
+            params, types = self.parse_params(typed=True)
+            n = self.node("event", t, name=name, params=params or [], ptypes=types or [])
             self.end_of_line(n)
             return n
         if kw == "timer":
@@ -240,25 +284,22 @@ class Parser:
             n = self.node("timer", t, name=self.expect_name("timer name"))
             self.end_of_line(n)
             return n
-        if kw in ("const", "var"):
+        if kw == "const":
             self.advance()
             name = self.expect_name()
-            value = None
-            if self.is_op("="):
-                self.advance()
-                value = self.parse_expr()
-            elif kw == "const":
+            if not self.is_op("="):
                 raise self.error("const needs a value")
-            n = self.node(kw, t, name=name, value=value)
+            self.advance()
+            n = self.node(kw, t, name=name, value=self.parse_expr())
             self.end_of_line(n)
             return n
         if kw == "func":
             self.advance()
             name = self.expect_name("function name")
-            params = self.parse_params()
+            params, types = self.parse_params(typed=True)
             if params is None:
                 raise self.error("func needs a parameter list, e.g. func %s()" % name)
-            n = self.node("func", t, name=name, params=params, body=[])
+            n = self.node("func", t, name=name, params=params, ptypes=types, returns=self.parse_returns(), body=[])
             self.open_block(n, "func")
             n["body"] = self.parse_block()
             return n
@@ -283,7 +324,7 @@ class Parser:
                 loose = []
                 note = self.gather(loose)
                 # state variables come first; comments above them stay with them
-                in_vars = kw == "state" and self.is_kw("var") and not n["handlers"]
+                in_vars = kw == "state" and self.is_type() and not n["handlers"]
                 (n["vars"] if in_vars else n["handlers"]).extend(loose)
                 if self.tok.kind == "DEDENT":
                     self.advance()
@@ -291,17 +332,18 @@ class Parser:
                 if self.is_kw("pass"):
                     self.skip_pass(n["handlers"], note)
                     continue
-                if self.is_kw("var"):
+                self.var_hint()
+                if self.is_type():
                     if kw == "any_state":
                         raise self.error("variables shared by every state are ordinary globals: "
                                          "declare them at the top level")
                     if n["handlers"]:
                         raise self.error("state variables go at the top of the state, "
                                          "before its handlers")
-                    n["vars"].append(self.attach(self.parse_item(), note))
+                    n["vars"].append(self.attach(self.parse_decl("var"), note))
                     continue
                 if not self.is_kw("on"):
-                    raise self.error("only 'var' and 'on' are allowed inside a state" if kw == "state"
+                    raise self.error("only variables (int/float/str/time) and 'on' handlers are allowed inside a state" if kw == "state"
                                      else "only 'on' handlers are allowed inside any_state")
                 n["handlers"].append(self.attach(self.parse_handler(), note))
             return n
@@ -313,7 +355,7 @@ class Parser:
             event = self.advance().value
         else:
             raise self.error("expected event name")
-        params = self.parse_params()
+        params, _ = self.parse_params()
         n = self.node("on", t, event=event, params=params, body=[])
         self.open_block(n, "on")
         n["body"] = self.parse_block()
@@ -347,16 +389,14 @@ class Parser:
         if t.kind == "INDENT":
             raise self.error("unexpected indentation")
         self.check_end()
+        self.var_hint()
         if t.kind == "KW":
             kw = t.value
-            if kw == "var":
-                self.advance()
-                name = self.expect_name("variable name")
-                value = None
-                if self.is_op("="):
-                    self.advance()
-                    value = self.parse_expr()
-                n = self.node("local", t, name=name, value=value)
+            if kw in TYPE_KEYWORDS and self.peek().kind == "NAME":
+                return self.parse_decl("local")
+            if kw in TYPE_KEYWORDS and self.peek().kind == "OP" and self.peek().value == "(":
+                call = self.parse_primary()
+                n = self.node("call", t, name=call["name"], args=call["args"])
                 self.end_of_line(n)
                 return n
             if kw == "if":
@@ -488,9 +528,14 @@ class Parser:
 
     def parse_primary(self):
         t = self.tok
-        if t.kind == "NUM":
+        if t.kind in ("NUM", "FLOAT"):
             self.advance()
             return self.node("num", t, value=t.value, text=t.text)
+        if t.kind == "KW" and t.value in TYPE_KEYWORDS and self.peek().kind == "OP" and self.peek().value == "(":
+            self.advance()
+            n = self.node("callx", t, name=t.value, args=[])
+            n["args"] = self.parse_args()
+            return n
         if t.kind == "STR":
             self.advance()
             return self.node("str", t, value=t.value)

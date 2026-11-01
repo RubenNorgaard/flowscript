@@ -13,13 +13,13 @@ flow t version 2
 # standalone comment
 
 # note for extern
-extern f(a, b)  # trailing
-event e(x)
+extern f(int a, str b) -> int  # trailing
+event e(int x)
 timer tm
 const K = -(3 + 4) * 2
 const M = 1 << 4 | 2
-var g = K
-var h = 0x10
+int g = K
+int h = 0x10
 
 initial state s1:
   # a note on a comment-only line before handler
@@ -50,8 +50,8 @@ initial state s1:
 state empty:
   pass
 
-func fn(a):
-  var b = a * 2
+func fn(int a) -> int:
+  int b = a * 2
   return b
 '''
 

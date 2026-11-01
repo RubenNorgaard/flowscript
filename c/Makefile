@@ -6,29 +6,29 @@
 #   make size     size of flowscript.o built with -Os
 
 CC      ?= cc
-CFLAGS  ?= -std=c99 -Wall -Wextra -pedantic -O2
-ASANFLAGS = -std=c99 -Wall -Wextra -pedantic -O1 -g -fno-omit-frame-pointer \
+CFLAGS  ?= -std=c99 -Wall -Wextra -pedantic -O2 -ffp-contract=off
+ASANFLAGS = -std=c99 -Wall -Wextra -pedantic -O1 -g -ffp-contract=off -fno-omit-frame-pointer \
             -fsanitize=address,undefined -fno-sanitize-recover=all
 PYTHON  ?= python3
 
 all: fsrun
 
 fsrun: fsrun.c flowscript.c flowscript.h
-	$(CC) $(CFLAGS) -Werror -o $@ fsrun.c flowscript.c
+	$(CC) $(CFLAGS) -Werror -o $@ fsrun.c flowscript.c -lm
 
 fsrun-asan: fsrun.c flowscript.c flowscript.h
-	$(CC) $(ASANFLAGS) -Werror -o $@ fsrun.c flowscript.c
+	$(CC) $(ASANFLAGS) -Werror -o $@ fsrun.c flowscript.c -lm
 
 asan: fsrun-asan
 
 flowscript.o: flowscript.c flowscript.h
-	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -Os -c -o $@ flowscript.c
+	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -Os -ffp-contract=off -c -o $@ flowscript.c
 
 size: flowscript.o
 	size flowscript.o
 
 test_api: test_api.c flowscript.c flowscript.h
-	$(CC) $(ASANFLAGS) -Werror -o $@ test_api.c flowscript.c
+	$(CC) $(ASANFLAGS) -Werror -o $@ test_api.c flowscript.c -lm
 
 test: fsrun fsrun-asan test_api
 	cd .. && $(PYTHON) -m flowscript compile tests/api/api.fs -o c/test_api.fsb > /dev/null

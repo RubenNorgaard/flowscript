@@ -2,14 +2,20 @@
  * FlowScript virtual machine (C99, no malloc, no stdio).
  *
  * Behaviour is identical to the reference VM in flowscript/vm.py (see SPEC.md
- * sections 7 and 8).  The library only depends on <stdint.h>, <stddef.h> and
- * <string.h>.
+ * sections 7 and 8).  The library depends on <stdint.h>, <stddef.h>,
+ * <string.h> and <math.h> (floor, ceil, sqrt, exp, log, pow, fmod: link -lm).
+ * Build with -ffp-contract=off so float results match the Python VM bit for bit.
+ *
+ * Values are typed (fs_value): int (int32), float (double), str and time
+ * (int64 ms since 1970-01-01T00:00:00Z).  Run-time strings live in a fixed pool
+ * of FS_STR_SLOTS slots of FS_STR_LEN bytes inside fs_vm; unused ones are
+ * reclaimed (mark and sweep over globals, stack and queue) when the pool is full.
  *
  * ---------------------------------------------------------------------------
  * Typical use
  * ---------------------------------------------------------------------------
  *
- *   static fs_vm vm;                         // ~2.5 KB with default sizes
+ *   static fs_vm vm;                         // ~6 KB with default sizes
  *
  *   if (fs_load(&vm, image, image_len) != FS_OK) { ... reject download ... }
  *   fs_bind(&vm, "led", my_led);             // bind every extern by name
@@ -17,7 +23,8 @@
  *   fs_set_callbacks(&vm, on_emit, on_fault, user);
  *   fs_start(&vm);
  *   for (;;) {
- *       fs_post(&vm, fs_event_id(&vm, "ignition"), args, 1);
+ *       fs_value on = fs_int(1);
+ *       fs_post(&vm, fs_event_id(&vm, "ignition"), &on, 1);
  *       fs_tick(&vm, elapsed_ms);
  *       fs_run(&vm, 100000);                 // dispatch & execute until idle
  *   }
@@ -78,6 +85,12 @@ extern "C" {
 #ifndef FS_MAX_EVENT_ARGS
 #define FS_MAX_EVENT_ARGS 8
 #endif
+#ifndef FS_STR_SLOTS
+#define FS_STR_SLOTS 16         /* run-time strings alive at once           */
+#endif
+#ifndef FS_STR_LEN
+#define FS_STR_LEN 64           /* bytes per run-time string (+ a NUL)      */
+#endif
 
 /* ---- return / error codes ------------------------------------------------ */
 #define FS_OK             0
@@ -92,6 +105,7 @@ extern "C" {
 #define FS_TIMER_STOPPED   1    /* fs_timer_expired: timer not running, ignored */
 #define FS_ERR_NOTFOUND  (-9)   /* fs_bind: no extern with that name          */
 #define FS_ERR_NOTLOADED (-10)  /* no valid image loaded                       */
+#define FS_ERR_MEM       (-11)  /* fs_post: no room for a string argument (fault 11/12 reported) */
 
 /* ---- fs_step() results ----------------------------------------------------- */
 #define FS_IDLE       0         /* nothing to do                               */
@@ -111,17 +125,55 @@ extern "C" {
 #define FS_FAULT_UNBOUND         8
 #define FS_FAULT_CHAIN           9  /* script never idle (goto_state/emit loop): its
                                        pending transition and queue are dropped */
+#define FS_FAULT_TYPE           10  /* a value of the wrong type (bad bytecode, or an
+                                       extern returned the wrong type)          */
+#define FS_FAULT_NO_STRINGS     11  /* every string slot is in use              */
+#define FS_FAULT_STR_LONG       12  /* a string longer than FS_STR_LEN          */
+#define FS_FAULT_VALUE          13  /* invalid conversion: int("x"), time(2026, 13, 1), ... */
+
+/* ---- values ------------------------------------------------------------------ */
+#define FS_INT   0
+#define FS_FLOAT 1
+#define FS_STR   2
+#define FS_TIME  3
+#define FS_CSTR  4              /* host -> VM only: a NUL-terminated C string to copy
+                                   (extern results, fs_post arguments); see fs_cstr() */
+#define FS_NONE_TYPE 4          /* fs_extern_ret(): the extern returns nothing */
+
+typedef struct {
+    uint8_t type;               /* FS_INT, FS_FLOAT, FS_STR, FS_TIME (FS_CSTR from the host) */
+    union {
+        int32_t i;              /* FS_INT                                         */
+        double f;               /* FS_FLOAT                                       */
+        int64_t t;              /* FS_TIME: ms since 1970-01-01T00:00:00Z (UTC)    */
+        int32_t s;              /* FS_STR: >= 0 image string, < 0 run-time slot   */
+        const char *c;          /* FS_CSTR                                        */
+    } as;
+} fs_value;
+
+static inline fs_value fs_int(int32_t i) { fs_value v; v.type = FS_INT; v.as.t = 0; v.as.i = i; return v; }
+static inline fs_value fs_float(double f) { fs_value v; v.type = FS_FLOAT; v.as.f = f; return v; }
+static inline fs_value fs_time(int64_t ms) { fs_value v; v.type = FS_TIME; v.as.t = ms; return v; }
+/* A C string handed to the VM, which copies it into a string slot (the pointer
+ * only has to be valid until the extern returns / fs_post returns). */
+static inline fs_value fs_cstr(const char *s) { fs_value v; v.type = FS_CSTR; v.as.c = s ? s : ""; return v; }
 
 #define FS_NONE16 0xFFFFu
 
 typedef struct fs_vm fs_vm;
 
-/* Host function.  args points to argc values (argc = the extern's declared
- * arity); the pointer is only valid during the call.  fs_current_extern(vm)
- * tells which extern is being called (useful for generic stubs). */
-typedef int32_t (*fs_extern_fn)(fs_vm *vm, const int32_t *args, int argc, void *user);
-/* `emit EVENT(args)` notification; called before the event is queued. */
-typedef void (*fs_emit_fn)(fs_vm *vm, int event, const int32_t *args, int argc, void *user);
+/* Host function.  args points to argc values of the declared types (read
+ * strings with fs_str()); the pointer and the strings are only valid during the
+ * call.  Return a value of the declared return type (an int is accepted for a
+ * float; return fs_cstr(text) or one of the arguments for a str); the result of
+ * an extern declared without a return type is ignored.  A wrong type faults
+ * with FS_FAULT_TYPE.  fs_current_extern(vm) tells which extern is being
+ * called (useful for generic stubs). */
+typedef fs_value (*fs_extern_fn)(fs_vm *vm, const fs_value *args, int argc, void *user);
+/* `raise_event EVENT(args)` notification; called before the event is queued. */
+typedef void (*fs_emit_fn)(fs_vm *vm, int event, const fs_value *args, int argc, void *user);
+/* now(): ms since 1970-01-01T00:00:00Z (UTC).  Without a clock now() is 0. */
+typedef int64_t (*fs_clock_fn)(fs_vm *vm, void *user);
 /* Fault report; pc = address of the faulting instruction, or -1 for a
  * queue-full fault raised by fs_post()/fs_tick() outside a handler. */
 typedef void (*fs_fault_fn)(fs_vm *vm, int code, int pc, void *user);
@@ -139,8 +191,15 @@ typedef struct {
 
 typedef struct {
     uint16_t event;
-    int32_t  args[FS_MAX_EVENT_ARGS];   /* zero filled beyond the event's argc */
+    fs_value args[FS_MAX_EVENT_ARGS];   /* int 0 beyond the event's argc */
 } fs_qentry;
+
+typedef struct {
+    uint16_t len;
+    uint8_t  used;
+    uint8_t  mark;
+    char     data[FS_STR_LEN + 1];      /* NUL terminated */
+} fs_strslot;
 
 typedef struct {
     uint8_t active;
@@ -160,8 +219,8 @@ struct fs_vm {
     size_t         image_len;
     const uint8_t *strings;     /* start of the string section */
     const uint8_t *globals_init;
-    const uint8_t *externs_tab; /* 4 bytes each */
-    const uint8_t *events_tab;  /* 4 bytes each */
+    const uint8_t *externs_tab; /* 8 bytes each */
+    const uint8_t *events_tab;  /* 6 bytes each */
     const uint8_t *states_tab;  /* 2 bytes each */
     const uint8_t *timers_tab;  /* 2 bytes each */
     const uint8_t *funcs_tab;   /* 6 bytes each */
@@ -179,15 +238,16 @@ struct fs_vm {
     fs_emit_fn   on_emit;
     fs_fault_fn  on_fault;
     fs_timer_fn  on_timer;      /* NULL: built-in timers driven by fs_tick() */
+    fs_clock_fn  clock;         /* NULL: now() is 0                          */
     void        *user;
 
     /* --- run-time state --- */
-    int32_t  globals[FS_MAX_GLOBALS];
-    int32_t  stack[FS_STACK_SIZE];
+    fs_value globals[FS_MAX_GLOBALS];
+    fs_value stack[FS_STACK_SIZE];
     int      sp;                /* number of values on the stack.  May exceed
                                    FS_STACK_SIZE only when a handler declares
                                    more locals than that (as in vm.py); such
-                                   virtual slots read as 0 and every push
+                                   virtual slots read as int 0 and every push
                                    faults with stack overflow. */
     fs_frame frames[FS_MAX_FRAMES];
     int      nframes;
@@ -206,6 +266,7 @@ struct fs_vm {
     fs_qentry queue[FS_QUEUE_SIZE];
     int      q_head, q_count;
     fs_timer timers[FS_MAX_TIMERS];
+    fs_strslot strs[FS_STR_SLOTS];
 };
 
 /* ---- loading & binding ---------------------------------------------------- */
@@ -228,10 +289,15 @@ void fs_set_callbacks(fs_vm *vm, fs_emit_fn on_emit, fs_fault_fn on_fault, void 
 /* ---- running --------------------------------------------------------------- */
 /* Queue `boot` and the entry into the initial state (first declared state). */
 void fs_start(fs_vm *vm);
-/* Queue an event.  Missing args are zero filled, extra args ignored.
- * Returns FS_OK, FS_ERR_ARG (unknown event) or FS_ERR_FULL (fault 7 is
- * reported to the host with pc -1, or the current pc inside a handler). */
-int  fs_post(fs_vm *vm, int event, const int32_t *args, int argc);
+/* Queue an event.  args must have the event's parameter types (an int is
+ * accepted for a float, fs_cstr(text) for a str); missing args are the zero
+ * value of their type, extra args are ignored.  Returns FS_OK, FS_ERR_ARG
+ * (unknown event, wrong type), FS_ERR_FULL (fault 7 is reported to the host
+ * with pc -1, or the current pc inside a handler) or FS_ERR_MEM (no room for a
+ * string argument: fault 11 or 12 reported the same way). */
+int  fs_post(fs_vm *vm, int event, const fs_value *args, int argc);
+/* The clock now() reads (NULL: now() is 0).  Kept across fs_load(). */
+void fs_set_clock(fs_vm *vm, fs_clock_fn fn);
 /* Advance all running timers by ms (SPEC 8.3); expired timers queue events. */
 void fs_tick(fs_vm *vm, int32_t ms);    /* built-in timers only (no-op with a timer handler) */
 
@@ -263,6 +329,25 @@ const char *fs_extern_name(const fs_vm *vm, int idx);
 const char *fs_program_name(const fs_vm *vm);          /* NULL = none   */
 int  fs_event_argc(const fs_vm *vm, int idx);          /* -1 if unknown */
 int  fs_extern_argc(const fs_vm *vm, int idx);         /* -1 if unknown */
+int  fs_event_arg_type(const fs_vm *vm, int idx, int arg);   /* FS_INT.., -1 */
+int  fs_extern_arg_type(const fs_vm *vm, int idx, int arg);  /* FS_INT.., -1 */
+int  fs_extern_ret(const fs_vm *vm, int idx);          /* type, FS_NONE_TYPE, -1 */
+
+/* ---- values -------------------------------------------------------------------- */
+/* The bytes of a str value (NUL terminated), or NULL if v is not a valid string.
+ * Valid until the VM next allocates a string (copy it to keep it). */
+const char *fs_str(const fs_vm *vm, fs_value v, uint16_t *len_out);
+/* The empty string (no slot needed). */
+fs_value fs_empty_str(void);
+/* Canonical text of a value, as in the traces: 12, 2.5, "a\n", 2026-11-01T12:00:00.000Z
+ * (an FS_CSTR is shown like a str).
+ * Writes at most size-1 bytes + NUL; returns the full length. */
+int  fs_format(const fs_vm *vm, fs_value v, char *buf, int size);
+/* Text -> value with the VM's own rules (same as float("...") / time("...")).
+ * Return 0 on success, -1 if the text is invalid. */
+int  fs_parse_float(const char *s, size_t len, double *out);
+int  fs_parse_time(const char *s, size_t len, int64_t *out);
+int  fs_strings_in_use(const fs_vm *vm);
 /* Index of the extern currently being called (valid inside fs_extern_fn). */
 int  fs_current_extern(const fs_vm *vm);
 
@@ -271,9 +356,9 @@ int     fs_active(const fs_vm *vm);           /* 1 while a handler runs  */
 int     fs_handler(const fs_vm *vm);          /* handler index or -1     */
 int32_t fs_pc(const fs_vm *vm);
 int     fs_sp(const fs_vm *vm);
-int32_t fs_stack_at(const fs_vm *vm, int i);  /* 0 if out of range       */
+fs_value fs_stack_at(const fs_vm *vm, int i); /* int 0 if out of range   */
 int     fs_global_count(const fs_vm *vm);
-int32_t fs_global(const fs_vm *vm, int i);    /* 0 if out of range       */
+fs_value fs_global(const fs_vm *vm, int i);   /* int 0 if out of range   */
 int     fs_frame_count(const fs_vm *vm);
 const fs_frame *fs_frame_at(const fs_vm *vm, int i);  /* NULL if out of range */
 

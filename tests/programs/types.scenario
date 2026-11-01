@@ -1,0 +1,11 @@
+extern ratio 0.75
+extern label "five"
+extern stamp 2026-11-01T00:00:00Z
+post mixed 3 0.5 "abc" 2026-01-01T00:00:00Z
+post mixed -1
+extern label "a string longer than sixty-four bytes is refused by the vm with fault 12!!"
+post echo "x" 1
+post relabel 1
+extern label "back to short"
+post relabel 2
+dump

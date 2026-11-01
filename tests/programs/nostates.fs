@@ -1,7 +1,7 @@
 # no states, no scenario file: boot only
-extern log(x)
+extern log(int x) -> int
 
-var g = -5
+int g = -5
 
 any_state:
   on boot:

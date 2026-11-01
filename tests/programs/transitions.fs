@@ -1,14 +1,14 @@
 # goto_state semantics: from boot, from functions, inside exit (ignored), in enter
 flow transitions
 
-extern log(x)
+extern log(int x) -> int
 
-event go(n)
+event go(int n)
 event poke
 
-var path = 0
+int path = 0
 
-func jump(n):
+func jump(int n) -> int:
   log(100 + n)
   if n == 1:
     goto_state b

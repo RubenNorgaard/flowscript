@@ -1,16 +1,22 @@
 # Program used by c/test_api.c (not part of the trace conformance run)
 flow api version 2
 
-extern record(a, b)
-extern flood()
+extern record(int a, int b) -> int
+extern flood() -> int
+extern echo(str s) -> str
+extern wrong() -> float
 
 event noop
-event rec(a, b)
+event rec(int a, int b)
 event doflood
+event text(str s, float x)
+event mistype
 
 timer t
 
-var g = 5
+int g = 5
+str last = "none"
+float lastx = 0
 
 any_state:
   on boot:
@@ -21,3 +27,10 @@ any_state:
 
   on doflood:
     flood()
+
+  on text(s, x):
+    last = echo(s + "!")
+    lastx = x
+
+  on mistype:
+    lastx = wrong()

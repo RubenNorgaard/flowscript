@@ -4,16 +4,16 @@
 flow tracker version 3
 
 # --- host functions provided by the firmware ---
-extern gps_has_fix()
-extern gps_speed()
-extern battery_mv()
-extern send_position(reason)
-extern set_led(pattern)
-extern log(msg, value)
+extern gps_has_fix() -> int
+extern gps_speed() -> int
+extern battery_mv() -> int
+extern send_position(int reason)
+extern set_led(int pattern)
+extern log(str msg, int value)
 
 # --- events raised by the firmware ---
-event ignition(active)
-event motion(level)
+event ignition(int active)
+event motion(int level)
 event button
 # --- events raised by the script itself ---
 event no_fix
@@ -36,7 +36,7 @@ const REASON_PERIODIC = 1
 const REASON_ALARM = 2
 const REASON_THEFT = 3
 
-var reports = 0
+int reports = 0
 
 any_state:
   on boot:
@@ -55,10 +55,10 @@ any_state:
     reports = reports + 1
 
 # Battery check is shared by every state
-func battery_ok():
+func battery_ok() -> int:
   return battery_mv() >= LOW_BATTERY
 
-func send_report(reason):
+func send_report(int reason):
   if gps_has_fix():
     send_position(reason)
     raise_event report_sent
@@ -85,14 +85,14 @@ initial state parked:
 
 state driving:
   # Belongs to driving: starts at 0 every time the state is entered
-  var overspeed_count = 0
+  int overspeed_count = 0
 
   on enter:
     set_led(2)
     start report every 30s
 
   on report:
-    var speed = gps_speed()
+    int speed = gps_speed()
     if speed > LIMIT:
       overspeed_count = overspeed_count + 1
       if overspeed_count >= OVERSPEED_ALARM:

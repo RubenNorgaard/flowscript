@@ -39,16 +39,16 @@ class Report(unittest.TestCase):
         self.assertEqual(mins["FS_MAX_EXTERNS"], 6)
         self.assertIsNone(mins["FS_QUEUE_SIZE"])
         self.assertIn("-DFS_STACK_SIZE=4", rep["ram"]["cflags"])
-        self.assertEqual(rep["ram"]["default_bytes"], 2648)
+        self.assertEqual(rep["ram"]["default_bytes"], 9216)
 
     def test_recursion_has_no_bound(self):
-        rep = size_report(compile_source("func f(n):\n  return f(n)\nany_state:\n  on boot:\n    f(1)\n")[1])
+        rep = size_report(compile_source("func f(int n) -> int:\n  return f(n)\nany_state:\n  on boot:\n    f(1)\n")[1])
         mins = {r["macro"]: r["minimum"] for r in rep["ram"]["rows"]}
         self.assertIsNone(mins["FS_STACK_SIZE"])
         self.assertNotIn("FS_STACK_SIZE", rep["ram"]["cflags"])
 
     def test_unused_hints(self):
-        rep = size_report(compile_source("extern a()\nextern b()\nevent e\nvar g = 1\n"
+        rep = size_report(compile_source("extern a() -> int\nextern b() -> int\nevent e\nint g = 1\n"
                                          "any_state:\n  on boot:\n    a()\n")[1])
         text = "\n".join(rep["hints"])
         self.assertIn("extern 'b' is never called", text)

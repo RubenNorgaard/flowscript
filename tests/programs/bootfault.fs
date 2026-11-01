@@ -2,11 +2,11 @@
 # the initial state is never entered (only global handlers run).
 flow bootfault
 
-extern log(x)
+extern log(int x) -> int
 
-event ev(d)
+event ev(int d)
 
-var z = 0
+int z = 0
 
 any_state:
   on boot:

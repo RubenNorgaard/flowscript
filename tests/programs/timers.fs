@@ -1,18 +1,18 @@
 # Timers: one-shot, periodic, restart, stop, catch-up with large ticks
 flow timers
 
-extern fired(id, n)
+extern fired(int id, int n) -> int
 
-event cmd(op, ms)
+event cmd(int op, int ms)
 
 timer once
 timer per
 timer zero
 timer neg
 
-var n_once = 0
-var n_every = 0
-var n_zero = 0
+int n_once = 0
+int n_every = 0
+int n_zero = 0
 
 any_state:
   on cmd(op, ms):

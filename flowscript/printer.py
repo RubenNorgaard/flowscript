@@ -20,7 +20,7 @@ def prec(e):
         return _LEVEL[e["op"]]
     if t == "unary":
         return NOT_LEVEL if e["op"] == "not" else UNARY_LEVEL
-    if t == "num" and e["value"] < 0:
+    if t == "num" and (e["value"] < 0 or str(e["value"]).startswith("-")):
         return UNARY_LEVEL
     return ATOM_LEVEL
 
@@ -34,7 +34,7 @@ def _num_text(e):
     if text:
         try:
             from .lexer import tokenize
-            toks = [t for t in tokenize(text.lstrip("-")) if t.kind == "NUM"]
+            toks = [t for t in tokenize(text.lstrip("-")) if t.kind in ("NUM", "FLOAT")]
             v = toks[0].value if toks else None
             if text.startswith("-") and v is not None:
                 v = -v
@@ -42,7 +42,11 @@ def _num_text(e):
                 return text
         except Exception:
             pass
-    return str(e["value"])
+    v = e["value"]
+    if isinstance(v, float):
+        r = repr(v)
+        return r if ("e" in r or "." in r or "n" in r) else r + ".0"
+    return str(v)
 
 
 def expr_to_str(e):
@@ -96,8 +100,19 @@ class Printer:
                 self.emit(depth, ("# " + ln) if ln else "#")
 
     @staticmethod
-    def params(ps):
+    def params(ps, types=None):
+        if types:
+            ps = ["%s %s" % (t, p) for t, p in zip(types, ps)]
         return "(" + ", ".join(ps) + ")"
+
+    @staticmethod
+    def returns(it):
+        return (" -> " + it["returns"]) if it.get("returns") else ""
+
+    @staticmethod
+    def decl(it):
+        v = it.get("value")
+        return "%s %s%s" % (it.get("vtype") or "int", it["name"], (" = " + expr_to_str(v)) if v is not None else "")
 
     def program(self, prog):
         for c in prog.get("pre") or []:
@@ -125,17 +140,20 @@ class Printer:
             return
         self.note(d, it)
         if t == "extern":
-            self.emit(d, "extern %s%s" % (it["name"], self.params(it.get("params", []))))
+            self.emit(d, "extern %s%s%s" % (it["name"], self.params(it.get("params", []), it.get("ptypes")),
+                                            self.returns(it)))
         elif t == "event":
             ps = it.get("params") or []
-            self.emit(d, "event %s%s" % (it["name"], self.params(ps) if ps else ""))
+            self.emit(d, "event %s%s" % (it["name"], self.params(ps, it.get("ptypes")) if ps else ""))
         elif t == "timer":
             self.emit(d, "timer %s" % it["name"])
-        elif t in ("const", "var"):
-            v = it.get("value")
-            self.emit(d, "%s %s%s" % (t, it["name"], (" = " + expr_to_str(v)) if v is not None else ""))
+        elif t == "const":
+            self.emit(d, "const %s = %s" % (it["name"], expr_to_str(it["value"])))
+        elif t == "var":
+            self.emit(d, self.decl(it))
         elif t == "func":
-            self.emit(d, "func %s%s:" % (it["name"], self.params(it.get("params", []))))
+            self.emit(d, "func %s%s%s:" % (it["name"], self.params(it.get("params", []), it.get("ptypes")),
+                                          self.returns(it)))
             self.block(d + 1, it.get("body", []))
         elif t == "on":
             ps = it.get("params")
@@ -174,8 +192,7 @@ class Printer:
         if t == "assign":
             self.emit(d, "%s = %s" % (s["target"], expr_to_str(s["value"])))
         elif t == "local":
-            v = s.get("value")
-            self.emit(d, "var %s%s" % (s["name"], (" = " + expr_to_str(v)) if v is not None else ""))
+            self.emit(d, self.decl(s))
         elif t == "call":
             self.emit(d, expr_to_str(s))
         elif t == "if":

@@ -1,9 +1,9 @@
 # Timers started by a state's handlers (or functions they call) stop when the
 # state is left; timers started by global handlers keep running.
 
-extern log(x)
+extern log(int x) -> int
 
-event go(to)
+event go(int to)
 event arm
 
 timer blink

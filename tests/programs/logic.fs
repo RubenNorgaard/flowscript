@@ -1,14 +1,14 @@
 # Short-circuit and/or, xor/not with stubbed externs
 flow logic
 
-extern a()
-extern b()
-extern c()
-extern mark(x)
+extern a() -> int
+extern b() -> int
+extern c() -> int
+extern mark(int x) -> int
 
 event test
 
-var hits = 0
+int hits = 0
 
 any_state:
   on test:
@@ -22,7 +22,7 @@ any_state:
       mark(4)
     if not (a() xor c()):
       mark(5)
-    var v = a() and b() or c()
+    int v = a() and b() or c()
     mark(v)
     v = (a() or b()) and c()
     mark(v)

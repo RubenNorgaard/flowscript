@@ -1,6 +1,6 @@
 flow strings version 42
 
-extern say(s, n)
+extern say(str s, int n)
 
 event hello
 

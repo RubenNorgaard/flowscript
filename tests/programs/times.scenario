@@ -1,0 +1,17 @@
+clock 2026-11-01T08:00:00Z
+post at 2026-11-01T12:34:56.789Z
+tick 1500
+post at 0
+post at -1
+post at 1793532605500
+post parse "2026-11-01"
+post parse "2026-11-01T12:00"
+post parse "2026-11-01 12:00:05.5+02:00"
+post parse "2026-02-29"
+post parse "2026-13-01"
+post parse "nonsense"
+post make 2024 2 29
+post make 2023 2 29
+post make 10000 1 1
+clock 4102444800000
+post at 9999-12-31T23:59:59.999Z

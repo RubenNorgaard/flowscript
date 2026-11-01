@@ -1,4 +1,9 @@
-"""FlowScript compiler: AST -> Program (bytecode + debug info)."""
+"""FlowScript compiler: AST -> Program (bytecode + debug info).
+
+Statically typed: every expression has one of the types int, float, str or time
+(values.py). An int is promoted to float where a float is expected; nothing else is
+converted implicitly (use int(), float(), str(), time()).
+"""
 
 import struct
 
@@ -6,6 +11,14 @@ from .lexer import FlowError
 from .parser import parse, COMPARE_OPS
 from .bytecode import Program, OPCODES, BUILTIN_EVENTS, EV_BOOT, EV_ENTER, EV_EXIT
 from . import intops
+from . import values as V
+from .values import INT, FLOAT, STR, TIME, TYPE_NAMES, TYPE_CODES, NONE_TYPE
+
+VOID = None     # the "type" of a call that returns nothing
+
+
+def tname(t):
+    return "nothing" if t is None else TYPE_NAMES[t]
 
 MAX_EVENT_ARGS = 8
 MAX_LOCALS = 32     # params + locals per routine; must stay well below the VM stack (64)
@@ -46,18 +59,25 @@ class DebugInfo:
 
 
 class Routine:
-    def __init__(self, kind, name, params):
+    def __init__(self, kind, name, params, types, returns=None):
         self.kind = kind          # "func" or "handler"
         self.name = name
         self.locals = list(params)
+        self.types = list(types)  # type code per local slot
+        self.declared = set(params)
+        self.returns = returns    # functions: return type code or None
 
-    def declare(self, name, node, comp):
+    def declare(self, name, t, node, comp):
         if name in self.locals:
             raise comp.err("'%s' is already declared in this %s" % (name, "function" if self.kind == "func" else "handler"), node)
         if len(self.locals) >= MAX_LOCALS:
             raise comp.err("too many local variables", node)
         self.locals.append(name)
+        self.types.append(t)
         return len(self.locals) - 1
+
+    def visible(self, name):
+        return name in self.declared
 
 
 class Label:
@@ -78,12 +98,13 @@ class Compiler:
         self.cur_stmt = None
         self.routine = None
         # symbol tables
-        self.externs = {}   # name -> (index, argc)
-        self.events = {}    # name -> (index, argc, params)
+        self.externs = {}   # name -> (index, argc, param types, return type or None)
+        self.events = {}    # name -> (index, argc, params, param types)
         self.timers = {}    # name -> (index, event index)
-        self.consts = {}    # name -> value
-        self.globals = {}   # name -> index
-        self.funcs = {}     # name -> (index, argc, node)
+        self.consts = {}    # name -> value (int, float, Str, Time)
+        self.globals = {}   # name -> index (type: self.global_types[index])
+        self.global_types = []
+        self.funcs = {}     # name -> (index, argc, node, param types, return type or None)
         self.states = {}    # name -> index
         self.strings = {}
         self.any_state = None   # the any_state item (handlers for every state)
@@ -105,10 +126,17 @@ class Compiler:
             raise self.err("'%s' is a built-in event name" % name, node)
 
     def string(self, s):
+        if isinstance(s, bytes):
+            s = s.decode("utf-8", "surrogateescape")
         if s not in self.strings:
             self.strings[s] = len(self.prog.strings)
             self.prog.strings.append(s)
         return self.strings[s]
+
+    def type_code(self, name, node):
+        if name not in TYPE_CODES:
+            raise self.err("unknown type '%s'" % name, node)
+        return TYPE_CODES[name]
 
     # -- emission ----------------------------------------------------------------
     def emit(self, op, arg=None, node=None):
@@ -124,6 +152,10 @@ class Compiler:
             self.code += struct.pack("<b", arg)
         elif kind == "u8":
             self.code += struct.pack("<B", arg)
+        elif kind == "f64":
+            self.code += struct.pack("<d", arg)
+        elif kind == "i64":
+            self.code += struct.pack("<q", arg)
         elif kind == "u16":
             if isinstance(arg, Label):
                 arg.refs.append(pc + 1)
@@ -146,11 +178,30 @@ class Compiler:
                 struct.pack_into("<H", self.code, ref, lb.pc)
 
     def push_const(self, v, node=None):
-        v = intops.wrap(v)
-        if -128 <= v <= 127:
-            self.emit("PUSH8", v, node)
-        else:
-            self.emit("PUSH", v, node)
+        """Push a constant value; returns the pc of the push."""
+        t = V.type_of(v)
+        if t == INT:
+            v = intops.wrap(v)
+            return self.emit("PUSH8" if -128 <= v <= 127 else "PUSH", v, node)
+        if t == FLOAT:
+            if v == int(v) if v == v and abs(v) < 2 ** 31 else False:
+                if not (v == 0 and str(v).startswith("-")):   # keep -0.0 exact
+                    iv = int(v)
+                    self.emit("PUSH8" if -128 <= iv <= 127 else "PUSH", iv, node)
+                    return self.emit("BUILTIN", 0, node)      # float(int): 4-7 bytes instead of 9
+            return self.emit("PUSHF", v, node)
+        if t == STR:
+            return self.emit("PUSHS", self.string(v.b), node)
+        return self.emit("PUSHT", v.ms, node)
+
+    def convert_const(self, v, want, node, what="value"):
+        """A constant converted to type `want` (int -> float only)."""
+        t = V.type_of(v)
+        if want is None or t == want:
+            return v
+        if t == INT and want == FLOAT:
+            return float(v)
+        raise self.err("%s is %s, expected %s" % (what, TYPE_NAMES[t], TYPE_NAMES[want]), node)
 
     # -- declarations -------------------------------------------------------------
     def collect(self):
@@ -158,7 +209,7 @@ class Compiler:
         p.name = self.ast.get("name")
         p.version = int(self.ast.get("version") or 0)
         for i, n in enumerate(BUILTIN_EVENTS):
-            p.events.append((n, 0))
+            p.events.append((n, 0, ()))
         for item in self.ast["items"]:
             t = item["type"]
             if t == "comment":
@@ -166,20 +217,24 @@ class Compiler:
             if t == "extern":
                 self.define(item["name"], t, item)
                 self.check_params(item["params"], item)
-                self.externs[item["name"]] = (len(p.externs), len(item["params"]))
-                p.externs.append((item["name"], len(item["params"])))
+                ptypes = self.param_types(item)
+                ret = self.type_code(item["returns"], item) if item.get("returns") else None
+                self.externs[item["name"]] = (len(p.externs), len(item["params"]), ptypes, ret)
+                p.externs.append((item["name"], len(item["params"]), tuple(ptypes),
+                                  NONE_TYPE if ret is None else ret))
             elif t == "event":
                 self.define(item["name"], t, item)
                 params = item.get("params") or []
                 self.check_params(params, item)
                 if len(params) > MAX_EVENT_ARGS:
                     raise self.err("events can have at most %d parameters" % MAX_EVENT_ARGS, item)
-                self.events[item["name"]] = (len(p.events), len(params), params)
-                p.events.append((item["name"], len(params)))
+                ptypes = self.param_types(item)
+                self.events[item["name"]] = (len(p.events), len(params), params, ptypes)
+                p.events.append((item["name"], len(params), tuple(ptypes)))
             elif t == "timer":
                 self.define(item["name"], t, item)
                 ev = len(p.events)
-                p.events.append((item["name"], 0))
+                p.events.append((item["name"], 0, ()))
                 self.timers[item["name"]] = (len(p.timers), ev)
                 p.timers.append(ev)
             elif t == "const":
@@ -187,14 +242,16 @@ class Compiler:
                 self.consts[item["name"]] = self.const_value(item["value"])
             elif t == "var":
                 self.define(item["name"], t, item)
-                v = self.const_value(item["value"]) if item.get("value") is not None else 0
                 self.globals[item["name"]] = len(p.globals)
-                p.globals.append(v)
+                p.globals.append(self.initial_value(item))
+                self.global_types.append(self.type_code(item.get("vtype") or "int", item))
                 p.global_names.append(item["name"])
             elif t == "func":
                 self.define(item["name"], t, item)
                 self.check_params(item["params"], item)
-                self.funcs[item["name"]] = (len(self.funcs), len(item["params"]), item)
+                ret = self.type_code(item["returns"], item) if item.get("returns") else None
+                self.funcs[item["name"]] = (len(self.funcs), len(item["params"]), item,
+                                            self.param_types(item), ret)
             elif t == "state":
                 self.define(item["name"], t, item)
                 self.states[item["name"]] = None   # numbered below: the initial state is 0
@@ -231,7 +288,8 @@ class Compiler:
                     raise self.err("'%s' is already declared in state '%s'"
                                    % (v["name"], item["name"]), v)
                 own[v["name"]] = len(p.globals)
-                p.globals.append(self.const_value(v["value"]) if v.get("value") is not None else 0)
+                p.globals.append(self.initial_value(v))
+                self.global_types.append(self.type_code(v.get("vtype") or "int", v))
                 p.global_names.append("%s.%s" % (item["name"], v["name"]))
 
     def global_index(self, name, node=None):
@@ -248,6 +306,20 @@ class Compiler:
                            "or return a value and let the event handler store it" % name, node)
         return self.globals.get(name)
 
+    def var_type(self, name, node):
+        """Type of a readable variable/constant name, else raise."""
+        r = self.routine
+        if name in r.locals and r.visible(name):
+            return r.types[r.locals.index(name)]
+        gi = self.global_index(name, node)
+        if gi is not None:
+            return self.global_types[gi]
+        if name in self.consts:
+            return V.type_of(self.consts[name])
+        if name in self.states or name in self.events or name in self.funcs or name in self.externs:
+            raise self.err("'%s' is not a value" % name, node)
+        raise self.other_state_var(name, node) or self.err("unknown name '%s'" % name, node)
+
     def other_state_var(self, name, node):
         owners = [st for st, vs in self.state_vars.items() if name in vs]
         if not owners:
@@ -255,6 +327,19 @@ class Compiler:
         return self.err("'%s' is a variable of state %s, only visible in %s handlers"
                         % (name, " and ".join("'%s'" % o for o in owners),
                            "that state's" if len(owners) == 1 else "those states'"), node)
+
+    def param_types(self, item):
+        types = item.get("ptypes")
+        if types is None:      # written without types: int (also the AST of older tools)
+            types = ["int"] * len(item.get("params") or [])
+        return [self.type_code(t, item) for t in types]
+
+    def initial_value(self, item):
+        t = self.type_code(item.get("vtype") or "int", item)
+        if item.get("value") is None:
+            return V.zero(t)
+        return self.convert_const(self.const_value(item["value"]), t, item["value"],
+                                  "the initial value of '%s'" % item["name"])
 
     def check_params(self, params, node):
         if len(params) > MAX_PARAMS:
@@ -272,17 +357,29 @@ class Compiler:
         return v
 
     def try_fold(self, e):
-        """Evaluate a constant expression, or return None."""
+        """Evaluate a constant expression (a typed value), or return None."""
         t = e["type"]
-        if t in ("num", "bool"):
+        if t == "num":
+            v = e["value"]
+            return v if isinstance(v, float) else intops.wrap(v)
+        if t == "bool":
             return intops.wrap(e["value"])
+        if t == "str":
+            return V.Str(e["value"])
         if t == "name":
             if self.routine and e["name"] in self.routine.locals:
                 return None
             return self.consts.get(e["name"])
         if t == "unary":
             v = self.try_fold(e["operand"])
-            return None if v is None else intops.UNARY[e["op"]](v)
+            if v is None:
+                return None
+            vt = V.type_of(v)
+            if e["op"] == "-" and vt == FLOAT:
+                return -v
+            if vt != INT:
+                return None          # a type error: reported when compiled
+            return intops.UNARY[e["op"]](v)
         if t == "binary":
             a = self.try_fold(e["left"])
             if a is None:
@@ -290,10 +387,43 @@ class Compiler:
             b = self.try_fold(e["right"])
             if b is None:
                 return None
+            op = e["op"]
+            ta, tb = V.type_of(a), V.type_of(b)
+            if op in ("and", "or", "xor"):
+                return intops.BINARY[op](a, b) if ta == tb == INT else None
+            rt = V.binary_type(op, ta, tb)
+            if rt is None:
+                return None
+            if rt[1]:
+                a = float(a)
+            if rt[2]:
+                b = float(b)
             try:
-                return intops.BINARY[e["op"]](a, b)
+                r = V.binary(op, a, b)
             except intops.DivZero:
                 raise self.err("division by zero in constant expression", e)
+            return V.Str(r) if isinstance(r, bytes) else r
+        if t == "callx" and e["name"] not in self.funcs and e["name"] not in self.externs:
+            args = []
+            for a in e.get("args") or []:
+                v = self.try_fold(a)
+                if v is None:
+                    return None
+                args.append(v)
+            hit = self.resolve_builtin(e["name"], [V.type_of(a) for a in args], e, quiet=True)
+            if hit is None:
+                return None
+            idx, ptypes, _ret = hit
+            if idx == "identity":
+                return args[0]
+            if V.BUILTINS[idx][0] in V.IMPURE:
+                return None
+            args = [float(a) if pt == FLOAT and V.type_of(a) == INT else a for a, pt in zip(args, ptypes)]
+            try:
+                r = V.call_builtin(idx, args)
+            except V.ValueFault:
+                raise self.err("invalid value in constant expression '%s'" % e["name"], e)
+            return V.Str(r) if isinstance(r, bytes) else r
         return None
 
     # -- program -------------------------------------------------------------------
@@ -322,7 +452,7 @@ class Compiler:
         self.dbg.warnings.sort(key=lambda w: w["line"])
         p = self.prog
         p.funcs = [None] * len(self.funcs)
-        for name, (idx, argc, node) in self.funcs.items():
+        for name, (idx, argc, node, _pt, _ret) in self.funcs.items():
             nlocals = node["_nlocals"]
             p.funcs[idx] = (name, argc, nlocals, func_offsets[name])
             del node["_nlocals"]
@@ -377,28 +507,64 @@ class Compiler:
             elif item["type"] in ("state", "any_state"):
                 walk(item["handlers"])
 
-    def begin_routine(self, kind, name, params, node, state=None):
-        self.routine = Routine(kind, name, params)
+    def begin_routine(self, kind, name, params, types, node, state=None, returns=None):
+        self.routine = Routine(kind, name, params, types, returns)
         self.cur_stmt = node
         self.cur_node = node
         self.dbg.stmt_of[node["id"]] = node["id"]
         return len(self.code)
 
+    def predeclare(self, body, node):
+        """Locals are routine-scoped and start at their type's zero value: give every
+        declaration in the body its slot now, and initialise the non-int ones (a stack slot
+        starts as int 0), so a local declared in a branch that did not run still has a value
+        of its type."""
+        found = []
+
+        def walk(stmts, nested):
+            for st in stmts or []:
+                if st["type"] == "local":
+                    found.append((st, nested))
+                elif st["type"] == "if":
+                    for br in st["branches"]:
+                        walk(br["body"], True)
+                    walk(st.get("else_body"), True)
+                elif st["type"] == "while":
+                    walk(st["body"], True)
+        walk(body, False)
+        for st, nested in found:
+            if st["name"] in (self.state_vars.get(self.cur_state) or {}):
+                raise self.err("local '%s' would hide the state variable of the same name" % st["name"], st)
+            if st["name"] in self.globals or st["name"] in self.consts:
+                raise self.err("local '%s' would hide a global of the same name" % st["name"], st)
+            t = self.type_code(st.get("vtype") or "int", st)
+            idx = self.routine.declare(st["name"], t, st, self)
+            # a declaration at the top of the body runs before any code that can see it
+            if t != INT and nested:
+                self.push_const(V.zero(t), node)
+                self.emit("STOREL", idx, node)
+
     def end_routine(self, start, node, state=None):
         self.dbg.routines.append({
             "start": start, "end": len(self.code), "kind": self.routine.kind,
             "name": self.routine.name, "state": state, "locals": list(self.routine.locals),
-            "node": node["id"],
+            "types": [TYPE_NAMES[t] for t in self.routine.types], "node": node["id"],
         })
         n = len(self.routine.locals)
         self.routine = None
         return n
 
     def compile_func(self, f):
-        start = self.begin_routine("func", f["name"], f["params"], f)
+        _idx, _argc, _node, ptypes, ret = self.funcs[f["name"]]
+        start = self.begin_routine("func", f["name"], f["params"], ptypes, f, returns=ret)
+        self.predeclare(f["body"], f)
         self.block(f["body"])
         if not self.ends_flow(f["body"]):
-            self.emit("RET0", node=f)
+            if ret is None or ret == INT:
+                self.emit("RET0", node=f)
+            else:               # falling off the end returns the zero value of the type
+                self.push_const(V.zero(ret), f)
+                self.emit("RET", node=f)
         f["_nlocals"] = self.end_routine(start, f)
         return start
 
@@ -409,15 +575,15 @@ class Compiler:
             if state is None:
                 raise self.err("'on %s' is only allowed inside a state (any_state is never "
                                "entered or left)" % ev, h)
-            evi, argc, eparams = BUILTIN_EVENTS.index(ev), 0, []
+            evi, argc, eparams, etypes = BUILTIN_EVENTS.index(ev), 0, [], []
         elif ev == "boot":
             if state is not None:
                 raise self.err("'on boot' belongs in any_state", h)
-            evi, argc, eparams = EV_BOOT, 0, []
+            evi, argc, eparams, etypes = EV_BOOT, 0, [], []
         elif ev in self.events:
-            evi, argc, eparams = self.events[ev]
+            evi, argc, eparams, etypes = self.events[ev]
         elif ev in self.timers:
-            evi, argc, eparams = self.timers[ev][1], 0, []
+            evi, argc, eparams, etypes = self.timers[ev][1], 0, [], []
         else:
             raise self.err("unknown event '%s' (declare it with 'event %s')" % (ev, ev), h)
         key = (sname, evi)
@@ -434,11 +600,13 @@ class Compiler:
         if len(params) > argc:
             raise self.err("event '%s' has only %d parameter(s)" % (ev, argc), h)
         label = ("%s.on %s" % (sname, ev)) if sname else ("on " + ev)
-        start = self.begin_routine("handler", label, params, h, sname)
+        start = self.begin_routine("handler", label, params, etypes[:len(params)], h, sname)
         # pad locals so all event args fit (unnamed ones get hidden names)
         while len(self.routine.locals) < argc:
+            self.routine.types.append(etypes[len(self.routine.locals)])
             self.routine.locals.append("$arg%d" % len(self.routine.locals))
         self.cur_state = sname
+        self.predeclare(h["body"], h)
         if ev == "enter":
             self.reset_state_vars(state)
         self.block(h["body"])
@@ -470,7 +638,7 @@ class Compiler:
         """A state with variables but no 'on enter' gets one that only resets them."""
         sname = state["name"]
         first = next(v for v in state["vars"] if v["type"] == "var")
-        start = self.begin_routine("handler", "%s.on enter" % sname, [], first, sname)
+        start = self.begin_routine("handler", "%s.on enter" % sname, [], [], first, sname)
         self.reset_state_vars(state)
         self.emit("RET0", node=first)
         nlocals = self.end_routine(start, first, sname)
@@ -501,30 +669,36 @@ class Compiler:
 
     def stmt_assign(self, s):
         name = s["target"]
-        self.expr(s["value"])
-        self.store(name, s)
+        self.store(name, s, self.target_type(name, s), s["value"])
 
-    def store(self, name, s):
-        if name in self.routine.locals:
-            self.emit("STOREL", self.routine.locals.index(name), s)
-        elif self.global_index(name, s) is not None:
-            self.emit("STOREG", self.global_index(name, s), s)
-        elif name in self.consts:
+    def target_type(self, name, s):
+        r = self.routine
+        if name in r.locals and r.visible(name):
+            return r.types[r.locals.index(name)]
+        gi = self.global_index(name, s)
+        if gi is not None:
+            return self.global_types[gi]
+        if name in self.consts:
             raise self.err("cannot assign to constant '%s'" % name, s)
+        raise self.other_state_var(name, s) or \
+            self.err("unknown variable '%s' (declare it with a type, e.g. 'int %s = 0')" % (name, name), s)
+
+    def store(self, name, s, t, value):
+        self.expr(value, t, "'%s' is %s:" % (name, TYPE_NAMES[t]))
+        r = self.routine
+        if name in r.locals and r.visible(name):
+            self.emit("STOREL", r.locals.index(name), s)
         else:
-            raise self.other_state_var(name, s) or \
-                self.err("unknown variable '%s' (declare it with 'var %s')" % (name, name), s)
+            self.emit("STOREG", self.global_index(name, s), s)
 
     def stmt_local(self, s):
-        if s["name"] in (self.state_vars.get(self.cur_state) or {}):
-            raise self.err("local '%s' would hide the state variable of the same name" % s["name"], s)
-        if s["name"] in self.globals or s["name"] in self.consts:
-            raise self.err("local '%s' would hide a global of the same name" % s["name"], s)
+        idx = self.routine.locals.index(s["name"])
+        t = self.routine.types[idx]
         if s.get("value") is not None:
-            self.expr(s["value"])
+            self.expr(s["value"], t, "'%s' is %s:" % (s["name"], TYPE_NAMES[t]))
         else:
-            self.push_const(0, s)
-        idx = self.routine.declare(s["name"], s, self)
+            self.push_const(V.zero(t), s)
+        self.routine.declared.add(s["name"])
         self.emit("STOREL", idx, s)
 
     def stmt_call(self, s):
@@ -572,12 +746,12 @@ class Compiler:
             raise self.err("cannot emit timer event '%s' (use start)" % name, s)
         if name not in self.events:
             raise self.err("unknown event '%s'" % name, s)
-        idx, argc, _ = self.events[name]
+        idx, argc, params, ptypes = self.events[name]
         args = s.get("args") or []
         if len(args) != argc:
             raise self.err("event '%s' takes %d argument(s), got %d" % (name, argc, len(args)), s)
-        for a in args:
-            self.expr(a)
+        for a, prm, pt in zip(args, params, ptypes):
+            self.expr(a, pt, "%s(%s %s):" % (name, TYPE_NAMES[pt], prm))
         self.emit("EMIT", idx, s)
 
     def timer_index(self, s):
@@ -587,7 +761,7 @@ class Compiler:
 
     def stmt_start(self, s):
         idx = self.timer_index(s)
-        self.expr(s["ms"])
+        self.expr(s["ms"], INT, "the timer duration (ms):")
         self.emit("TEVERY" if s.get("every") else "TSTART", idx, s)
 
     def stmt_stop(self, s):
@@ -596,11 +770,16 @@ class Compiler:
     def stmt_return(self, s):
         v = s.get("value")
         if v is None:
+            if self.routine.kind == "func" and self.routine.returns is not None:
+                raise self.err("'%s' must return a %s value" % (self.routine.name, TYPE_NAMES[self.routine.returns]), s)
             self.emit("RET0", node=s)
             return
         if self.routine.kind == "handler":
             raise self.err("event handlers cannot return a value", s)
-        self.expr(v)
+        if self.routine.returns is None:
+            raise self.err("'%s' returns nothing: declare its type, e.g. 'func %s(...) -> int:'"
+                           % (self.routine.name, self.routine.name), s)
+        self.expr(v, self.routine.returns, "'%s' returns %s:" % (self.routine.name, TYPE_NAMES[self.routine.returns]))
         self.emit("RET", node=s)
 
     # -- expressions -----------------------------------------------------------------
@@ -611,39 +790,94 @@ class Compiler:
         self.dbg.stmt_of[e["id"]] = self.cur_stmt["id"]
         self.dbg.node_lines[e["id"]] = e.get("line", 0)
 
-    def expr(self, e):
-        """Compile e in value context."""
+    def typeof(self, e):
+        """Static type of an expression (INT, FLOAT, STR, TIME or VOID); raises on errors."""
+        t = e["type"]
+        if t == "num":
+            return FLOAT if isinstance(e["value"], float) else INT
+        if t == "bool":
+            return INT
+        if t == "str":
+            return STR
+        if t == "name":
+            return self.var_type(e["name"], e)
+        if t in ("callx", "call"):
+            return self.call_target(e)[3]
+        if t == "unary":
+            ot = self.value_type(e["operand"])
+            if e["op"] == "-" and ot in (INT, FLOAT):
+                return ot
+            if ot != INT:
+                raise self.err("'%s' needs an int operand, not %s" % (e["op"], TYPE_NAMES[ot]), e)
+            return INT
+        if t == "binary":
+            op = e["op"]
+            lt, rt = self.value_type(e["left"]), self.value_type(e["right"])
+            if op in ("and", "or", "xor"):
+                for side, st in ((e["left"], lt), (e["right"], rt)):
+                    if st != INT:
+                        raise self.err("'%s' needs conditions (int), not %s: compare it, e.g. x != 0"
+                                       % (op, TYPE_NAMES[st]), side)
+                return INT
+            r = V.binary_type(op, lt, rt)
+            if r is None:
+                raise self.err("cannot use '%s' on %s and %s" % (op, TYPE_NAMES[lt], TYPE_NAMES[rt]), e)
+            return r[0]
+        raise self.err("unknown expression type '%s'" % t, e)
+
+    def value_type(self, e):
+        t = self.typeof(e)
+        if t is VOID:
+            raise self.err("'%s' returns nothing, so it has no value" % e.get("name", "?"), e)
+        return t
+
+    def expr(self, e, want=None, what="value"):
+        """Compile e in value context; convert it to type `want` (int -> float) if given.
+        Returns the type of the value left on the stack."""
+        t = self.value_type(e)
+        if want is not None and t != want and not (t == INT and want == FLOAT):
+            raise self.err("%s got %s, expected %s" % (what, TYPE_NAMES[t], TYPE_NAMES[want]), e)
         self.track(e)
         saved = self.cur_node
         self.cur_node = e
         folded = self.try_fold(e)
-        t = e["type"]
         if folded is not None:
-            self.push_const(folded, e)
-            self.mark(e, len(self.code) - (2 if -128 <= folded <= 127 else 5))
+            if want == FLOAT and V.type_of(folded) == INT:
+                folded = float(folded)
+                t = FLOAT
+            self.mark(e, self.push_const(folded, e))
             self.track_subtree(e)
-        elif t == "str":
-            pc = self.emit("PUSHS", self.string(e["value"]))
-            self.mark(e, pc)
-        elif t == "name":
+            self.cur_node = saved
+            return t
+        self.expr_code(e, t)
+        self.cur_node = saved
+        if want == FLOAT and t == INT:
+            self.promote(e)
+            t = FLOAT
+        return t
+
+    def promote(self, e):
+        self.emit("BUILTIN", 0, e)        # float(int)
+
+    def expr_code(self, e, t):
+        et = e["type"]
+        if et == "str":
+            self.mark(e, self.emit("PUSHS", self.string(e["value"])))
+        elif et == "name":
             name = e["name"]
-            if name in self.routine.locals:
-                pc = self.emit("LOADL", self.routine.locals.index(name))
-            elif self.global_index(name, e) is not None:
-                pc = self.emit("LOADG", self.global_index(name, e))
-            elif name in self.states or name in self.events or name in self.funcs or name in self.externs:
-                raise self.err("'%s' is not a value" % name, e)
+            r = self.routine
+            if name in r.locals and r.visible(name):
+                pc = self.emit("LOADL", r.locals.index(name))
             else:
-                raise self.other_state_var(name, e) or self.err("unknown name '%s'" % name, e)
+                pc = self.emit("LOADG", self.global_index(name, e))
             self.mark(e, pc)
-        elif t in ("callx", "call"):
-            pc = self.call(e, e)
-            self.mark(e, pc)
-        elif t == "unary":
+        elif et in ("callx", "call"):
+            self.mark(e, self.call(e, e))
+        elif et == "unary":
             self.expr(e["operand"])
             op = {"-": "NEG", "~": "BNOT", "not": "NOT"}[e["op"]]
             self.mark(e, self.emit(op))
-        elif t == "binary":
+        elif et == "binary":
             op = e["op"]
             if op in ("and", "or"):
                 f, end = Label(), Label()
@@ -664,44 +898,85 @@ class Compiler:
                 self.emit("BOOL")
                 self.mark(e, self.emit("NE"))
             else:
-                self.expr(e["left"])
-                self.expr(e["right"])
+                rt, pl, pr = V.binary_type(op, self.value_type(e["left"]), self.value_type(e["right"]))
+                self.expr(e["left"], FLOAT if pl else None)
+                self.expr(e["right"], FLOAT if pr else None)
                 self.cur_node = e
-                self.mark(e, self.emit(BIN_OPS[op]))
+                self.mark(e, self.emit("CONCAT" if op == "+" and rt == STR else BIN_OPS[op]))
         else:
-            raise self.err("unknown expression type '%s'" % t, e)
-        self.cur_node = saved
+            raise self.err("unknown expression type '%s'" % et, e)
 
     def track_subtree(self, e):
         for k in ("left", "right", "operand"):
             if isinstance(e.get(k), dict):
                 self.track(e[k])
                 self.track_subtree(e[k])
+        for a in e.get("args") or []:
+            if isinstance(a, dict):
+                self.track(a)
+                self.track_subtree(a)
 
-    def call(self, e, node):
+    def resolve_builtin(self, name, argtypes, node, quiet=False):
+        """-> (builtin id or "identity", param types, return type), None if not a builtin."""
+        cands = [(i, b) for i, b in enumerate(V.BUILTINS) if b[0] == name]
+        if not cands:
+            return None
+        if len(argtypes) == 1 and (name, argtypes[0]) in V.IDENTITY:
+            return "identity", (argtypes[0],), argtypes[0]
+        exact = [c for c in cands if list(c[1][1]) == list(argtypes)]
+        if exact:
+            i, b = exact[0]
+            return i, b[1], b[2]
+        loose = [c for c in cands if len(c[1][1]) == len(argtypes) and all(
+            a == p or (a == INT and p == FLOAT) for a, p in zip(argtypes, c[1][1]))]
+        if loose:
+            i, b = loose[0]
+            return i, b[1], b[2]
+        if quiet:
+            return None
+        sigs = ", ".join("%s(%s)" % (name, ", ".join(TYPE_NAMES[p] for p in b[1])) for _i, b in cands)
+        raise self.err("no %s() takes (%s); there is %s" % (name, ", ".join(TYPE_NAMES[a] for a in argtypes), sigs), node)
+
+    def call_target(self, e):
+        """-> (kind, index, param types, return type) for a call expression/statement."""
         name = e["name"]
         args = e.get("args") or []
         if name in self.funcs:
-            idx, argc, _ = self.funcs[name]
-            op = "CALL"
+            idx, argc, _node, ptypes, ret = self.funcs[name]
+            kind = "CALL"
         elif name in self.externs:
-            idx, argc = self.externs[name]
-            op = "XCALL"
+            idx, argc, ptypes, ret = self.externs[name]
+            kind = "XCALL"
         else:
-            raise self.err("unknown function '%s' (declare host functions with 'extern %s(...)')" % (name, name), e)
+            hit = self.resolve_builtin(name, [self.value_type(a) for a in args], e)
+            if hit is None:
+                raise self.err("unknown function '%s' (declare host functions with 'extern %s(...)')" % (name, name), e)
+            return ("BUILTIN", hit[0], hit[1], hit[2])
         if len(args) != argc:
             raise self.err("'%s' takes %d argument(s), got %d" % (name, argc, len(args)), e)
-        for a in args:
-            self.expr(a)
+        return kind, idx, ptypes, ret
+
+    def call(self, e, node):
+        kind, idx, ptypes, _ret = self.call_target(e)
+        args = e.get("args") or []
+        for i, (a, pt) in enumerate(zip(args, ptypes)):
+            self.expr(a, pt, "argument %d of %s() (%s):" % (i + 1, e["name"], TYPE_NAMES[pt]))
         saved = self.cur_node
         self.cur_node = node
-        pc = self.emit(op, idx)
+        if idx == "identity":
+            pc = len(self.code) - 1 if self.code else 0
+        else:
+            pc = self.emit(kind, idx)
         self.cur_node = saved
         return pc
 
     def cjump(self, e, label, jump_if):
         """Compile a condition: jump to label if truth(e) == jump_if, else fall through."""
         self.track(e)
+        ct = self.value_type(e)
+        if ct != INT:
+            raise self.err("a condition must be an int (true/false), not %s: compare it, e.g. x != 0"
+                           % TYPE_NAMES[ct], e)
         t = e["type"]
         folded = self.try_fold(e)
         if folded is not None:

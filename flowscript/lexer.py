@@ -1,15 +1,18 @@
 """FlowScript lexer: source text -> list of tokens."""
 
 KEYWORDS = {
-    "flow", "version", "extern", "event", "timer", "const", "var", "func", "on",
+    "flow", "version", "extern", "event", "timer", "const", "func", "on",
+    "int", "float", "str", "time",
     "state", "initial", "any_state", "pass", "if", "elif", "else", "while", "goto_state", "raise_event", "start", "every",
     "stop", "return", "and", "or", "xor", "not", "true", "false",
 }
 
+TYPE_KEYWORDS = ("int", "float", "str", "time")
+
 TIME_UNITS = {"ms": 1, "s": 1000, "min": 60000, "h": 3600000}
 
 # longest first
-OPERATORS = ["<<", ">>", "==", "!=", "<=", ">=", "+", "-", "*", "/", "%", "&", "|",
+OPERATORS = ["->", "<<", ">>", "==", "!=", "<=", ">=", "+", "-", "*", "/", "%", "&", "|",
              "^", "~", "<", ">", "=", "(", ")", ",", ":"]
 
 
@@ -33,7 +36,7 @@ class Token:
     __slots__ = ("kind", "value", "line", "col", "text")
 
     def __init__(self, kind, value, line, col, text=None):
-        self.kind = kind      # NAME KW NUM STR OP NEWLINE COMMENT INDENT DEDENT EOF
+        self.kind = kind      # NAME KW NUM FLOAT STR OP NEWLINE COMMENT INDENT DEDENT EOF
         self.value = value
         self.line = line
         self.col = col
@@ -109,6 +112,29 @@ def _raw_tokens(src):
                     j += 1
                 base = 10
                 digits = src[i:j]
+                # float literal: 1.5, 2.0e-3, 1e6
+                k = j
+                if k + 1 < n and src[k] == "." and src[k + 1].isdigit():
+                    k += 1
+                    while k < n and (src[k].isdigit() or src[k] == "_"):
+                        k += 1
+                if k < n and src[k] in "eE":
+                    m = k + 1
+                    if m < n and src[m] in "+-":
+                        m += 1
+                    if m < n and src[m].isdigit():
+                        k = m
+                        while k < n and src[k].isdigit():
+                            k += 1
+                if k > j:
+                    if k < n and (src[k].isalpha() or src[k] == "_"):
+                        raise FlowError("time units need an integer: write %s as a whole number of ms"
+                                        % src[i:k], line, col)
+                    text = src[i:k]
+                    add("FLOAT", float(text.replace("_", "")), line, col, text)
+                    col += k - i
+                    i = k
+                    continue
             digits = digits.replace("_", "")
             if not digits:
                 raise FlowError("malformed number", line, col)

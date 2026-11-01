@@ -1,15 +1,15 @@
 # Scripts that never go idle are stopped after FS_MAX_CHAIN (256) dispatches
 # with fault 9; the pending transition and the event queue are dropped.
 
-extern log(x)
+extern log(int x) -> int
 
 event pingpong
 event spin
-event chain(n)
+event chain(int n)
 event hello
 
-var bounces = 0
-var spins = 0
+int bounces = 0
+int spins = 0
 
 initial state idle:
   on pingpong:

@@ -5,20 +5,21 @@
  */
 #include "flowscript.h"
 
+#include <math.h>
 #include <string.h>
 
 /* ---- opcodes (flowscript/bytecode.py) -------------------------------------- */
 enum {
     OP_NOP = 0x00, OP_PUSH = 0x01, OP_PUSH8 = 0x02, OP_PUSHS = 0x03, OP_POP = 0x04,
-    OP_DUP = 0x05,
+    OP_DUP = 0x05, OP_PUSHF = 0x06, OP_PUSHT = 0x07,
     OP_LOADG = 0x10, OP_STOREG = 0x11, OP_LOADL = 0x12, OP_STOREL = 0x13,
     OP_ADD = 0x20, OP_SUB = 0x21, OP_MUL = 0x22, OP_DIV = 0x23, OP_MOD = 0x24,
     OP_NEG = 0x25, OP_BAND = 0x26, OP_BOR = 0x27, OP_BXOR = 0x28, OP_BNOT = 0x29,
-    OP_SHL = 0x2A, OP_SHR = 0x2B,
+    OP_SHL = 0x2A, OP_SHR = 0x2B, OP_CONCAT = 0x2C,
     OP_EQ = 0x30, OP_NE = 0x31, OP_LT = 0x32, OP_LE = 0x33, OP_GT = 0x34, OP_GE = 0x35,
     OP_NOT = 0x36, OP_BOOL = 0x37,
     OP_JMP = 0x40, OP_JZ = 0x41, OP_JNZ = 0x42,
-    OP_CALL = 0x50, OP_RET = 0x51, OP_RET0 = 0x52, OP_XCALL = 0x53,
+    OP_CALL = 0x50, OP_RET = 0x51, OP_RET0 = 0x52, OP_XCALL = 0x53, OP_BUILTIN = 0x54,
     OP_GOTO = 0x60, OP_EMIT = 0x61, OP_TSTART = 0x62, OP_TEVERY = 0x63, OP_TSTOP = 0x64
 };
 
@@ -38,12 +39,504 @@ static uint32_t rd32(const uint8_t *p)
            ((uint32_t)p[3] << 24);
 }
 
+static uint64_t rd64(const uint8_t *p)
+{
+    return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
+}
+
 /* uint32 -> int32 two's complement without implementation-defined behaviour */
 static int32_t s32(uint32_t u)
 {
     if (u & 0x80000000u)
         return -(int32_t)(~u) - 1;
     return (int32_t)u;
+}
+
+static int64_t s64(uint64_t u)
+{
+    if (u & 0x8000000000000000u)
+        return -(int64_t)(~u) - 1;
+    return (int64_t)u;
+}
+
+static double f64(uint64_t u)
+{
+    double d;
+    memcpy(&d, &u, sizeof(d));
+    return d;
+}
+
+#define EMPTY_STR INT32_MIN     /* fs_value.as.s of the empty string constant */
+
+static fs_value v_str(int32_t ref) { fs_value v; v.type = FS_STR; v.as.t = 0; v.as.s = ref; return v; }
+
+static fs_value zero_of(int type)
+{
+    switch (type) {
+    case FS_FLOAT: return fs_float(0.0);
+    case FS_STR:   return v_str(EMPTY_STR);
+    case FS_TIME:  return fs_time(0);
+    default:       return fs_int(0);
+    }
+}
+
+/* parameter type i (2 bits each) */
+static int ptype(uint32_t packed, int i) { return (int)((packed >> (2 * i)) & 3u); }
+
+/* ---- value rules (flowscript/values.py: same arithmetic, same text) ----------- */
+static const double P10[23] = {
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
+    1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
+};
+
+static double scale_up(double m, int k)
+{
+    while (k > 22) {
+        m = m * 1e22;
+        k -= 22;
+    }
+    return m * P10[k];
+}
+
+static double scale_down(double m, int k)
+{
+    while (k > 22) {
+        m = m / 1e22;
+        k -= 22;
+    }
+    return m / P10[k];
+}
+
+static int dec_exp(double a)
+{
+    int d = 0;
+    if (a >= 1.0) {
+        while (d < 400 && scale_up(1.0, d + 1) <= a)
+            d++;
+    } else {
+        while (d > -400 && scale_up(a, -d) < 1.0)
+            d--;
+    }
+    return d;
+}
+
+static int64_t digits15(double a, int d)
+{
+    int s = 14 - d;
+    double m = s >= 0 ? scale_up(a, s) : scale_down(a, -s);
+    return (int64_t)(m + 0.5);
+}
+
+/* Python str(int) */
+static int fmt_i64(int64_t v, char *out)
+{
+    char tmp[24];
+    int n = 0, len = 0;
+    uint64_t u = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+    do {
+        tmp[n++] = (char)('0' + (int)(u % 10u));
+        u /= 10u;
+    } while (u);
+    if (v < 0)
+        out[len++] = '-';
+    while (n)
+        out[len++] = tmp[--n];
+    out[len] = 0;
+    return len;
+}
+
+/* values.fmt_float; out needs 32 bytes */
+static int fmt_float(double x, char *out)
+{
+    char dg[24], *o = out;
+    int d, nd, i, neg;
+    int64_t n;
+    const int64_t E15 = 1000000000000000LL, E14 = 100000000000000LL;
+    double a;
+    if (x != x) {
+        memcpy(out, "nan", 4);
+        return 3;
+    }
+    if (x == INFINITY || x == -INFINITY) {
+        memcpy(out, x > 0 ? "inf" : "-inf", x > 0 ? 4 : 5);
+        return x > 0 ? 3 : 4;
+    }
+    if (x == 0.0) {
+        if (signbit(x)) {
+            memcpy(out, "-0.0", 5);
+            return 4;
+        }
+        memcpy(out, "0.0", 4);
+        return 3;
+    }
+    neg = x < 0;
+    a = neg ? -x : x;
+    d = dec_exp(a);
+    n = digits15(a, d);
+    if (n >= E15) {
+        n = (n + 5) / 10;
+        d++;
+    } else if (n < E14) {
+        d--;
+        n = digits15(a, d);
+        if (n >= E15) {
+            n = (n + 5) / 10;
+            d++;
+        }
+    }
+    nd = fmt_i64(n, dg);
+    while (nd > 1 && dg[nd - 1] == '0')
+        nd--;
+    if (neg)
+        *o++ = '-';
+    if (d >= -4 && d < 15) {
+        if (d >= 0) {
+            for (i = 0; i <= d; i++)
+                *o++ = i < nd ? dg[i] : '0';
+            *o++ = '.';
+            if (nd > d + 1)
+                for (i = d + 1; i < nd; i++)
+                    *o++ = dg[i];
+            else
+                *o++ = '0';
+        } else {
+            *o++ = '0';
+            *o++ = '.';
+            for (i = 0; i < -d - 1; i++)
+                *o++ = '0';
+            for (i = 0; i < nd; i++)
+                *o++ = dg[i];
+        }
+    } else {
+        int ad = d < 0 ? -d : d;
+        *o++ = dg[0];
+        if (nd > 1) {
+            *o++ = '.';
+            for (i = 1; i < nd; i++)
+                *o++ = dg[i];
+        }
+        *o++ = 'e';
+        *o++ = d < 0 ? '-' : '+';
+        if (ad < 10)
+            *o++ = '0';
+        o += fmt_i64(ad, o);
+    }
+    *o = 0;
+    return (int)(o - out);
+}
+
+int fs_parse_float(const char *s, size_t n, double *out)
+{
+    size_t i = 0;
+    int neg = 0, ndig = 0, seen = 0;
+    long exp = 0;
+    uint64_t mant = 0;
+    double v;
+    if (!s || !out)
+        return -1;
+    if (i < n && (s[i] == '+' || s[i] == '-'))
+        neg = s[i++] == '-';
+    if (n - i == 3 && memcmp(s + i, "nan", 3) == 0) {
+        *out = NAN;
+        return 0;
+    }
+    if (n - i == 3 && memcmp(s + i, "inf", 3) == 0) {
+        *out = neg ? -INFINITY : INFINITY;
+        return 0;
+    }
+    while (i < n && s[i] >= '0' && s[i] <= '9') {
+        seen++;
+        if (ndig < 18) {
+            mant = mant * 10u + (uint64_t)(s[i] - '0');
+            if (mant)
+                ndig++;
+        } else {
+            exp++;
+        }
+        i++;
+    }
+    if (i < n && s[i] == '.') {
+        i++;
+        while (i < n && s[i] >= '0' && s[i] <= '9') {
+            seen++;
+            if (ndig < 18) {
+                mant = mant * 10u + (uint64_t)(s[i] - '0');
+                if (mant)
+                    ndig++;
+                exp--;
+            }
+            i++;
+        }
+    }
+    if (!seen)
+        return -1;
+    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+        int eneg = 0;
+        long e = 0;
+        i++;
+        if (i < n && (s[i] == '+' || s[i] == '-'))
+            eneg = s[i++] == '-';
+        if (i >= n || s[i] < '0' || s[i] > '9')
+            return -1;
+        while (i < n && s[i] >= '0' && s[i] <= '9') {
+            if (e < 100000)
+                e = e * 10 + (s[i] - '0');
+            i++;
+        }
+        exp += eneg ? -e : e;
+    }
+    if (i != n)
+        return -1;
+    v = (double)mant;
+    if (mant) {
+        if (exp > 0)
+            v = scale_up(v, exp > 400 ? 400 : (int)exp);
+        else if (exp < 0)
+            v = scale_down(v, -exp > 400 ? 400 : (int)-exp);
+    }
+    *out = neg ? -v : v;
+    return 0;
+}
+
+/* values.parse_int: [+-]digits within int32 */
+static int parse_i32(const char *s, size_t n, int32_t *out)
+{
+    size_t i = 0;
+    int neg = 0;
+    int64_t v = 0;
+    if (i < n && (s[i] == '+' || s[i] == '-'))
+        neg = s[i++] == '-';
+    if (i >= n)
+        return -1;
+    for (; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9')
+            return -1;
+        v = v * 10 + (s[i] - '0');
+        if (v > 2147483648LL)
+            return -1;
+    }
+    if (neg)
+        v = -v;
+    if (v > INT32_MAX || v < INT32_MIN)
+        return -1;
+    *out = (int32_t)v;
+    return 0;
+}
+
+#define DAY_MS 86400000LL
+
+static int64_t floor_div(int64_t a, int64_t b)
+{
+    int64_t q = a / b;
+    if ((a % b != 0) && ((a < 0) != (b < 0)))
+        q--;
+    return q;
+}
+
+static int64_t days_from_civil(int64_t y, int64_t m, int64_t d)
+{
+    int64_t era, yoe, doy, doe;
+    y -= m <= 2;
+    era = floor_div(y, 400);
+    yoe = y - era * 400;
+    doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+static void civil_from_days(int64_t z, int64_t *y, int64_t *m, int64_t *d)
+{
+    int64_t era, doe, yoe, doy, mp;
+    z += 719468;
+    era = floor_div(z, 146097);
+    doe = z - era * 146097;
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    mp = (5 * doy + 2) / 153;
+    *d = doy - (153 * mp + 2) / 5 + 1;
+    *m = mp + (mp < 10 ? 3 : -9);
+    *y = yoe + era * 400 + (*m <= 2);
+}
+
+static int days_in_month(int64_t y, int64_t m)
+{
+    if (m == 2)
+        return ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 29 : 28;
+    return (m == 4 || m == 6 || m == 9 || m == 11) ? 30 : 31;
+}
+
+static int make_time(int64_t y, int64_t mo, int64_t d, int64_t h, int64_t mi, int64_t s, int64_t *out)
+{
+    if (!(y >= 1 && y <= 9999 && mo >= 1 && mo <= 12 && d >= 1 && d <= days_in_month(y, mo) &&
+          h >= 0 && h <= 23 && mi >= 0 && mi <= 59 && s >= 0 && s <= 59))
+        return -1;
+    *out = days_from_civil(y, mo, d) * DAY_MS + ((h * 60 + mi) * 60 + s) * 1000;
+    return 0;
+}
+
+/* year, month, day, hour, minute, second, millisecond, weekday (0 = Monday) */
+static void split_time(int64_t ms, int64_t f[8])
+{
+    int64_t days = floor_div(ms, DAY_MS), rem = ms - days * DAY_MS, wd;
+    civil_from_days(days, &f[0], &f[1], &f[2]);
+    f[3] = rem / 3600000;
+    f[4] = rem / 60000 % 60;
+    f[5] = rem / 1000 % 60;
+    f[6] = rem % 1000;
+    wd = (days + 3) % 7;
+    f[7] = wd < 0 ? wd + 7 : wd;
+}
+
+static void put2(char **o, int64_t v)
+{
+    *(*o)++ = (char)('0' + (int)(v / 10 % 10));
+    *(*o)++ = (char)('0' + (int)(v % 10));
+}
+
+/* values.fmt_time; out needs 40 bytes */
+static int fmt_time(int64_t ms, char *out)
+{
+    int64_t f[8], ay;
+    char ys[24], *o = out;
+    int n, i;
+    split_time(ms, f);
+    ay = f[0] < 0 ? -f[0] : f[0];
+    if (f[0] < 0)
+        *o++ = '-';
+    n = fmt_i64(ay, ys);
+    for (i = n; i < 4; i++)
+        *o++ = '0';
+    memcpy(o, ys, (size_t)n);
+    o += n;
+    *o++ = '-';
+    put2(&o, f[1]);
+    *o++ = '-';
+    put2(&o, f[2]);
+    *o++ = 'T';
+    put2(&o, f[3]);
+    *o++ = ':';
+    put2(&o, f[4]);
+    *o++ = ':';
+    put2(&o, f[5]);
+    *o++ = '.';
+    *o++ = (char)('0' + (int)(f[6] / 100));
+    put2(&o, f[6] % 100);
+    *o++ = 'Z';
+    *o = 0;
+    return (int)(o - out);
+}
+
+static int digits_at(const char *s, size_t n, size_t *pos, int k, int64_t *out)
+{
+    int64_t v = 0;
+    int i;
+    if (*pos + (size_t)k > n)
+        return -1;
+    for (i = 0; i < k; i++) {
+        char c = s[*pos + (size_t)i];
+        if (c < '0' || c > '9')
+            return -1;
+        v = v * 10 + (c - '0');
+    }
+    *pos += (size_t)k;
+    *out = v;
+    return 0;
+}
+
+int fs_parse_time(const char *s, size_t n, int64_t *out)
+{
+    size_t pos = 0;
+    int64_t y, mo, d, h = 0, mi = 0, sec = 0, milli = 0, offset = 0, t, oh, om;
+    if (!s || !out)
+        return -1;
+    if (digits_at(s, n, &pos, 4, &y) || pos >= n || s[pos++] != '-' ||
+        digits_at(s, n, &pos, 2, &mo) || pos >= n || s[pos++] != '-' || digits_at(s, n, &pos, 2, &d))
+        return -1;
+    if (pos < n && (s[pos] == 'T' || s[pos] == ' ')) {
+        pos++;
+        if (digits_at(s, n, &pos, 2, &h) || pos >= n || s[pos++] != ':' || digits_at(s, n, &pos, 2, &mi))
+            return -1;
+        if (pos < n && s[pos] == ':') {
+            pos++;
+            if (digits_at(s, n, &pos, 2, &sec))
+                return -1;
+            if (pos < n && s[pos] == '.') {
+                int k = 0;
+                pos++;
+                while (k < 3 && pos < n && s[pos] >= '0' && s[pos] <= '9') {
+                    milli = milli * 10 + (s[pos] - '0');
+                    pos++;
+                    k++;
+                }
+                if (k == 0)
+                    return -1;
+                milli *= k == 1 ? 100 : k == 2 ? 10 : 1;
+            }
+        }
+    }
+    if (pos < n && s[pos] == 'Z') {
+        pos++;
+    } else if (pos < n && (s[pos] == '+' || s[pos] == '-')) {
+        int plus = s[pos++] == '+';
+        if (digits_at(s, n, &pos, 2, &oh) || pos >= n || s[pos++] != ':' || digits_at(s, n, &pos, 2, &om))
+            return -1;
+        if (oh > 23 || om > 59)
+            return -1;
+        offset = (oh * 60 + om) * 60000 * (plus ? 1 : -1);
+    }
+    if (pos != n)
+        return -1;
+    if (make_time(y, mo, d, h, mi, sec, &t))
+        return -1;
+    *out = t + milli - offset;
+    return 0;
+}
+
+/* values.fround: half away from zero, exactly */
+static double fround(double x)
+{
+    double a, t;
+    if (x != x || x == INFINITY || x == -INFINITY)
+        return x;
+    a = fabs(x);
+    t = floor(a);
+    if (a - t >= 0.5)
+        t += 1.0;
+    return copysign(t, x);
+}
+
+/* values.fdiv: IEEE without relying on the compiler for x / 0 */
+static double fdiv(double a, double b)
+{
+    if (b == 0.0) {
+        if (a != a || a == 0.0)
+            return NAN;
+        return copysign(INFINITY, a) * copysign(1.0, b);
+    }
+    return a / b;
+}
+
+/* Text of a string in traces: values.quote */
+static int quote(const char *b, int n, char *out, int size)
+{
+    static const char hex[] = "0123456789abcdef";
+    int len = 0, i;
+#define QPUT(c) do { if (len < size - 1) out[len] = (c); len++; } while (0)
+    QPUT('"');
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)b[i];
+        if (c == '"') { QPUT('\\'); QPUT('"'); }
+        else if (c == '\\') { QPUT('\\'); QPUT('\\'); }
+        else if (c == '\n') { QPUT('\\'); QPUT('n'); }
+        else if (c == '\t') { QPUT('\\'); QPUT('t'); }
+        else if (c >= 0x20 && c < 0x7f) QPUT((char)c);
+        else { QPUT('\\'); QPUT('x'); QPUT(hex[c >> 4]); QPUT(hex[c & 15]); }
+    }
+    QPUT('"');
+#undef QPUT
+    if (size > 0)
+        out[len < size ? len : size - 1] = 0;
+    return len;
 }
 
 /* ---- image validation -------------------------------------------------------- */
@@ -63,6 +556,7 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     fs_emit_fn on_emit;
     fs_fault_fn on_fault;
     fs_timer_fn on_timer;
+    fs_clock_fn clock;
     void *user;
     size_t off, n;
     uint16_t ns, flags;
@@ -74,11 +568,13 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     on_emit = vm->on_emit;
     on_fault = vm->on_fault;
     on_timer = vm->on_timer;
+    clock = vm->clock;
     user = vm->user;
     memset(vm, 0, sizeof(*vm));
     vm->on_emit = on_emit;
     vm->on_fault = on_fault;
     vm->on_timer = on_timer;
+    vm->clock = clock;
     vm->user = user;
     vm->handler = -1;
     vm->state = vm->pending = vm->transition = -1;
@@ -89,7 +585,7 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
         return img ? FS_ERR_MAGIC : FS_ERR_ARG;
     if (memcmp(img, "FSB1", 4) != 0)
         return FS_ERR_MAGIC;
-    if (rd16(img + 4) != 1)
+    if (rd16(img + 4) != 2)
         return FS_ERR_VERSION;
     flags = rd16(img + 6);
     vm->prog_name = rd16(img + 8);
@@ -121,11 +617,11 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
         if (p[n] != 0)
             return FS_ERR_TRUNCATED;   /* missing NUL terminator */
     }
-    if (!(vm->globals_init = take(img, len, &off, (size_t)vm->n_globals * 4)))
+    if (!(vm->globals_init = take(img, len, &off, (size_t)vm->n_globals * 9)))
         return FS_ERR_TRUNCATED;
-    if (!(vm->externs_tab = take(img, len, &off, (size_t)vm->n_externs * 4)))
+    if (!(vm->externs_tab = take(img, len, &off, (size_t)vm->n_externs * 8)))
         return FS_ERR_TRUNCATED;
-    if (!(vm->events_tab = take(img, len, &off, (size_t)vm->n_events * 4)))
+    if (!(vm->events_tab = take(img, len, &off, (size_t)vm->n_events * 6)))
         return FS_ERR_TRUNCATED;
     if (!(vm->states_tab = take(img, len, &off, (size_t)vm->n_states * 2)))
         return FS_ERR_TRUNCATED;
@@ -149,13 +645,23 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
                 return FS_ERR_INDEX;
     }
 
-    for (i = 0; i < vm->n_externs; i++)
-        if (rd16(vm->externs_tab + 4 * i) >= ns)
+    for (i = 0; i < vm->n_globals; i++) {
+        const uint8_t *g = vm->globals_init + 9 * i;
+        if (g[0] > FS_TIME)
             return FS_ERR_INDEX;
+        if (g[0] == FS_STR && rd64(g + 1) >= ns)
+            return FS_ERR_INDEX;
+    }
+    for (i = 0; i < vm->n_externs; i++) {
+        if (rd16(vm->externs_tab + 8 * i) >= ns)
+            return FS_ERR_INDEX;
+        if (vm->externs_tab[8 * i + 2] > 16 || vm->externs_tab[8 * i + 3] > FS_NONE_TYPE)
+            return FS_ERR_LIMIT;
+    }
     for (i = 0; i < vm->n_events; i++) {
-        if (rd16(vm->events_tab + 4 * i) >= ns)
+        if (rd16(vm->events_tab + 6 * i) >= ns)
             return FS_ERR_INDEX;
-        if (vm->events_tab[4 * i + 2] > FS_MAX_EVENT_ARGS)
+        if (vm->events_tab[6 * i + 2] > FS_MAX_EVENT_ARGS)
             return FS_ERR_LIMIT;
     }
     for (i = 0; i < vm->n_states; i++)
@@ -163,6 +669,9 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
             return FS_ERR_INDEX;
     for (i = 0; i < vm->n_timers; i++)
         if (rd16(vm->timers_tab + 2 * i) >= vm->n_events)
+            return FS_ERR_INDEX;
+    for (i = 0; i < vm->n_events; i++)       /* built-in and timer events take no arguments */
+        if (i < 3 && vm->events_tab[6 * i + 2] != 0)
             return FS_ERR_INDEX;
     for (i = 0; i < vm->n_funcs; i++) {
         p = vm->funcs_tab + 6 * i;
@@ -193,8 +702,17 @@ void fs_reset(fs_vm *vm)
     unsigned i;
     if (!vm || !vm->loaded)
         return;
-    for (i = 0; i < vm->n_globals; i++)
-        vm->globals[i] = s32(rd32(vm->globals_init + 4 * i));
+    for (i = 0; i < vm->n_globals; i++) {
+        const uint8_t *g = vm->globals_init + 9 * i;
+        uint64_t u = rd64(g + 1);
+        switch (g[0]) {
+        case FS_INT:   vm->globals[i] = fs_int(s32((uint32_t)u)); break;
+        case FS_FLOAT: vm->globals[i] = fs_float(f64(u)); break;
+        case FS_STR:   vm->globals[i] = v_str((int32_t)u); break;
+        default:       vm->globals[i] = fs_time(s64(u)); break;
+        }
+    }
+    memset(vm->strs, 0, sizeof(vm->strs));
     vm->sp = 0;
     vm->nframes = 0;
     vm->pc = 0;
@@ -250,7 +768,7 @@ static int find_name(const fs_vm *vm, const uint8_t *tab, unsigned stride, unsig
 
 int fs_event_id(const fs_vm *vm, const char *name)
 {
-    return vm ? find_name(vm, vm->events_tab, 4, vm->n_events, name) : -1;
+    return vm ? find_name(vm, vm->events_tab, 6, vm->n_events, name) : -1;
 }
 
 int fs_state_id(const fs_vm *vm, const char *name)
@@ -260,7 +778,7 @@ int fs_state_id(const fs_vm *vm, const char *name)
 
 int fs_extern_id(const fs_vm *vm, const char *name)
 {
-    return vm ? find_name(vm, vm->externs_tab, 4, vm->n_externs, name) : -1;
+    return vm ? find_name(vm, vm->externs_tab, 8, vm->n_externs, name) : -1;
 }
 
 const char *fs_state_name(const fs_vm *vm, int idx)
@@ -274,14 +792,14 @@ const char *fs_event_name(const fs_vm *vm, int idx)
 {
     if (!vm || !vm->loaded || idx < 0 || idx >= vm->n_events)
         return NULL;
-    return fs_string(vm, rd16(vm->events_tab + 4 * idx), NULL);
+    return fs_string(vm, rd16(vm->events_tab + 6 * idx), NULL);
 }
 
 const char *fs_extern_name(const fs_vm *vm, int idx)
 {
     if (!vm || !vm->loaded || idx < 0 || idx >= vm->n_externs)
         return NULL;
-    return fs_string(vm, rd16(vm->externs_tab + 4 * idx), NULL);
+    return fs_string(vm, rd16(vm->externs_tab + 8 * idx), NULL);
 }
 
 const char *fs_program_name(const fs_vm *vm)
@@ -295,14 +813,35 @@ int fs_event_argc(const fs_vm *vm, int idx)
 {
     if (!vm || !vm->loaded || idx < 0 || idx >= vm->n_events)
         return -1;
-    return vm->events_tab[4 * idx + 2];
+    return vm->events_tab[6 * idx + 2];
 }
 
 int fs_extern_argc(const fs_vm *vm, int idx)
 {
     if (!vm || !vm->loaded || idx < 0 || idx >= vm->n_externs)
         return -1;
-    return vm->externs_tab[4 * idx + 2];
+    return vm->externs_tab[8 * idx + 2];
+}
+
+int fs_event_arg_type(const fs_vm *vm, int idx, int arg)
+{
+    if (fs_event_argc(vm, idx) <= arg || arg < 0)
+        return -1;
+    return ptype(rd16(vm->events_tab + 6 * idx + 4), arg);
+}
+
+int fs_extern_arg_type(const fs_vm *vm, int idx, int arg)
+{
+    if (fs_extern_argc(vm, idx) <= arg || arg < 0)
+        return -1;
+    return ptype(rd32(vm->externs_tab + 8 * idx + 4), arg);
+}
+
+int fs_extern_ret(const fs_vm *vm, int idx)
+{
+    if (!vm || !vm->loaded || idx < 0 || idx >= vm->n_externs)
+        return -1;
+    return vm->externs_tab[8 * idx + 3];
 }
 
 int fs_current_extern(const fs_vm *vm) { return vm ? vm->cur_extern : -1; }
@@ -314,17 +853,17 @@ int fs_sp(const fs_vm *vm) { return vm ? vm->sp : 0; }
 int fs_global_count(const fs_vm *vm) { return vm && vm->loaded ? vm->n_globals : 0; }
 int fs_frame_count(const fs_vm *vm) { return vm ? vm->nframes : 0; }
 
-int32_t fs_stack_at(const fs_vm *vm, int i)
+fs_value fs_stack_at(const fs_vm *vm, int i)
 {
     if (!vm || i < 0 || i >= vm->sp || i >= FS_STACK_SIZE)
-        return 0;
+        return fs_int(0);
     return vm->stack[i];
 }
 
-int32_t fs_global(const fs_vm *vm, int i)
+fs_value fs_global(const fs_vm *vm, int i)
 {
     if (!vm || !vm->loaded || i < 0 || i >= vm->n_globals)
-        return 0;
+        return fs_int(0);
     return vm->globals[i];
 }
 
@@ -343,7 +882,7 @@ int fs_bind(fs_vm *vm, const char *name, fs_extern_fn fn)
     if (!vm || !vm->loaded || !name)
         return FS_ERR_ARG;
     for (i = 0; i < vm->n_externs; i++) {
-        if (name_eq(vm, rd16(vm->externs_tab + 4 * i), name)) {
+        if (name_eq(vm, rd16(vm->externs_tab + 8 * i), name)) {
             vm->bound[i] = fn;
             n++;
         }
@@ -387,6 +926,137 @@ static void report_fault(fs_vm *vm, int code, int pc)
         vm->on_fault(vm, code, pc, vm->user);
 }
 
+/* ---- strings --------------------------------------------------------------------------- */
+fs_value fs_empty_str(void) { return v_str(EMPTY_STR); }
+
+static int str_valid(const fs_vm *vm, int32_t ref)
+{
+    if (ref == EMPTY_STR)
+        return 1;
+    if (ref >= 0)
+        return ref < vm->n_strings;
+    return -1 - ref < FS_STR_SLOTS && vm->strs[-1 - ref].used;
+}
+
+const char *fs_str(const fs_vm *vm, fs_value v, uint16_t *len_out)
+{
+    if (!vm || !vm->loaded || v.type != FS_STR || !str_valid(vm, v.as.s))
+        return NULL;
+    if (v.as.s == EMPTY_STR) {
+        if (len_out)
+            *len_out = 0;
+        return "";
+    }
+    if (v.as.s >= 0)
+        return fs_string(vm, v.as.s, len_out);
+    if (len_out)
+        *len_out = vm->strs[-1 - v.as.s].len;
+    return vm->strs[-1 - v.as.s].data;
+}
+
+int fs_strings_in_use(const fs_vm *vm)
+{
+    int i, n = 0;
+    for (i = 0; vm && i < FS_STR_SLOTS; i++)
+        n += vm->strs[i].used;
+    return n;
+}
+
+static void mark(fs_vm *vm, const fs_value *v)
+{
+    if (v->type == FS_STR && v->as.s < 0 && v->as.s != EMPTY_STR && -1 - v->as.s < FS_STR_SLOTS)
+        vm->strs[-1 - v->as.s].mark = 1;
+}
+
+/* Mark and sweep: a slot stays in use while a global, the stack or the queue refers to it. */
+static void collect(fs_vm *vm)
+{
+    int i, j, top = vm->sp < FS_STACK_SIZE ? vm->sp : FS_STACK_SIZE;
+    for (i = 0; i < FS_STR_SLOTS; i++)
+        vm->strs[i].mark = 0;
+    for (i = 0; i < vm->n_globals; i++)
+        mark(vm, &vm->globals[i]);
+    for (i = 0; i < top; i++)
+        mark(vm, &vm->stack[i]);
+    for (i = 0; i < vm->q_count; i++) {
+        const fs_qentry *e = &vm->queue[(vm->q_head + i) % FS_QUEUE_SIZE];
+        for (j = 0; j < FS_MAX_EVENT_ARGS; j++)
+            mark(vm, &e->args[j]);
+    }
+    for (i = 0; i < FS_STR_SLOTS; i++)
+        if (!vm->strs[i].mark)
+            vm->strs[i].used = 0;
+}
+
+/* A new string of n bytes copied from p (may be NULL: filled by the caller).
+ * Returns 0 and the value, or the fault code (12 too long, 11 no slot). */
+static int alloc_str(fs_vm *vm, const char *p, size_t n, fs_value *out)
+{
+    int i, attempt;
+    if (n > FS_STR_LEN)
+        return FS_FAULT_STR_LONG;
+    for (attempt = 0; attempt < 2; attempt++) {
+        for (i = 0; i < FS_STR_SLOTS; i++) {
+            if (!vm->strs[i].used) {
+                fs_strslot *sl = &vm->strs[i];
+                sl->used = 1;
+                sl->len = (uint16_t)n;
+                if (p && n)
+                    memcpy(sl->data, p, n);
+                sl->data[n] = 0;
+                *out = v_str(-1 - i);
+                return 0;
+            }
+        }
+        if (attempt == 0)
+            collect(vm);
+    }
+    return FS_FAULT_NO_STRINGS;
+}
+
+/* A value from the host as type t (vm.py host_value).  Returns 0 or a fault code. */
+static int host_value(fs_vm *vm, fs_value v, int t, fs_value *out)
+{
+    if (t == FS_FLOAT && v.type == FS_INT) {
+        *out = fs_float((double)v.as.i);
+        return 0;
+    }
+    if (t == FS_STR && v.type == FS_CSTR)
+        return alloc_str(vm, v.as.c, strlen(v.as.c), out);
+    if (v.type != t)
+        return FS_FAULT_TYPE;
+    if (t == FS_STR && !str_valid(vm, v.as.s))
+        return FS_FAULT_TYPE;
+    *out = v;
+    return 0;
+}
+
+int fs_format(const fs_vm *vm, fs_value v, char *buf, int size)
+{
+    char tmp[48];
+    int n;
+    if (!buf || size <= 0)
+        return 0;
+    switch (v.type) {
+    case FS_INT:   n = fmt_i64(v.as.i, tmp); break;
+    case FS_FLOAT: n = fmt_float(v.as.f, tmp); break;
+    case FS_TIME:  n = fmt_time(v.as.t, tmp); break;
+    case FS_STR: {
+        uint16_t len = 0;
+        const char *p = fs_str(vm, v, &len);
+        return quote(p ? p : "", p ? len : 0, buf, size);
+    }
+    case FS_CSTR:
+        return quote(v.as.c, (int)strlen(v.as.c), buf, size);
+    default:
+        n = 0;
+        tmp[0] = 0;
+    }
+    memcpy(buf, tmp, (size_t)(n < size ? n + 1 : size));
+    buf[size - 1 < n ? size - 1 : n] = 0;
+    return n;
+}
+
 void fs_start(fs_vm *vm)
 {
     if (!vm || !vm->loaded)
@@ -396,23 +1066,45 @@ void fs_start(fs_vm *vm)
         vm->pending = 0;
 }
 
-int fs_post(fs_vm *vm, int event, const int32_t *args, int argc)
+int fs_post(fs_vm *vm, int event, const fs_value *args, int argc)
 {
     fs_qentry *e;
-    int i, n;
+    int i, n, pc;
+    uint16_t types;
     if (!vm || !vm->loaded || event < 0 || event >= vm->n_events)
         return FS_ERR_ARG;
+    pc = vm->handler >= 0 ? (int)vm->cur_pc : -1;
     if (vm->q_count >= FS_QUEUE_SIZE) {
-        report_fault(vm, FS_FAULT_QUEUE_FULL, vm->handler >= 0 ? (int)vm->cur_pc : -1);
+        report_fault(vm, FS_FAULT_QUEUE_FULL, pc);
         return FS_ERR_FULL;
     }
+    /* the entry is queued first, so the strings already copied are roots */
     e = &vm->queue[(vm->q_head + vm->q_count) % FS_QUEUE_SIZE];
     vm->q_count++;
     e->event = (uint16_t)event;
-    n = vm->events_tab[4 * event + 2];          /* <= FS_MAX_EVENT_ARGS */
+    n = vm->events_tab[6 * event + 2];          /* <= FS_MAX_EVENT_ARGS */
+    types = rd16(vm->events_tab + 6 * event + 4);
     for (i = 0; i < FS_MAX_EVENT_ARGS; i++)
-        e->args[i] = (i < n && args && i < argc) ? args[i] : 0;
+        e->args[i] = fs_int(0);
+    for (i = 0; i < n; i++) {
+        int t = ptype(types, i), err;
+        fs_value v = (args && i < argc) ? args[i] : zero_of(t);
+        err = host_value(vm, v, t, &e->args[i]);
+        if (err) {
+            vm->q_count--;
+            if (err == FS_FAULT_TYPE)
+                return FS_ERR_ARG;
+            report_fault(vm, err, pc);
+            return FS_ERR_MEM;
+        }
+    }
     return FS_OK;
+}
+
+void fs_set_clock(fs_vm *vm, fs_clock_fn fn)
+{
+    if (vm)
+        vm->clock = fn;
 }
 
 #define FS_REM_LIMIT ((int64_t)1 << 62)   /* keeps int64 math free of overflow */
@@ -438,7 +1130,7 @@ const char *fs_timer_name(const fs_vm *vm, int timer)
 {
     if (!vm || !vm->loaded || timer < 0 || timer >= vm->n_timers)
         return NULL;
-    return fs_string(vm, rd16(vm->events_tab + 4 * rd16(vm->timers_tab + 2 * timer)), NULL);
+    return fs_string(vm, rd16(vm->events_tab + 6 * rd16(vm->timers_tab + 2 * timer)), NULL);
 }
 
 int fs_timer_expired(fs_vm *vm, int timer)
@@ -507,13 +1199,13 @@ static int handler_state(const fs_vm *vm, int h)
     return st == FS_NONE16 ? -1 : st;
 }
 
-static void begin(fs_vm *vm, int h, const int32_t *args)
+static void begin(fs_vm *vm, int h, const fs_value *args)
 {
     const uint8_t *p = vm->handlers_tab + 8 * h;
     int argc = p[4], nlocals = p[5], n, i;
     n = argc > nlocals ? argc : nlocals;
     for (i = 0; i < n && i < FS_STACK_SIZE; i++)
-        vm->stack[i] = (args && i < argc && i < FS_MAX_EVENT_ARGS) ? args[i] : 0;
+        vm->stack[i] = (args && i < argc && i < FS_MAX_EVENT_ARGS) ? args[i] : fs_int(0);
     vm->sp = n;       /* may exceed FS_STACK_SIZE: see fs_vm.sp */
     vm->handler = h;
     vm->frames[0].ret_pc = -1;
@@ -583,30 +1275,294 @@ static void finish(fs_vm *vm)
 }
 
 /* ---- execution --------------------------------------------------------------------------- */
-/* Stack slot access; slots >= FS_STACK_SIZE are virtual zeros (see fs_vm.sp). */
-#define SLOT(i) ((i) < FS_STACK_SIZE ? vm->stack[(i)] : 0)
+/* Stack slot access; slots >= FS_STACK_SIZE are virtual int zeros (see fs_vm.sp). */
+#define SLOT(i) ((i) < FS_STACK_SIZE ? vm->stack[(i)] : fs_int(0))
 
 #define FAULT(c) do { fault = (c); goto faulted; } while (0)
 #define POP(v) do { if (vm->sp <= 0) FAULT(FS_FAULT_STACK_UNDERFLOW); \
                     vm->sp--; (v) = SLOT(vm->sp); } while (0)
-#define PUSH(v) do { int32_t pv_ = (v); if (vm->sp >= FS_STACK_SIZE) FAULT(FS_FAULT_STACK_OVERFLOW); \
+#define PUSH(v) do { fs_value pv_ = (v); if (vm->sp >= FS_STACK_SIZE) FAULT(FS_FAULT_STACK_OVERFLOW); \
                      vm->stack[vm->sp++] = pv_; } while (0)
+#define POPINT(v) do { fs_value pi_; POP(pi_); if (pi_.type != FS_INT) FAULT(FS_FAULT_TYPE); (v) = pi_.as.i; } while (0)
 
-/* Pop the top n values (caller checked sp >= n) and return a contiguous view
- * of them.  Values in virtual slots (see fs_vm.sp) are gathered into tmp
- * (FS_MAX_EVENT_ARGS entries); returns NULL if they do not fit there, which
- * is only possible for hand-crafted bytecode. */
-static const int32_t *pop_args(fs_vm *vm, int n, int32_t *tmp)
+#define MAX_CALL_ARGS 16
+
+/* The top n values (caller checked sp >= n) as a contiguous view, left on the
+ * stack.  Values in virtual slots (see fs_vm.sp) are gathered into tmp
+ * (MAX_CALL_ARGS entries); returns NULL if they do not fit there, which is
+ * only possible for hand-crafted bytecode. */
+static const fs_value *arg_view(fs_vm *vm, int n, fs_value *tmp)
 {
     int base = vm->sp - n, i;
-    vm->sp = base;
     if (base + n <= FS_STACK_SIZE)
         return &vm->stack[base];
-    if (n > FS_MAX_EVENT_ARGS)
+    if (n > MAX_CALL_ARGS)
         return NULL;
     for (i = 0; i < n; i++)
         tmp[i] = SLOT(base + i);
     return tmp;
+}
+
+static int check_types(const fs_value *args, int n, uint32_t types)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (args[i].type != ptype(types, i))
+            return FS_FAULT_TYPE;
+    return 0;
+}
+
+static const char *sbytes(const fs_vm *vm, fs_value v, int *len)
+{
+    uint16_t n = 0;
+    const char *p = fs_str(vm, v, &n);
+    *len = n;
+    return p ? p : "";
+}
+
+/* values.binary for opcode op on a and b (still on the stack). */
+static int binop(fs_vm *vm, uint8_t op, fs_value a, fs_value b, fs_value *r)
+{
+    int cmp = op >= OP_EQ && op <= OP_GE;
+    if (op == OP_CONCAT && !(a.type == FS_STR && b.type == FS_STR))
+        return FS_FAULT_TYPE;            /* strings are joined by CONCAT, numbers by ADD */
+    if (a.type == FS_INT && b.type == FS_INT) {
+        int32_t x = a.as.i, y = b.as.i, v;
+        uint32_t ux = (uint32_t)x, uy = (uint32_t)y;
+        switch (op) {
+        case OP_ADD: v = s32(ux + uy); break;
+        case OP_SUB: v = s32(ux - uy); break;
+        case OP_MUL: v = s32(ux * uy); break;
+        case OP_DIV:
+            if (y == 0)
+                return FS_FAULT_DIV_ZERO;
+            v = (x == INT32_MIN && y == -1) ? INT32_MIN : x / y;
+            break;
+        case OP_MOD:
+            if (y == 0)
+                return FS_FAULT_DIV_ZERO;
+            v = (y == -1) ? 0 : x % y;
+            break;
+        case OP_BAND: v = s32(ux & uy); break;
+        case OP_BOR:  v = s32(ux | uy); break;
+        case OP_BXOR: v = s32(ux ^ uy); break;
+        case OP_SHL:  v = s32(ux << (uy & 31u)); break;
+        case OP_SHR: {
+            unsigned n = uy & 31u;
+            /* arithmetic shift without relying on implementation-defined >> */
+            v = x >= 0 ? (int32_t)((uint32_t)x >> n) : -(int32_t)((uint32_t)(-(x + 1)) >> n) - 1;
+            break;
+        }
+        case OP_EQ: v = x == y; break;
+        case OP_NE: v = x != y; break;
+        case OP_LT: v = x < y; break;
+        case OP_LE: v = x <= y; break;
+        case OP_GT: v = x > y; break;
+        default:    v = x >= y; break;
+        }
+        *r = fs_int(v);
+        return 0;
+    }
+    if (a.type == FS_FLOAT && b.type == FS_FLOAT) {
+        double x = a.as.f, y = b.as.f;
+        switch (op) {
+        case OP_ADD: *r = fs_float(x + y); return 0;
+        case OP_SUB: *r = fs_float(x - y); return 0;
+        case OP_MUL: *r = fs_float(x * y); return 0;
+        case OP_DIV: *r = fs_float(fdiv(x, y)); return 0;
+        case OP_MOD: *r = fs_float(fmod(x, y)); return 0;
+        case OP_EQ: *r = fs_int(x == y); return 0;
+        case OP_NE: *r = fs_int(x != y); return 0;
+        case OP_LT: *r = fs_int(x < y); return 0;
+        case OP_LE: *r = fs_int(x <= y); return 0;
+        case OP_GT: *r = fs_int(x > y); return 0;
+        case OP_GE: *r = fs_int(x >= y); return 0;
+        default: return FS_FAULT_TYPE;
+        }
+    }
+    if (a.type == FS_STR && b.type == FS_STR && (op == OP_CONCAT || cmp)) {
+        int la, lb, c, err;
+        const char *pa = sbytes(vm, a, &la), *pb = sbytes(vm, b, &lb);
+        if (op == OP_CONCAT) {
+            fs_value s;
+            if (la + lb > FS_STR_LEN)
+                return FS_FAULT_STR_LONG;
+            if ((err = alloc_str(vm, NULL, (size_t)(la + lb), &s)) != 0)
+                return err;
+            /* pa/pb stay valid: a and b are on the stack, slots never move */
+            memcpy(vm->strs[-1 - s.as.s].data, pa, (size_t)la);
+            memcpy(vm->strs[-1 - s.as.s].data + la, pb, (size_t)lb);
+            *r = s;
+            return 0;
+        }
+        c = memcmp(pa, pb, (size_t)(la < lb ? la : lb));
+        if (c == 0)
+            c = la - lb;
+        switch (op) {
+        case OP_EQ: *r = fs_int(c == 0); break;
+        case OP_NE: *r = fs_int(c != 0); break;
+        case OP_LT: *r = fs_int(c < 0); break;
+        case OP_LE: *r = fs_int(c <= 0); break;
+        case OP_GT: *r = fs_int(c > 0); break;
+        default:    *r = fs_int(c >= 0); break;
+        }
+        return 0;
+    }
+    if (a.type == FS_TIME && b.type == FS_INT && (op == OP_ADD || op == OP_SUB)) {
+        uint64_t t = (uint64_t)a.as.t, d = (uint64_t)(int64_t)b.as.i;
+        *r = fs_time(s64(op == OP_ADD ? t + d : t - d));
+        return 0;
+    }
+    if (a.type == FS_INT && b.type == FS_TIME && op == OP_ADD) {
+        *r = fs_time(s64((uint64_t)b.as.t + (uint64_t)(int64_t)a.as.i));
+        return 0;
+    }
+    if (a.type == FS_TIME && b.type == FS_TIME && (op == OP_SUB || cmp)) {
+        int64_t x = a.as.t, y = b.as.t;
+        if (op == OP_SUB) {
+            int64_t d = s64((uint64_t)x - (uint64_t)y);
+            *r = fs_int(d > INT32_MAX ? INT32_MAX : d < INT32_MIN ? INT32_MIN : (int32_t)d);
+            return 0;
+        }
+        switch (op) {
+        case OP_EQ: *r = fs_int(x == y); break;
+        case OP_NE: *r = fs_int(x != y); break;
+        case OP_LT: *r = fs_int(x < y); break;
+        case OP_LE: *r = fs_int(x <= y); break;
+        case OP_GT: *r = fs_int(x > y); break;
+        default:    *r = fs_int(x >= y); break;
+        }
+        return 0;
+    }
+    return FS_FAULT_TYPE;
+}
+
+/* values.BUILTINS: parameter types by id (I int, F float, S str, T time) */
+static const char *const BUILTIN_PARAMS[] = {
+    "I", "S", "T", "F", "S", "I", "F", "T", "S", "III", "IIIIII", "", "T",
+    "T", "T", "T", "T", "T", "T", "T", "T", "S", "SII", "SS", "I", "F",
+    "II", "II", "FF", "FF", "F", "F", "F", "F", "F", "F", "FF"
+};
+#define N_BUILTINS ((unsigned)(sizeof(BUILTIN_PARAMS) / sizeof(BUILTIN_PARAMS[0])))
+
+static uint32_t builtin_types(unsigned id, int *argc)
+{
+    const char *p = BUILTIN_PARAMS[id];
+    uint32_t t = 0;
+    int i;
+    for (i = 0; p[i]; i++)
+        t |= (uint32_t)(p[i] == 'I' ? FS_INT : p[i] == 'F' ? FS_FLOAT : p[i] == 'S' ? FS_STR : FS_TIME) << (2 * i);
+    *argc = i;
+    return t;
+}
+
+static int new_text(fs_vm *vm, const char *p, int n, fs_value *r)
+{
+    return alloc_str(vm, p, (size_t)n, r);
+}
+
+/* values.call_builtin; a = arguments (still on the stack). */
+static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
+{
+    char tmp[48];
+    int n;
+    switch (id) {
+    case 0: *r = fs_float((double)a[0].as.i); return 0;
+    case 1: {
+        double f;
+        const char *p = sbytes(vm, a[0], &n);
+        if (fs_parse_float(p, (size_t)n, &f))
+            return FS_FAULT_VALUE;
+        *r = fs_float(f);
+        return 0;
+    }
+    case 2: *r = fs_float((double)a[0].as.t / 1000.0); return 0;
+    case 3: {
+        double x = a[0].as.f;
+        if (x != x || x >= 2147483648.0 || x <= -2147483649.0)
+            return FS_FAULT_VALUE;
+        *r = fs_int((int32_t)x);
+        return 0;
+    }
+    case 4: {
+        int32_t v;
+        const char *p = sbytes(vm, a[0], &n);
+        if (parse_i32(p, (size_t)n, &v))
+            return FS_FAULT_VALUE;
+        *r = fs_int(v);
+        return 0;
+    }
+    case 5: n = fmt_i64(a[0].as.i, tmp); return new_text(vm, tmp, n, r);
+    case 6: n = fmt_float(a[0].as.f, tmp); return new_text(vm, tmp, n, r);
+    case 7: n = fmt_time(a[0].as.t, tmp); return new_text(vm, tmp, n, r);
+    case 8: {
+        int64_t t;
+        const char *p = sbytes(vm, a[0], &n);
+        if (fs_parse_time(p, (size_t)n, &t))
+            return FS_FAULT_VALUE;
+        *r = fs_time(t);
+        return 0;
+    }
+    case 9: case 10: {
+        int64_t t;
+        if (make_time(a[0].as.i, a[1].as.i, a[2].as.i, id == 10 ? a[3].as.i : 0,
+                      id == 10 ? a[4].as.i : 0, id == 10 ? a[5].as.i : 0, &t))
+            return FS_FAULT_VALUE;
+        *r = fs_time(t);
+        return 0;
+    }
+    case 11: *r = fs_time(vm->clock ? vm->clock(vm, vm->user) : 0); return 0;
+    case 12: *r = fs_time(floor_div(a[0].as.t, DAY_MS) * DAY_MS); return 0;
+    case 13: case 14: case 15: case 16: case 17: case 18: case 19: case 20: {
+        int64_t f[8];
+        split_time(a[0].as.t, f);
+        *r = fs_int(s32((uint32_t)(uint64_t)f[id - 13]));
+        return 0;
+    }
+    case 21: sbytes(vm, a[0], &n); *r = fs_int(n); return 0;
+    case 22: {
+        int32_t start = a[1].as.i, count = a[2].as.i, end;
+        const char *p = sbytes(vm, a[0], &n);
+        int err;
+        if (start < 0)
+            start = 0;
+        if (start > n)
+            start = n;
+        if (count < 0)
+            count = 0;
+        end = count < n - start ? start + count : n;
+        if ((err = alloc_str(vm, NULL, (size_t)(end - start), r)) != 0)
+            return err;
+        memcpy(vm->strs[-1 - r->as.s].data, p + start, (size_t)(end - start));
+        return 0;
+    }
+    case 23: {
+        int lb, i, found = -1;
+        const char *p = sbytes(vm, a[0], &n), *q = sbytes(vm, a[1], &lb);
+        for (i = 0; i + lb <= n; i++) {
+            if (memcmp(p + i, q, (size_t)lb) == 0) {
+                found = i;
+                break;
+            }
+        }
+        *r = fs_int(found);
+        return 0;
+    }
+    case 24: *r = fs_int(s32(a[0].as.i < 0 ? 0u - (uint32_t)a[0].as.i : (uint32_t)a[0].as.i)); return 0;
+    case 25: *r = fs_float(fabs(a[0].as.f)); return 0;
+    case 26: *r = fs_int(a[1].as.i < a[0].as.i ? a[1].as.i : a[0].as.i); return 0;
+    case 27: *r = fs_int(a[1].as.i > a[0].as.i ? a[1].as.i : a[0].as.i); return 0;
+    case 28: *r = fs_float(a[1].as.f < a[0].as.f ? a[1].as.f : a[0].as.f); return 0;
+    case 29: *r = fs_float(a[1].as.f > a[0].as.f ? a[1].as.f : a[0].as.f); return 0;
+    case 30: *r = fs_float(floor(a[0].as.f)); return 0;
+    case 31: *r = fs_float(ceil(a[0].as.f)); return 0;
+    case 32: *r = fs_float(fround(a[0].as.f)); return 0;
+    case 33: *r = fs_float(sqrt(a[0].as.f)); return 0;
+    case 34: *r = fs_float(exp(a[0].as.f)); return 0;
+    case 35: *r = fs_float(log(a[0].as.f)); return 0;
+    case 36: *r = fs_float(pow(a[0].as.f, a[1].as.f)); return 0;
+    default: return FS_FAULT_BAD_OPCODE;
+    }
 }
 
 static int execute(fs_vm *vm)
@@ -615,8 +1571,9 @@ static int execute(fs_vm *vm)
     uint32_t csize = vm->code_size;
     int32_t pc = vm->pc, npc;
     unsigned arg = 0;
-    int32_t a, b, v;
-    int fault;
+    fs_value v, r;
+    int32_t iv;
+    int fault, err;
     uint8_t op;
 
     vm->cur_pc = pc;
@@ -633,10 +1590,10 @@ static int execute(fs_vm *vm)
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_NEG:
     case OP_BAND: case OP_BOR: case OP_BXOR: case OP_BNOT: case OP_SHL: case OP_SHR:
     case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE:
-    case OP_NOT: case OP_BOOL: case OP_RET: case OP_RET0:
+    case OP_NOT: case OP_BOOL: case OP_RET: case OP_RET0: case OP_CONCAT:
         npc = pc + 1;
         break;
-    case OP_PUSH8: case OP_LOADL: case OP_STOREL:
+    case OP_PUSH8: case OP_LOADL: case OP_STOREL: case OP_BUILTIN:
         if ((uint32_t)pc + 2 > csize)
             FAULT(FS_FAULT_BAD_OPCODE);
         arg = code[pc + 1];
@@ -647,6 +1604,12 @@ static int execute(fs_vm *vm)
             FAULT(FS_FAULT_BAD_OPCODE);
         arg = 0;
         npc = pc + 5;
+        break;
+    case OP_PUSHF: case OP_PUSHT:
+        if ((uint32_t)pc + 9 > csize)
+            FAULT(FS_FAULT_BAD_OPCODE);
+        arg = 0;
+        npc = pc + 9;
         break;
     case OP_PUSHS: case OP_LOADG: case OP_STOREG: case OP_JMP: case OP_JZ: case OP_JNZ:
     case OP_CALL: case OP_XCALL: case OP_GOTO: case OP_EMIT:
@@ -665,13 +1628,21 @@ static int execute(fs_vm *vm)
     case OP_NOP:
         break;
     case OP_PUSH:
-        PUSH(s32(rd32(code + pc + 1)));
+        PUSH(fs_int(s32(rd32(code + pc + 1))));
         break;
     case OP_PUSH8:
-        PUSH(arg < 0x80 ? (int32_t)arg : (int32_t)arg - 256);
+        PUSH(fs_int(arg < 0x80 ? (int32_t)arg : (int32_t)arg - 256));
+        break;
+    case OP_PUSHF:
+        PUSH(fs_float(f64(rd64(code + pc + 1))));
+        break;
+    case OP_PUSHT:
+        PUSH(fs_time(s64(rd64(code + pc + 1))));
         break;
     case OP_PUSHS:
-        PUSH((int32_t)arg);
+        if (arg >= vm->n_strings)
+            FAULT(FS_FAULT_BAD_OPCODE);
+        PUSH(v_str((int32_t)arg));
         break;
     case OP_POP:
         POP(v);
@@ -712,73 +1683,47 @@ static int execute(fs_vm *vm)
     }
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
     case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR:
-    case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
-        uint32_t ua, ub;
-        POP(b);
-        POP(a);
-        ua = (uint32_t)a;
-        ub = (uint32_t)b;
-        switch (op) {
-        case OP_ADD: v = s32(ua + ub); break;
-        case OP_SUB: v = s32(ua - ub); break;
-        case OP_MUL: v = s32(ua * ub); break;
-        case OP_DIV:
-            if (b == 0)
-                FAULT(FS_FAULT_DIV_ZERO);
-            v = (a == INT32_MIN && b == -1) ? INT32_MIN : a / b;
-            break;
-        case OP_MOD:
-            if (b == 0)
-                FAULT(FS_FAULT_DIV_ZERO);
-            v = (b == -1) ? 0 : a % b;
-            break;
-        case OP_BAND: v = s32(ua & ub); break;
-        case OP_BOR:  v = s32(ua | ub); break;
-        case OP_BXOR: v = s32(ua ^ ub); break;
-        case OP_SHL:  v = s32(ua << (ub & 31u)); break;
-        case OP_SHR: {
-            unsigned n = ub & 31u;
-            /* arithmetic shift without relying on implementation-defined >> */
-            v = a >= 0 ? (int32_t)((uint32_t)a >> n) : -(int32_t)((uint32_t)(-(a + 1)) >> n) - 1;
-            break;
-        }
-        case OP_EQ: v = a == b; break;
-        case OP_NE: v = a != b; break;
-        case OP_LT: v = a < b; break;
-        case OP_LE: v = a <= b; break;
-        case OP_GT: v = a > b; break;
-        default:    v = a >= b; break;
-        }
-        PUSH(v);
+    case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE: case OP_CONCAT:
+        if (vm->sp < 2)
+            FAULT(FS_FAULT_STACK_UNDERFLOW);
+        /* the operands stay on the stack (string roots) until the result exists */
+        if ((err = binop(vm, op, SLOT(vm->sp - 2), SLOT(vm->sp - 1), &r)) != 0)
+            FAULT(err);
+        vm->sp -= 2;
+        PUSH(r);
         break;
-    }
     case OP_NEG:
-        POP(a);
-        PUSH(s32(0u - (uint32_t)a));
+        POP(v);
+        if (v.type == FS_INT)
+            PUSH(fs_int(s32(0u - (uint32_t)v.as.i)));
+        else if (v.type == FS_FLOAT)
+            PUSH(fs_float(-v.as.f));
+        else
+            FAULT(FS_FAULT_TYPE);
         break;
     case OP_BNOT:
-        POP(a);
-        PUSH(s32(~(uint32_t)a));
+        POPINT(iv);
+        PUSH(fs_int(s32(~(uint32_t)iv)));
         break;
     case OP_NOT:
-        POP(a);
-        PUSH(a == 0);
+        POPINT(iv);
+        PUSH(fs_int(iv == 0));
         break;
     case OP_BOOL:
-        POP(a);
-        PUSH(a != 0);
+        POPINT(iv);
+        PUSH(fs_int(iv != 0));
         break;
     case OP_JMP:
         vm->pc = (int32_t)arg;   /* an out-of-range target faults on the next step */
         break;
     case OP_JZ:
-        POP(v);
-        if (v == 0)
+        POPINT(iv);
+        if (iv == 0)
             vm->pc = (int32_t)arg;
         break;
     case OP_JNZ:
-        POP(v);
-        if (v != 0)
+        POPINT(iv);
+        if (iv != 0)
             vm->pc = (int32_t)arg;
         break;
     case OP_CALL: {
@@ -795,7 +1740,7 @@ static int execute(fs_vm *vm)
         if (base < 0)
             FAULT(FS_FAULT_STACK_UNDERFLOW);
         for (i = 0; i < nlocals - fargc; i++)
-            PUSH(0);
+            PUSH(fs_int(0));
         vm->frames[vm->nframes].ret_pc = npc;
         vm->frames[vm->nframes].base = base;
         vm->nframes++;
@@ -805,7 +1750,7 @@ static int execute(fs_vm *vm)
     case OP_RET:
     case OP_RET0: {
         const fs_frame *fr;
-        v = 0;
+        v = fs_int(0);
         if (op == OP_RET)
             POP(v);
         fr = &vm->frames[--vm->nframes];
@@ -820,25 +1765,56 @@ static int execute(fs_vm *vm)
         break;
     }
     case OP_XCALL: {
-        int32_t tmp[FS_MAX_EVENT_ARGS];
-        const int32_t *args;
-        int xargc;
+        fs_value tmp[MAX_CALL_ARGS];
+        const fs_value *args;
+        const uint8_t *x;
+        int xargc, ret;
         fs_extern_fn fn;
         if (arg >= vm->n_externs)
             FAULT(FS_FAULT_BAD_OPCODE);
-        xargc = vm->externs_tab[4 * arg + 2];
+        x = vm->externs_tab + 8 * arg;
+        xargc = x[2];
+        ret = x[3];
         if (vm->sp < xargc)
             FAULT(FS_FAULT_STACK_UNDERFLOW);
-        args = pop_args(vm, xargc, tmp);
+        args = arg_view(vm, xargc, tmp);
         if (!args)                   /* only reachable with virtual slots */
             FAULT(FS_FAULT_STACK_OVERFLOW);
+        if ((err = check_types(args, xargc, rd32(x + 4))) != 0)
+            FAULT(err);
         fn = vm->bound[arg];
         if (!fn)
             FAULT(FS_FAULT_UNBOUND);
         vm->cur_extern = (int)arg;
-        v = fn(vm, args, xargc, vm->user);
+        v = fn(vm, args, xargc, vm->user);   /* the arguments stay on the stack meanwhile */
         vm->cur_extern = -1;
-        PUSH(v);
+        if (ret == FS_NONE_TYPE)
+            r = fs_int(0);
+        else if ((err = host_value(vm, v, ret, &r)) != 0)
+            FAULT(err);
+        vm->sp -= xargc;
+        PUSH(r);
+        break;
+    }
+    case OP_BUILTIN: {
+        fs_value tmp[MAX_CALL_ARGS];
+        const fs_value *args;
+        int bargc;
+        uint32_t types;
+        if (arg >= N_BUILTINS)
+            FAULT(FS_FAULT_BAD_OPCODE);
+        types = builtin_types(arg, &bargc);
+        if (vm->sp < bargc)
+            FAULT(FS_FAULT_STACK_UNDERFLOW);
+        args = arg_view(vm, bargc, tmp);
+        if (!args)
+            FAULT(FS_FAULT_STACK_OVERFLOW);
+        if ((err = check_types(args, bargc, types)) != 0)
+            FAULT(err);
+        if ((err = builtin(vm, arg, args, &r)) != 0)
+            FAULT(err);
+        vm->sp -= bargc;
+        PUSH(r);
         break;
     }
     case OP_GOTO:
@@ -849,21 +1825,26 @@ static int execute(fs_vm *vm)
         finish(vm);
         return FS_DONE;
     case OP_EMIT: {
-        int32_t tmp[FS_MAX_EVENT_ARGS], copy[FS_MAX_EVENT_ARGS];
-        const int32_t *args;
+        fs_value tmp[MAX_CALL_ARGS], copy[FS_MAX_EVENT_ARGS];
+        const fs_value *args;
         int eargc, i;
         if (arg >= vm->n_events)
             FAULT(FS_FAULT_BAD_OPCODE);
-        eargc = vm->events_tab[4 * arg + 2];      /* <= FS_MAX_EVENT_ARGS */
+        eargc = vm->events_tab[6 * arg + 2];      /* <= FS_MAX_EVENT_ARGS */
         if (vm->sp < eargc)
             FAULT(FS_FAULT_STACK_UNDERFLOW);
-        args = pop_args(vm, eargc, tmp);
+        args = arg_view(vm, eargc, tmp);
+        if (!args)
+            FAULT(FS_FAULT_STACK_OVERFLOW);
+        if ((err = check_types(args, eargc, rd16(vm->events_tab + 6 * arg + 4))) != 0)
+            FAULT(err);
         for (i = 0; i < eargc; i++)
             copy[i] = args[i];    /* the callback may not see stack slots change */
         if (vm->on_emit)
             vm->on_emit(vm, (int)arg, copy, eargc, vm->user);
         /* queue-full is reported but does not abort the handler (as vm.py) */
         fs_post(vm, (int)arg, copy, eargc);
+        vm->sp -= eargc;
         break;
     }
     case OP_TSTART:
@@ -871,15 +1852,15 @@ static int execute(fs_vm *vm)
         fs_timer *t;
         if (arg >= vm->n_timers)
             FAULT(FS_FAULT_BAD_OPCODE);
-        POP(v);
+        POPINT(iv);
         t = &vm->timers[arg];
         t->active = 1;
         t->periodic = op == OP_TEVERY;
-        t->period = v;
-        t->remaining = v;
+        t->period = iv;
+        t->remaining = iv;
         t->owner = (int16_t)handler_state(vm, vm->handler);
         if (vm->on_timer)
-            vm->on_timer(vm, (int)arg, 1, v, t->periodic, vm->user);
+            vm->on_timer(vm, (int)arg, 1, iv, t->periodic, vm->user);
         break;
     }
     case OP_TSTOP:

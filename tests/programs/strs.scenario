@@ -1,0 +1,18 @@
+extern name "fs"
+post add "hello"
+post add " world"
+post add "\t\"q\"\n\x01"
+post fill 3
+post fill 20
+post add "0123456789012345678901234567890123456789012345678901234567890"
+post convert "123"
+post convert "-2147483648"
+post convert "2147483648"
+post convert "12x"
+post convert 1.5
+post add "spaces inside quotes # not a comment"   # a comment
+extern name "a much longer name that is still fine"
+post fill 1
+post hoard 100
+post add "!"
+post hoard 1

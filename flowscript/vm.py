@@ -6,13 +6,17 @@ Behaviour is normative: the C VM (c/flowscript.c) must produce identical traces.
 import struct
 
 from .bytecode import Program, BY_CODE, OPERAND_SIZE, EV_BOOT, EV_ENTER, EV_EXIT, FAULTS
-from .intops import wrap, div, mod, shl, shr, DivZero
+from .intops import wrap, DivZero
+from . import values as V
+from .values import INT, FLOAT, STR, TIME, NONE_TYPE, Str, Time
 
 STACK_SIZE = 64
 MAX_FRAMES = 16
 QUEUE_SIZE = 16
 BUDGET = 10000
 MAX_CHAIN = 256          # dispatches in a row without the VM becoming idle
+STR_SLOTS = V.STR_SLOTS  # run-time strings alive at once
+STR_LEN = V.STR_LEN      # bytes per run-time string
 
 # step() results
 IDLE = "idle"            # nothing to do
@@ -30,7 +34,10 @@ class Fault(Exception):
 
 class VM:
     """
-    externs:  dict name -> callable(vm, args:list[int]) -> int
+    externs:  dict name -> callable(vm, args) -> value. Values are int, float, values.Str
+              (.b bytes, .text) and values.Time (.ms); a str extern may also return a
+              Python str/bytes. An extern declared without a return type may return anything.
+    clock:    callable(vm) -> int ms since 1970 (UTC) for now(); default: always 0
     on_emit:  callable(vm, event_name, args) or None
     on_fault: callable(vm, code, pc) or None
     on_timer: callable(vm, timer, start, ms, periodic) or None. When set the host runs the
@@ -40,7 +47,7 @@ class VM:
 
     def __init__(self, prog, externs=None, on_emit=None, on_fault=None, on_timer=None,
                  stack_size=STACK_SIZE, max_frames=MAX_FRAMES, queue_size=QUEUE_SIZE, budget=BUDGET,
-                 max_chain=MAX_CHAIN):
+                 max_chain=MAX_CHAIN, str_slots=STR_SLOTS, str_len=STR_LEN, clock=None):
         if isinstance(prog, (bytes, bytearray)):
             prog = Program.from_bytes(prog)
         self.prog = prog
@@ -54,9 +61,12 @@ class VM:
         self.queue_size = queue_size
         self.budget = budget
         self.max_chain = max_chain
+        self.str_slots = str_slots
+        self.str_len = str_len
+        self.clock = clock
         self.bound = []
-        for name, _argc in prog.externs:
-            self.bound.append(self.externs.get(name))
+        for ext in prog.externs:
+            self.bound.append(self.externs.get(ext[0]))
         self.reset()
 
     def unbound_externs(self):
@@ -67,6 +77,7 @@ class VM:
             if t[0] and self.on_timer:
                 self.on_timer(self, i, 0, 0, 0)
         self.globals = list(self.prog.globals)
+        self.pool = [None] * self.str_slots   # run-time strings: slot -> bytes, None = free
         self.stack = []
         self.frames = []          # [return_pc, base]
         self.pc = 0
@@ -93,19 +104,87 @@ class VM:
         return self
 
     def post(self, event, *args):
+        """Queue an event. Arguments are converted to the event's parameter types (an int
+        is accepted for a float, a Python str/bytes for a str). Returns False if the queue
+        or the string memory is full (a fault is reported). Raises TypeError for a wrong type."""
         if isinstance(event, str):
             idx = self.prog.event_index(event)
             if idx < 0:
                 raise KeyError("unknown event %r" % event)
             event = idx
+        pc = self.cur_pc if self.handler is not None else -1
         if len(self.queue) >= self.queue_size:
-            self.report_fault(7, self.cur_pc if self.handler is not None else -1)
+            self.report_fault(7, pc)
             return False
-        argc = self.prog.events[event][1]
-        a = [wrap(int(x)) for x in args[:argc]]
-        a += [0] * (argc - len(a))
-        self.queue.append((event, a))
+        _name, argc, ptypes = self.prog.events[event]
+        entry = (event, [0] * argc)
+        self.queue.append(entry)              # a root while its strings are allocated
+        try:
+            for i in range(argc):
+                v = args[i] if i < len(args) else V.zero(ptypes[i])
+                entry[1][i] = self.host_value(v, ptypes[i])
+        except V.ValueFault as f:
+            self.queue.remove(entry)
+            if f.code == V.TYPE_MISMATCH:
+                raise TypeError("event %s: argument has the wrong type" % _name)
+            self.report_fault(f.code, pc)
+            return False
         return True
+
+    def host_value(self, v, t):
+        """A value from the host as type t (allocates a str). Raises ValueFault."""
+        if t == FLOAT and V.type_of(v) == INT and not isinstance(v, bool):
+            return float(v)
+        if t == STR and isinstance(v, (str, bytes)):
+            return self.alloc(v.encode("utf-8") if isinstance(v, str) else v)
+        if t == INT and isinstance(v, bool):
+            return int(v)
+        try:
+            vt = V.type_of(v)
+        except TypeError:
+            raise V.ValueFault(V.TYPE_MISMATCH)
+        if vt != t:
+            raise V.ValueFault(V.TYPE_MISMATCH)
+        if vt == INT:
+            return wrap(v)
+        if vt == STR and v.slot is not None and self.pool[v.slot] is None:
+            raise V.ValueFault(V.TYPE_MISMATCH)       # a stale run-time string
+        return v
+
+    def set_global(self, index, value):
+        """Debugger/host: set a global (converted to its current type)."""
+        self.globals[index] = self.host_value(value, V.type_of(self.globals[index]))
+
+    # -- strings -------------------------------------------------------------------------
+    def alloc(self, b):
+        """A new run-time string. Raises ValueFault 12 (too long) or 11 (no free slot)."""
+        if len(b) > self.str_len:
+            raise V.ValueFault(V.STRING_TOO_LONG)
+        for attempt in (0, 1):
+            for i, used in enumerate(self.pool):
+                if used is None:
+                    self.pool[i] = b
+                    return Str(b, i)
+            if attempt == 0:
+                self.collect()
+        raise V.ValueFault(V.OUT_OF_STRINGS)
+
+    def collect(self):
+        """Mark and sweep: free every slot not referenced by a global, the stack or the queue."""
+        live = set()
+        for v in self.globals + self.stack:
+            if isinstance(v, Str) and v.slot is not None:
+                live.add(v.slot)
+        for _ev, args in self.queue:
+            for v in args:
+                if isinstance(v, Str) and v.slot is not None:
+                    live.add(v.slot)
+        for i in range(len(self.pool)):
+            if i not in live:
+                self.pool[i] = None
+
+    def strings_in_use(self):
+        return sum(1 for b in self.pool if b is not None)
 
     def timer_index(self, timer):
         if isinstance(timer, str):
@@ -271,7 +350,10 @@ class VM:
         name, kind = ent
         if pc + OPERAND_SIZE[kind] >= len(code):  # operand cut off by end of code
             raise Fault(5)
-        if kind is None:
+        if kind in ("f64", "i64"):
+            arg = struct.unpack_from("<d" if kind == "f64" else "<q", code, pc + 1)[0]
+            npc = pc + 9
+        elif kind is None:
             arg = None
             npc = pc + 1
         elif kind == "u16":
@@ -283,14 +365,22 @@ class VM:
         elif kind == "i8":
             arg = struct.unpack_from("<b", code, pc + 1)[0]
             npc = pc + 2
-        else:
+        elif kind == "i32":
             arg = struct.unpack_from("<i", code, pc + 1)[0]
             npc = pc + 5
         self.pc = npc
         push, pop = self.push, self.pop
 
-        if name in ("PUSH", "PUSH8", "PUSHS"):
+        if name in ("PUSH", "PUSH8"):
             push(arg)
+        elif name == "PUSHF":
+            push(arg)
+        elif name == "PUSHT":
+            push(Time(arg))
+        elif name == "PUSHS":
+            if arg >= len(self.prog.strings):
+                raise Fault(5)
+            push(Str(self.prog.strings[arg].encode("utf-8", "surrogateescape")))
         elif name == "POP":
             pop()
         elif name == "DUP":
@@ -317,27 +407,47 @@ class VM:
                 raise Fault(5)
             self.stack[i] = v
         elif name in BINOPS:
-            b = pop()
-            a = pop()
+            if len(self.stack) < 2:
+                raise Fault(2)
+            a, b = self.stack[-2], self.stack[-1]
+            op = BINOPS[name]
+            ta, tb = V.type_of(a), V.type_of(b)
+            if op in ("&", "|", "^", "<<", ">>") and not (ta == tb == INT):
+                raise Fault(10)
+            if (name == "CONCAT") != (ta == STR and tb == STR and op == "+"):
+                raise Fault(10)             # strings are joined by CONCAT, numbers by ADD
             try:
-                push(BINOPS[name](a, b))
+                r = V.binary(op, a, b)
             except DivZero:
                 raise Fault(3)
+            except V.ValueFault as f:
+                raise Fault(f.code)
+            if isinstance(r, bytes):
+                r = self.alloc_or_fault(r)      # the operands are still on the stack (roots)
+            del self.stack[-2:]
+            push(r)
         elif name == "NEG":
-            push(wrap(-pop()))
+            v = pop()
+            t = V.type_of(v)
+            if t == INT:
+                push(wrap(-v))
+            elif t == FLOAT:
+                push(-v)
+            else:
+                raise Fault(10)
         elif name == "BNOT":
-            push(wrap(~pop()))
+            push(wrap(~self.pop_int()))
         elif name == "NOT":
-            push(0 if pop() else 1)
+            push(0 if self.pop_int() else 1)
         elif name == "BOOL":
-            push(1 if pop() else 0)
+            push(1 if self.pop_int() else 0)
         elif name == "JMP":
             self.pc = arg
         elif name == "JZ":
-            if pop() == 0:
+            if self.pop_int() == 0:
                 self.pc = arg
         elif name == "JNZ":
-            if pop() != 0:
+            if self.pop_int() != 0:
                 self.pc = arg
         elif name == "CALL":
             if arg >= len(self.prog.funcs):
@@ -364,16 +474,41 @@ class VM:
         elif name == "XCALL":
             if arg >= len(self.bound):
                 raise Fault(5)
-            argc = self.prog.externs[arg][1]
+            _xn, argc, ptypes, ret = self.prog.externs[arg]
             if len(self.stack) < argc:
                 raise Fault(2)
             args = self.stack[len(self.stack) - argc:] if argc else []
-            del self.stack[len(self.stack) - argc:]
+            self.check_types(args, ptypes)
             fn = self.bound[arg]
             if fn is None:
                 raise Fault(8)
-            r = fn(self, list(args))
-            push(wrap(int(r or 0)))
+            r = fn(self, list(args))      # the arguments stay on the stack (roots) meanwhile
+            if ret == NONE_TYPE:
+                r = 0
+            else:
+                try:
+                    r = self.host_value(r, ret)
+                except V.ValueFault as f:
+                    raise Fault(f.code)
+            del self.stack[len(self.stack) - argc:]
+            push(r)
+        elif name == "BUILTIN":
+            if arg >= len(V.BUILTINS):
+                raise Fault(5)
+            _bn, ptypes, _ret = V.BUILTINS[arg]
+            argc = len(ptypes)
+            if len(self.stack) < argc:
+                raise Fault(2)
+            args = self.stack[len(self.stack) - argc:] if argc else []
+            self.check_types(args, ptypes)
+            try:
+                r = V.call_builtin(arg, args, (lambda: self.clock(self)) if self.clock else None)
+            except V.ValueFault as f:
+                raise Fault(f.code)
+            if isinstance(r, bytes):
+                r = self.alloc_or_fault(r)
+            del self.stack[len(self.stack) - argc:]
+            push(r)
         elif name == "GOTO":
             if arg >= len(self.prog.states):
                 raise Fault(5)
@@ -384,18 +519,19 @@ class VM:
         elif name == "EMIT":
             if arg >= len(self.prog.events):
                 raise Fault(5)
-            argc = self.prog.events[arg][1]
+            _en, argc, ptypes = self.prog.events[arg]
             if len(self.stack) < argc:
                 raise Fault(2)
-            args = self.stack[len(self.stack) - argc:] if argc else []
-            del self.stack[len(self.stack) - argc:]
+            args = list(self.stack[len(self.stack) - argc:]) if argc else []
+            self.check_types(args, ptypes)
             if self.on_emit:
                 self.on_emit(self, self.prog.events[arg][0], list(args))
             self.post(arg, *args)
+            del self.stack[len(self.stack) - argc:]
         elif name in ("TSTART", "TEVERY"):
             if arg >= len(self.timers):
                 raise Fault(5)
-            ms = pop()
+            ms = self.pop_int()
             t = self.timers[arg]
             t[0] = True
             t[1] = name == "TEVERY"
@@ -414,17 +550,30 @@ class VM:
             raise Fault(5)
         return RUNNING
 
+    def pop_int(self):
+        v = self.pop()
+        if V.type_of(v) != INT:
+            raise Fault(10)
+        return v
+
+    def check_types(self, args, ptypes):
+        for v, t in zip(args, ptypes):
+            if V.type_of(v) != t:
+                raise Fault(10)
+
+    def alloc_or_fault(self, b):
+        try:
+            return self.alloc(b)
+        except V.ValueFault as f:
+            raise Fault(f.code)
+
     # -- introspection -----------------------------------------------------------------
     def state_name(self):
         return None if self.state is None else self.prog.states[self.state]
 
 
 BINOPS = {
-    "ADD": lambda a, b: wrap(a + b), "SUB": lambda a, b: wrap(a - b),
-    "MUL": lambda a, b: wrap(a * b), "DIV": div, "MOD": mod,
-    "BAND": lambda a, b: wrap(a & b), "BOR": lambda a, b: wrap(a | b),
-    "BXOR": lambda a, b: wrap(a ^ b), "SHL": shl, "SHR": shr,
-    "EQ": lambda a, b: int(a == b), "NE": lambda a, b: int(a != b),
-    "LT": lambda a, b: int(a < b), "LE": lambda a, b: int(a <= b),
-    "GT": lambda a, b: int(a > b), "GE": lambda a, b: int(a >= b),
+    "ADD": "+", "CONCAT": "+", "SUB": "-", "MUL": "*", "DIV": "/", "MOD": "%",
+    "BAND": "&", "BOR": "|", "BXOR": "^", "SHL": "<<", "SHR": ">>",
+    "EQ": "==", "NE": "!=", "LT": "<", "LE": "<=", "GT": ">", "GE": ">=",
 }

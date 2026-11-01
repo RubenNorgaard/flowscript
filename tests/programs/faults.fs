@@ -1,11 +1,11 @@
 # Faults: abort the handler, report pc, continue with the next event
 flow faults
 
-extern ping(x)
-extern wide(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15)
+extern ping(int x) -> int
+extern wide(int p0, int p1, int p2, int p3, int p4, int p5, int p6, int p7, int p8, int p9, int p10, int p11, int p12, int p13, int p14, int p15) -> int
 
-event recurse(n)
-event depth(n)
+event recurse(int n)
+event depth(int n)
 event spin
 event almost
 event deep
@@ -13,54 +13,54 @@ event many
 event after
 event widecall
 
-var counter = 0
-var v = 1
+int counter = 0
+int v = 1
 
-func rec(n):
+func rec(int n) -> int:
   return rec(n + 1)
 
-func down(n):
+func down(int n) -> int:
   if n > 0:
     return down(n - 1) + 1
   return 0
 
-func lots():
-  var l00 = 0
-  var l01 = 0
-  var l02 = 0
-  var l03 = 0
-  var l04 = 0
-  var l05 = 0
-  var l06 = 0
-  var l07 = 0
-  var l08 = 0
-  var l09 = 0
-  var l10 = 0
-  var l11 = 0
-  var l12 = 0
-  var l13 = 0
-  var l14 = 0
-  var l15 = 0
-  var l16 = 0
-  var l17 = 0
-  var l18 = 0
-  var l19 = 0
-  var m00 = 0
-  var m01 = 0
-  var m02 = 0
-  var m03 = 0
-  var m04 = 0
-  var m05 = 0
-  var m06 = 0
-  var m07 = 0
-  var m08 = 0
-  var m09 = 0
+func lots() -> int:
+  int l00 = 0
+  int l01 = 0
+  int l02 = 0
+  int l03 = 0
+  int l04 = 0
+  int l05 = 0
+  int l06 = 0
+  int l07 = 0
+  int l08 = 0
+  int l09 = 0
+  int l10 = 0
+  int l11 = 0
+  int l12 = 0
+  int l13 = 0
+  int l14 = 0
+  int l15 = 0
+  int l16 = 0
+  int l17 = 0
+  int l18 = 0
+  int l19 = 0
+  int m00 = 0
+  int m01 = 0
+  int m02 = 0
+  int m03 = 0
+  int m04 = 0
+  int m05 = 0
+  int m06 = 0
+  int m07 = 0
+  int m08 = 0
+  int m09 = 0
   return 7
 
-func lots_rec(n):
-  var a = n
-  var b = n
-  var c = n
+func lots_rec(int n) -> int:
+  int a = n
+  int b = n
+  int c = n
   if n > 0:
     return lots_rec(n - 1)
   return lots()
@@ -81,7 +81,7 @@ any_state:
 
   # a loop that just fits into the budget of 10000 instructions
   on almost:
-    var i = 0
+    int i = 0
     while i < 1110:
       i = i + 1
     ping(i)

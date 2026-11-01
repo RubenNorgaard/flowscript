@@ -1,16 +1,16 @@
 # Event arguments, handler lookup, raise_event + queue overflow
 flow events
 
-extern show(a, b, c)
+extern show(int a, int b, int c) -> int
 
-event three(a, b, c)
-event few(a, b)
+event three(int a, int b, int c)
+event few(int a, int b)
 event noargs
-event flood(n)
-event item(i)
-event unhandled(x)
+event flood(int n)
+event item(int i)
+event unhandled(int x)
 
-var items = 0
+int items = 0
 
 any_state:
   # global handler, overridden in state "two"
@@ -27,7 +27,7 @@ any_state:
     raise_event three(7, 8, 9)
 
   on flood(n):
-    var i = 0
+    int i = 0
     while i < n:
       raise_event item(i)
       i = i + 1

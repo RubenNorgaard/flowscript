@@ -1,7 +1,7 @@
 # Host-managed timers: the VM asks the host to start/stop timers and the host
 # reports expiries with fs_timer_expired() (scenario: host_timers + fire).
 
-extern log(x)
+extern log(int x) -> int
 
 event go
 event halt

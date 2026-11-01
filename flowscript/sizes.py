@@ -10,22 +10,25 @@ Three separate budgets matter on a device:
 """
 
 from .bytecode import Program, decode, BUILTIN_EVENTS
+from .values import BUILTINS
 
 # C VM defaults (c/flowscript.h)
 DEFAULTS = {
     "FS_STACK_SIZE": 64, "FS_MAX_FRAMES": 16, "FS_QUEUE_SIZE": 16, "FS_MAX_EXTERNS": 64,
     "FS_MAX_GLOBALS": 256, "FS_MAX_TIMERS": 16, "FS_MAX_EVENT_ARGS": 8,
+    "FS_STR_SLOTS": 16, "FS_STR_LEN": 64,
 }
+VALUE = (16, 8)              # fs_value: type byte + 8-byte union (double/int64 align 8)
 VM_CODE_BYTES = 6 * 1024     # flowscript.c, -Os Thumb-2 (approx., see README)
 
 # net stack effect of instructions that just fall through (CALL/XCALL/EMIT/RET handled apart)
 _EFFECT = {
-    "NOP": 0, "PUSH": 1, "PUSH8": 1, "PUSHS": 1, "POP": -1, "DUP": 1,
+    "NOP": 0, "PUSH": 1, "PUSH8": 1, "PUSHS": 1, "PUSHF": 1, "PUSHT": 1, "POP": -1, "DUP": 1,
     "LOADG": 1, "STOREG": -1, "LOADL": 1, "STOREL": -1,
     "NEG": 0, "BNOT": 0, "NOT": 0, "BOOL": 0, "TSTART": -1, "TEVERY": -1, "TSTOP": 0,
     "JMP": 0, "JZ": -1, "JNZ": -1,
 }
-for _op in ("ADD", "SUB", "MUL", "DIV", "MOD", "BAND", "BOR", "BXOR", "SHL", "SHR",
+for _op in ("ADD", "CONCAT", "SUB", "MUL", "DIV", "MOD", "BAND", "BOR", "BXOR", "SHL", "SHR",
             "EQ", "NE", "LT", "LE", "GT", "GE"):
     _EFFECT[_op] = -1
 
@@ -50,16 +53,38 @@ def fs_vm_size(cfg, ptr=4):
     i32 = (4, 4)
     u16 = (2, 2)
     u8 = (1, 1)
-    qentry, _ = _layout([u16, (4 * cfg["FS_MAX_EVENT_ARGS"], 4)])
+    qentry, qalign = _layout([u16, (VALUE[0] * cfg["FS_MAX_EVENT_ARGS"], VALUE[1])])
     timer, talign = _layout([u8, u8, (2, 2), i32, (8, 8)])
+    strslot, salign = _layout([u16, u8, u8, (cfg["FS_STR_LEN"] + 1, 1)])
     fields = [P, P] + [P] * 9 + [i32] + [u16] * 10 + [u8]
-    fields += [(ptr * cfg["FS_MAX_EXTERNS"], ptr), P, P, P, P]   # bound, on_emit/fault/timer, user
-    fields += [(4 * cfg["FS_MAX_GLOBALS"], 4), (4 * cfg["FS_STACK_SIZE"], 4), i32,
+    fields += [(ptr * cfg["FS_MAX_EXTERNS"], ptr), P, P, P, P, P]  # bound, on_emit/fault/timer, clock, user
+    fields += [(VALUE[0] * cfg["FS_MAX_GLOBALS"], VALUE[1]), (VALUE[0] * cfg["FS_STACK_SIZE"], VALUE[1]), i32,
                (8 * cfg["FS_MAX_FRAMES"], 4)]
     fields += [i32] * 7 + [u8, u8] + [i32] * 4
-    fields += [(qentry * cfg["FS_QUEUE_SIZE"], 4), i32, i32,
-               (timer * cfg["FS_MAX_TIMERS"], talign)]
+    fields += [(qentry * cfg["FS_QUEUE_SIZE"], qalign), i32, i32,
+               (timer * cfg["FS_MAX_TIMERS"], talign), (strslot * cfg["FS_STR_SLOTS"], salign)]
     return _layout(fields)[0]
+
+
+def makes_strings(prog):
+    """Can this program create run-time strings (so it needs the string slots)?
+    Yes if it joins strings (CONCAT), calls str() / substr(), has an extern returning
+    a str or an event with a str parameter (the host's strings are copied in)."""
+    from .values import STR
+    if any(e[3] == STR for e in prog.externs) or any(STR in e[2] for e in prog.events):
+        return True
+    for pc in _pcs(prog):
+        op, arg, _size = decode(prog.code, pc)
+        if op == "CONCAT" or (op == "BUILTIN" and arg in (5, 6, 7, 22)):
+            return True
+    return False
+
+
+def _pcs(prog):
+    pc = 0
+    while pc < len(prog.code):
+        yield pc
+        pc += decode(prog.code, pc)[2]
 
 
 # ---------------------------------------------------------------------------------------
@@ -111,6 +136,10 @@ def _local_peak(prog, start, nlocals):
                 if arg >= len(prog.externs):
                     break
                 d = d - prog.externs[arg][1] + 1
+            elif name == "BUILTIN":
+                if arg >= len(BUILTINS):
+                    break
+                d = d - len(BUILTINS[arg][1]) + 1
             elif name == "EMIT":
                 if arg >= len(prog.events):
                     break
@@ -188,7 +217,7 @@ def _usage(prog):
 # ---------------------------------------------------------------------------------------
 
 def _sbytes(s):
-    return 2 + len(s.encode("utf-8")) + 1
+    return 2 + len(s.encode("utf-8", "surrogateescape")) + 1
 
 
 def size_report(prog, debug=False, image=None):
@@ -206,10 +235,10 @@ def size_report(prog, debug=False, image=None):
     sections = [("header", 32, "magic, version, counts")]
     sections.append(("strings", sum(_sbytes(s) for s in strings),
                      "%d strings (2-byte length + text + NUL each)" % len(strings)))
-    sections.append(("globals", 4 * len(prog.globals), "%d initial values x 4" % len(prog.globals)))
-    sections.append(("externs", 4 * len(prog.externs), "%d x 4" % len(prog.externs)))
-    sections.append(("events", 4 * len(prog.events),
-                     "%d x 4 (incl. built-in boot/enter/exit)" % len(prog.events)))
+    sections.append(("globals", 9 * len(prog.globals), "%d initial values x 9 (type + 8 bytes)" % len(prog.globals)))
+    sections.append(("externs", 8 * len(prog.externs), "%d x 8 (name, argc, return and parameter types)" % len(prog.externs)))
+    sections.append(("events", 6 * len(prog.events),
+                     "%d x 6 (incl. built-in boot/enter/exit)" % len(prog.events)))
     sections.append(("states", 2 * len(prog.states), "%d x 2" % len(prog.states)))
     sections.append(("timers", 2 * len(prog.timers), "%d x 2" % len(prog.timers)))
     sections.append(("funcs", 6 * len(prog.funcs), "%d x 6" % len(prog.funcs)))
@@ -226,9 +255,9 @@ def size_report(prog, debug=False, image=None):
     idx = {s: i for i, s in enumerate(strings)}
     if prog.name:
         roles[idx[prog.name]].append("program name")
-    for n, _a in prog.externs:
+    for n, *_rest in prog.externs:
         roles[idx[n]].append("extern")
-    for i, (n, _a) in enumerate(prog.events):
+    for i, (n, *_rest) in enumerate(prog.events):
         roles[idx[n]].append("built-in event" if i < len(BUILTIN_EVENTS) else "event")
     for n in prog.states:
         roles[idx[n]].append("state")
@@ -276,19 +305,25 @@ def size_report(prog, debug=False, image=None):
     minimum["FS_MAX_GLOBALS"] = max(1, len(prog.globals))
     minimum["FS_MAX_EXTERNS"] = max(1, len(prog.externs))
     minimum["FS_MAX_TIMERS"] = max(1, len(prog.timers))
-    minimum["FS_MAX_EVENT_ARGS"] = max([1] + [a for _n, a in prog.events])
+    minimum["FS_MAX_EVENT_ARGS"] = max([1] + [e[1] for e in prog.events])
+    if makes_strings(prog):
+        why["FS_STR_SLOTS"] = why["FS_STR_LEN"] = "the program makes strings: size for its data"
+    else:
+        minimum["FS_STR_SLOTS"] = minimum["FS_STR_LEN"] = 1
+        why["FS_STR_SLOTS"] = why["FS_STR_LEN"] = "the program never makes a string at run time"
     for k in ("FS_STACK_SIZE", "FS_MAX_FRAMES", "FS_MAX_GLOBALS", "FS_MAX_EXTERNS",
-              "FS_MAX_TIMERS", "FS_MAX_EVENT_ARGS"):
+              "FS_MAX_TIMERS", "FS_MAX_EVENT_ARGS", "FS_STR_SLOTS", "FS_STR_LEN"):
         if not (unbounded and k in ("FS_STACK_SIZE", "FS_MAX_FRAMES")):
             shown[k] = minimum[k]
     why["FS_QUEUE_SIZE"] = "depends on how many events the host posts between runs"
     ram = {
         "rows": [{"macro": k, "default": DEFAULTS[k], "minimum": shown[k], "why": why.get(k, "")}
                  for k in ("FS_STACK_SIZE", "FS_MAX_FRAMES", "FS_MAX_GLOBALS", "FS_MAX_EXTERNS",
-                           "FS_MAX_TIMERS", "FS_MAX_EVENT_ARGS", "FS_QUEUE_SIZE")],
+                           "FS_MAX_TIMERS", "FS_MAX_EVENT_ARGS", "FS_STR_SLOTS", "FS_STR_LEN",
+                           "FS_QUEUE_SIZE")],
         "default_bytes": fs_vm_size(DEFAULTS),
         "minimum_bytes": fs_vm_size(minimum),
-        "queue_entry_bytes": _layout([(2, 2), (4 * minimum["FS_MAX_EVENT_ARGS"], 4)])[0],
+        "queue_entry_bytes": _layout([(2, 2), (VALUE[0] * minimum["FS_MAX_EVENT_ARGS"], VALUE[1])])[0],
         "cflags": " ".join("-D%s=%d" % (k, shown[k]) for k in sorted(shown)
                            if shown[k] is not None and shown[k] != DEFAULTS[k]),
         "unbounded": unbounded,
@@ -297,7 +332,7 @@ def size_report(prog, debug=False, image=None):
     # hints
     hints = []
     names = lambda pairs: [n for n, _a in pairs]
-    for i, (n, _a) in enumerate(prog.externs):
+    for i, (n, *_rest) in enumerate(prog.externs):
         if i not in used["XCALL"]:
             hints.append("extern '%s' is never called: removing it saves %d bytes "
                          "(and the firmware need not bind it)" % (n, 4 + _sbytes(n)))
@@ -307,7 +342,7 @@ def size_report(prog, debug=False, image=None):
             hints.append("func '%s' is never called: removing it saves %d bytes"
                          % (f[0], 6 + _sbytes(f[0]) + (r[0]["bytes"] if r else 0)))
     handled = {ev for _s, ev, _a, _l, _o in prog.handlers}
-    for i, (n, _a) in enumerate(prog.events):
+    for i, (n, *_rest) in enumerate(prog.events):
         if i < len(BUILTIN_EVENTS) or i in prog.timers:
             continue
         if i not in handled and i not in used["EMIT"]:

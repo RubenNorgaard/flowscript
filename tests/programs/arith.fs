@@ -1,24 +1,24 @@
 # int32 wrap-around, truncating division, masked shifts
 flow arith version 1
 
-event calc(a, b)
-event divmod(a, b)
-event shifts(a, b)
-event unary(a)
-event out(r1, r2, r3, r4, r5, r6, r7, r8)
+event calc(int a, int b)
+event divmod(int a, int b)
+event shifts(int a, int b)
+event unary(int a)
+event out(int r1, int r2, int r3, int r4, int r5, int r6, int r7, int r8)
 
 # constant folding uses the same int32 semantics
 const MAXI = 2147483647
 
-var wrap_add = MAXI + 1
-var min_div = -2147483648 / -1
-var min_mod = -2147483648 % -1
-var neg_mod = -7 % 3
-var fold_shr = -8 >> 1
-var fold_shl = 1 << 33
-var fold_mul = 65536 * 65536
-var hex = 0xFFFFFFFF
-var last = 0
+int wrap_add = MAXI + 1
+int min_div = -2147483648 / -1
+int min_mod = -2147483648 % -1
+int neg_mod = -7 % 3
+int fold_shr = -8 >> 1
+int fold_shl = 1 << 33
+int fold_mul = 65536 * 65536
+int hex = 0xFFFFFFFF
+int last = 0
 
 any_state:
   on calc(a, b):
@@ -27,9 +27,9 @@ any_state:
 
   on divmod(a, b):
     last = 1
-    var q = a / b
+    int q = a / b
     last = 2
-    var r = a % b
+    int r = a % b
     last = 3
     raise_event out(q, r, q * b + r, 0, 0, 0, 0, 0)
 

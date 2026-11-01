@@ -1,15 +1,15 @@
 # State variables: visible only in their state, reset on every entry
 # (a has no 'on enter', so the compiler adds one; b's own 'on enter' resets first)
 
-extern log(msg, level)
+extern log(str msg, int level)
 
 event go
 event bump
 
 initial state a:
   # counts bumps in a
-  var n = 5
-  var m
+  int n = 5
+  int m
 
   on bump:
     n = n + 1
@@ -20,7 +20,7 @@ initial state a:
     goto_state b
 
 state b:
-  var n = 100
+  int n = 100
 
   on enter:
     log("b enter", n)

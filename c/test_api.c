@@ -6,6 +6,9 @@
  * - unbound extern -> fault 8, fs_unbound()
  * - fs_post with an unknown event, zero-filled args
  * - fs_load rejects every truncation of the image and bad magic/version
+ * - typed values: fs_post with C strings and int -> float, wrong types, a string
+ *   too long (FS_ERR_MEM + fault 12), an extern returning the wrong type (fault 10),
+ *   fs_format / fs_parse_float / fs_parse_time, the clock
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,14 +30,36 @@ static void on_fault(fs_vm *vm, int code, int pc, void *user)
     n_faults++;
 }
 
-static int32_t x_record(fs_vm *vm, const int32_t *args, int argc, void *user)
+static fs_value x_record(fs_vm *vm, const fs_value *args, int argc, void *user)
 {
     int i;
     (void)vm; (void)user;
     n_calls++;
     for (i = 0; i < argc && i < 8; i++)
-        last_args[i] = args[i];
-    return 0;
+        last_args[i] = args[i].as.i;
+    return fs_int(0);
+}
+
+static char echoed[128];
+static fs_value x_echo(fs_vm *vm, const fs_value *args, int argc, void *user)
+{
+    uint16_t n = 0;
+    const char *s = fs_str(vm, args[0], &n);
+    (void)argc; (void)user;
+    snprintf(echoed, sizeof(echoed), "%s?", s ? s : "(null)");
+    return fs_cstr(echoed);              /* copied into a string slot by the VM */
+}
+
+static fs_value x_wrong(fs_vm *vm, const fs_value *args, int argc, void *user)
+{
+    (void)vm; (void)args; (void)argc; (void)user;
+    return fs_cstr("not a float");
+}
+
+static int64_t x_clock(fs_vm *vm, void *user)
+{
+    (void)vm; (void)user;
+    return 1793534400000LL;              /* 2026-11-01T12:00:00Z */
 }
 
 /* posts until the queue is full while a handler is running */
@@ -50,13 +75,20 @@ static void on_timer(fs_vm *vm, int timer, int start, int32_t ms, int periodic, 
     t_last_periodic = periodic;
 }
 
-static int32_t x_flood(fs_vm *vm, const int32_t *args, int argc, void *user)
+static fs_value x_flood(fs_vm *vm, const fs_value *args, int argc, void *user)
 {
     int i, ev = fs_event_id(vm, "noop");
     (void)args; (void)argc; (void)user;
     for (i = 0; i < FS_QUEUE_SIZE + 1; i++)
         fs_post(vm, ev, NULL, 0);
-    return 0;
+    return fs_int(0);
+}
+
+static int global_index(fs_vm *vm, const char *name)
+{
+    /* the test program's globals in declaration order: g, last, lastx */
+    (void)vm;
+    return strcmp(name, "g") == 0 ? 0 : strcmp(name, "last") == 0 ? 1 : 2;
 }
 
 int main(int argc, char **argv)
@@ -66,7 +98,9 @@ int main(int argc, char **argv)
     FILE *f;
     size_t len, cut;
     int i, ev_noop, ev_rec;
-    int32_t a[2] = {11, 22};
+    fs_value a[2];
+    a[0] = fs_int(11);
+    a[1] = fs_int(22);
 
     if (argc != 2 || !(f = fopen(argv[1], "rb"))) {
         fprintf(stderr, "usage: test_api api.fsb\n");
@@ -84,7 +118,7 @@ int main(int argc, char **argv)
     bad[0] = 'X';
     CHECK(fs_load(&vm, bad, len) == FS_ERR_MAGIC);
     memcpy(bad, img, len);
-    bad[4] = 2;
+    bad[4] = 1;                                   /* FlowScript v1 images (untyped) */
     CHECK(fs_load(&vm, bad, len) == FS_ERR_VERSION);
     memcpy(bad, img, len);
     bad[16] = 0xFF;                               /* n_externs = 255 */
@@ -98,6 +132,12 @@ int main(int argc, char **argv)
     CHECK(fs_bind(&vm, "record", x_record) == 1);
     CHECK(fs_bind(&vm, "nope", x_record) == FS_ERR_NOTFOUND);
     CHECK(fs_unbound(&vm) && strcmp(fs_unbound(&vm), "flood") == 0);
+    CHECK(fs_bind(&vm, "echo", x_echo) == 1);
+    CHECK(fs_bind(&vm, "wrong", x_wrong) == 1);
+    CHECK(fs_extern_ret(&vm, fs_extern_id(&vm, "echo")) == FS_STR);
+    CHECK(fs_extern_ret(&vm, fs_extern_id(&vm, "record")) == FS_INT);
+    CHECK(fs_extern_arg_type(&vm, fs_extern_id(&vm, "echo"), 0) == FS_STR);
+    CHECK(fs_extern_arg_type(&vm, fs_extern_id(&vm, "echo"), 1) == -1);
 
     ev_noop = fs_event_id(&vm, "noop");
     ev_rec = fs_event_id(&vm, "rec");
@@ -144,9 +184,60 @@ int main(int argc, char **argv)
         CHECK(n_faults == 4 && last_fault == 7 && last_fault_pc == xpc);
     }
 
+    /* typed values ------------------------------------------------------------------- */
+    {
+        int ev_text = fs_event_id(&vm, "text"), faults0;
+        fs_value t[2];
+        char buf[64];
+        double f;
+        int64_t ms;
+        uint16_t n;
+        CHECK(fs_event_arg_type(&vm, ev_text, 0) == FS_STR && fs_event_arg_type(&vm, ev_text, 1) == FS_FLOAT);
+        t[0] = fs_cstr("hi");
+        t[1] = fs_int(3);                             /* int accepted for a float */
+        CHECK(fs_post(&vm, ev_text, t, 2) == FS_OK);
+        CHECK(fs_strings_in_use(&vm) == 1);           /* "hi" copied into a slot */
+        fs_run(&vm, 100000);
+        CHECK(strcmp(echoed, "hi!?") == 0);
+        CHECK(fs_global(&vm, global_index(&vm, "lastx")).type == FS_FLOAT &&
+              fs_global(&vm, global_index(&vm, "lastx")).as.f == 3.0);
+        CHECK(strcmp(fs_str(&vm, fs_global(&vm, global_index(&vm, "last")), &n), "hi!?") == 0 && n == 4);
+        CHECK(fs_format(&vm, fs_global(&vm, 1), buf, sizeof(buf)) == 6 && strcmp(buf, "\"hi!?\"") == 0);
+        CHECK(fs_format(&vm, fs_float(0.1), buf, sizeof(buf)) == 3 && strcmp(buf, "0.1") == 0);
+        CHECK(fs_format(&vm, fs_time(0), buf, 8) == 24 && strcmp(buf, "1970-01") == 0);   /* truncated */
+        CHECK(fs_format(&vm, fs_int(INT32_MIN), buf, sizeof(buf)) == 11 && strcmp(buf, "-2147483648") == 0);
+
+        t[1] = fs_cstr("3");                          /* a str for a float: refused */
+        CHECK(fs_post(&vm, ev_text, t, 2) == FS_ERR_ARG);
+        CHECK(vm.q_count == 0);
+        t[0] = fs_cstr("0123456789012345678901234567890123456789012345678901234567890123456789");
+        t[1] = fs_float(1.5);
+        faults0 = n_faults;
+        CHECK(fs_post(&vm, ev_text, t, 2) == FS_ERR_MEM);
+        CHECK(n_faults == faults0 + 1 && last_fault == FS_FAULT_STR_LONG && last_fault_pc == -1);
+        CHECK(vm.q_count == 0);
+        CHECK(fs_post(&vm, ev_text, NULL, 0) == FS_OK);   /* missing: "" and 0.0, no slot */
+        fs_run(&vm, 100000);
+        CHECK(strcmp(echoed, "!?") == 0);
+
+        /* an extern returning the wrong type: fault 10 at the XCALL */
+        CHECK(fs_post(&vm, fs_event_id(&vm, "mistype"), NULL, 0) == FS_OK);
+        fs_run(&vm, 100000);
+        CHECK(n_faults == faults0 + 2 && last_fault == FS_FAULT_TYPE && last_fault_pc >= 0);
+
+        CHECK(fs_parse_float("2.5e3", 5, &f) == 0 && f == 2500.0);
+        CHECK(fs_parse_float("2.5x", 4, &f) == -1);
+        CHECK(fs_parse_time("2026-11-01T12:00:00Z", 20, &ms) == 0 && ms == 1793534400000LL);
+        CHECK(fs_parse_time("2026-11-31", 10, &ms) == -1);
+        CHECK(fs_str(&vm, fs_int(1), NULL) == NULL);
+        CHECK(fs_str(&vm, fs_empty_str(), &n) && n == 0);
+        fs_set_clock(&vm, x_clock);
+        CHECK(vm.clock == x_clock);
+    }
+
     /* fs_reset restores globals and clears state */
     fs_reset(&vm);
-    CHECK(fs_state(&vm) == -1 && fs_global(&vm, 0) == 5);
+    CHECK(fs_state(&vm) == -1 && fs_global(&vm, 0).as.i == 5 && fs_strings_in_use(&vm) == 0);
 
     /* host-managed timers (api.fs: on boot: start t 10) */
     CHECK(fs_timer_count(&vm) == 1 && strcmp(fs_timer_name(&vm, 0), "t") == 0);

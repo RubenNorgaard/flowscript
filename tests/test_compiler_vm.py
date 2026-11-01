@@ -36,13 +36,13 @@ class Errors(unittest.TestCase):
         self.bad("const K = 1\nany_state:\n  on boot:\n    K = 2\n", "cannot assign to constant")
         self.bad("any_state:\n  on nothing:\n    pass\n", "unknown event")
         self.bad("any_state:\n  on enter:\n    pass\n", "only allowed inside a state")
-        self.bad("extern f(a)\nany_state:\n  on boot:\n    f()\n", "takes 1 argument")
+        self.bad("extern f(int a) -> int\nany_state:\n  on boot:\n    f()\n", "takes 1 argument")
         self.bad("any_state:\n  on boot:\n    goto_state nowhere\n", "unknown state")
-        self.bad("var a = 1\nvar a = 2\n", "already declared")
+        self.bad("int a = 1\nint a = 2\n", "already declared")
         self.bad("any_state:\n  on boot:\n    if 1 < 2 < 3:\n      pass\n", "cannot be chained")
         self.bad("any_state:\n  on boot:\n    return 3\n", "cannot return a value")
-        self.bad("any_state:\n  on boot:\n    var x\n    var x\n", "already declared")
-        self.bad("var v = 5\nconst C = v\n", "constant expression")
+        self.bad("any_state:\n  on boot:\n    int x\n    int x\n", "already declared")
+        self.bad("int v = 5\nconst C = v\n", "constant expression")
         self.bad("const C = 1 / 0\n", "division by zero")
         self.bad("any_state:\n  on boot:\n    x = = 1\n", "expected an expression")
 
@@ -51,7 +51,7 @@ class Errors(unittest.TestCase):
         self.bad("any_state:\n  on boot:\n", "expected an indented block")
         self.bad("any_state:\n  on boot:\npass\n", "expected an indented block")
         self.bad("any_state:\n  on boot:\n    pass\n      pass\n", "unexpected indentation")
-        self.bad("var x\nany_state:\n  on boot:\n      x = 1\n    x = 2\n", "does not match any outer block")
+        self.bad("int x\nany_state:\n  on boot:\n      x = 1\n    x = 2\n", "does not match any outer block")
         self.bad("any_state:\n  on boot:\n  \tpass\n", "tab used for indentation")
         self.bad("any_state:\n  on boot:\n    pass\nend\n", "'end' is not used")
         self.bad("any_state:\n  on boot:\n    pass\n    else:\n      pass\n", "without a matching 'if'")
@@ -60,7 +60,7 @@ class Errors(unittest.TestCase):
         self.bad("event e\nany_state:\n  on boot:\n    emit e\n", "use 'raise_event e'")
 
     def test_any_indent_width(self):
-        _ast, prog, _ = compile_source("var x\nany_state:\n  on boot:\n      if x:\n          x = 1\n      else:\n          x = 2\n")
+        _ast, prog, _ = compile_source("int x\nany_state:\n  on boot:\n      if x:\n          x = 1\n      else:\n          x = 2\n")
         self.assertTrue(prog.code)
 
     def test_error_line(self):
@@ -77,38 +77,38 @@ class Errors(unittest.TestCase):
         self.bad("state any_state:\n  pass\n", "keyword")
 
     def test_state_var_rules(self):
-        self.bad("event e\ninitial state a:\n  var n\n  on e:\n    goto_state b\nstate b:\n  on e:\n    n = 1\n",
+        self.bad("event e\ninitial state a:\n  int n\n  on e:\n    goto_state b\nstate b:\n  on e:\n    n = 1\n",
                  "'n' is a variable of state 'a', only visible in that state's handlers")
-        self.bad("func f():\n  return n\nstate a:\n  var n\n", "variable of state 'a'")
-        self.bad("any_state:\n  var n\n", "declare them at the top level")
-        self.bad("state a:\n  on enter:\n    pass\n  var n\n", "before its handlers")
-        self.bad("state a:\n  var n\n  var n\n", "already declared in state 'a'")
-        self.bad("var n\nstate a:\n  var n\n", "already declared as var")
-        self.bad("state a:\n  var n\n  on enter:\n    var n = 2\n", "hide the state variable")
-        self.bad("event e(n)\nstate a:\n  var n\n  on e:\n    pass\n", "hide the state variable")
-        self.bad("var g\nstate a:\n  var n = g\n", "constant expression")
+        self.bad("func f() -> int:\n  return n\nstate a:\n  int n\n", "variable of state 'a'")
+        self.bad("any_state:\n  int n\n", "declare them at the top level")
+        self.bad("state a:\n  on enter:\n    pass\n  int n\n", "before its handlers")
+        self.bad("state a:\n  int n\n  int n\n", "already declared in state 'a'")
+        self.bad("int n\nstate a:\n  int n\n", "already declared as var")
+        self.bad("state a:\n  int n\n  on enter:\n    int n = 2\n", "hide the state variable")
+        self.bad("event e(int n)\nstate a:\n  int n\n  on e:\n    pass\n", "hide the state variable")
+        self.bad("int g\nstate a:\n  int n = g\n", "constant expression")
 
     def test_initial_state_rules(self):
         self.bad("state a:\n  pass\nstate b:\n  pass\n", "mark the state the program starts in: 'initial state a:'")
         self.bad("initial state a:\n  pass\ninitial state b:\n  pass\n", "only one state can be 'initial'")
-        self.bad("initial var x\n", "write 'initial state NAME:'")
+        self.bad("initial int x\n", "write 'initial state NAME:'")
         # a single state needs no marker; the marked state starts even when it is not first
         self.assertEqual(compile_source("state a:\n  pass\n")[1].states, ["a"])
-        vm, _ = run("var x\nstate a:\n  on enter:\n    x = 1\ninitial state b:\n  on enter:\n    x = 2\n")
+        vm, _ = run("int x\nstate a:\n  on enter:\n    x = 1\ninitial state b:\n  on enter:\n    x = 2\n")
         self.assertEqual((vm.state_name(), g(vm, "x")), ("b", 2))
 
     def test_funcs_cannot_use_globals(self):
         msg = "functions cannot use global variables: pass 'g' in as a parameter"
-        self.bad("var g\nfunc f():\n  return g\n", msg)
-        self.bad("var g\nfunc f():\n  g = 1\n", msg)
-        self.bad("var g\nfunc f(n):\n  if n > g:\n    pass\n", msg)
+        self.bad("int g\nfunc f() -> int:\n  return g\n", msg)
+        self.bad("int g\nfunc f() -> int:\n  g = 1\n", msg)
+        self.bad("int g\nfunc f(int n) -> int:\n  if n > g:\n    pass\n", msg)
         # parameters, locals, consts and calls are fine; handlers store the result
-        _ast, prog, _ = compile_source("const K = 2\nvar g\nfunc f(n):\n  var t = n * K\n  return t\n"
+        _ast, prog, _ = compile_source("const K = 2\nint g\nfunc f(int n) -> int:\n  int t = n * K\n  return t\n"
                                        "any_state:\n  on boot:\n    g = f(g + 1)\n")
         self.assertTrue(prog.code)
 
     def test_magic_number_warning(self):
-        src = ("const LIMIT = 4\nvar x\nfunc f(n):\n  return n > 7\n"
+        src = ("const LIMIT = 4\nint x\nfunc f(int n) -> int:\n  return n > 7\n"
                "any_state:\n  on boot:\n    if x == 0 or x != -1 or x < 1 or x > LIMIT or x >= LIMIT / 2:\n"
                "      pass\n    while -300 < x:\n      x = x - 1\n")
         _ast, _prog, dbg = compile_source(src)
@@ -131,10 +131,10 @@ class Errors(unittest.TestCase):
 class Semantics(unittest.TestCase):
     def test_arith(self):
         vm, _ = run("""
-var a
-var b
-var c
-var d
+int a
+int b
+int c
+int d
 any_state:
   on boot:
     a = -7 / 2
@@ -150,8 +150,8 @@ any_state:
             calls.append(args[0])
             return args[0]
         vm, _ = run("""
-extern f(x)
-var r
+extern f(int x) -> int
+int r
 any_state:
   on boot:
     r = f(0) and f(1)
@@ -165,7 +165,7 @@ any_state:
         vm, trace = run("""
 event go
 timer t
-var log = 0
+int log = 0
 initial state a:
   on enter:
     log = log * 10 + 1
@@ -189,16 +189,16 @@ state b:
         src = """
 event go
 event bump
-var seen = 0
+int seen = 0
 initial state a:
-  var n = 5
+  int n = 5
   on bump:
     n = n + 1
     seen = n
   on go:
     goto_state b
 state b:
-  var n = 100
+  int n = 100
   on enter:
     seen = n
   on go:
@@ -215,7 +215,7 @@ state b:
     def test_boot_selects_state_and_override(self):
         vm, trace = run("""
 event e
-var x
+int x
 any_state:
   on boot:
     goto_state second
@@ -234,7 +234,7 @@ state second:
 
     def test_faults(self):
         vm, trace = run("""
-var z
+int z
 any_state:
   on boot:
     z = 1 / z
@@ -242,7 +242,7 @@ any_state:
         self.assertEqual(trace, [("fault", 3)])
         vm, trace = run("any_state:\n  on boot:\n    while true:\n      pass\n")
         self.assertEqual(trace, [("fault", 4)])
-        vm, trace = run("func f(n):\n  return f(n + 1)\nany_state:\n  on boot:\n    f(0)\n")
+        vm, trace = run("func f(int n) -> int:\n  return f(n + 1)\nany_state:\n  on boot:\n    f(0)\n")
         self.assertEqual(trace, [("fault", 6)])
 
     def test_livelock_is_stopped(self):
@@ -254,14 +254,14 @@ any_state:
 
     def test_functions_and_locals(self):
         vm, _ = run("""
-var r
-func fact(n):
+int r
+func fact(int n) -> int:
   if n <= 1:
     return 1
   return n * fact(n - 1)
 any_state:
   on boot:
-    var i = 0
+    int i = 0
     while i < 5:
       i = i + 1
     r = fact(i)
@@ -300,7 +300,7 @@ class Rejected(unittest.TestCase):
                 pass
 
     def test_truncated_operand_faults(self):
-        _ast, prog, _ = compile_source("var x\nany_state:\n  on boot:\n    x = 1000\n")
+        _ast, prog, _ = compile_source("int x\nany_state:\n  on boot:\n    x = 1000\n")
         prog.code = prog.code[:2]           # PUSH with a cut-off operand
         faults = []
         vm = VM(prog, on_fault=lambda vm, c, pc: faults.append((c, pc)))
@@ -308,6 +308,6 @@ class Rejected(unittest.TestCase):
         self.assertEqual(faults, [(5, 0)])
 
     def test_boot_fault_still_enters_initial_state(self):
-        vm, trace = run("var z\nany_state:\n  on boot:\n    z = 1 / z\nstate a:\n  pass\n")
+        vm, trace = run("int z\nany_state:\n  on boot:\n    z = 1 / z\nstate a:\n  pass\n")
         self.assertEqual(trace, [("fault", 3)])
         self.assertEqual(vm.state_name(), "a")
