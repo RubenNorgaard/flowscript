@@ -67,6 +67,8 @@ class VM:
             self._image = image
         self.prog = prog
         self.code = prog.code
+        self._decoded = {}         # pc -> (opcode, name, operand, next pc)
+        self._strs = {}            # string index -> its Str (PUSHS)
         self.externs = externs or {}
         self.on_emit = on_emit
         self.on_fault = on_fault
@@ -297,12 +299,21 @@ class VM:
                     t[0] = False
 
     def run(self, max_steps=1000000):
-        """Run until idle. Returns number of steps."""
+        """Run until idle. Returns number of steps (each exactly as step() would do it)."""
         n = 0
+        execute = self.execute
         while n < max_steps:
-            r = self.step()
-            if r == IDLE:
-                break
+            if self.handler is None:
+                if self.step() == IDLE:
+                    break
+            else:
+                if self.rec:
+                    self.rec.steps += 1
+                try:
+                    execute()
+                except Fault as f:
+                    self.report_fault(f.code, self.cur_pc)
+                    self.finish()
             n += 1
         return n
 
@@ -418,12 +429,24 @@ class VM:
         self.stack.append(v)
 
     def execute(self):
-        code = self.code
         pc = self.pc
         self.cur_pc = pc
         self.steps += 1
         if self.steps > self.budget:
             raise Fault(4)
+        d = self._decoded.get(pc)
+        if d is None:
+            d = self._decode(pc)
+        fast, name, arg, npc = d
+        self.pc = npc
+        if fast is not None:
+            return fast(self, arg)
+        return self._execute_op(name, arg, npc)
+
+    def _decode(self, pc):
+        """Decode the instruction at pc (cached: the code never changes).  Fault 5 if invalid.
+        -> (fast handler or None, name, operand, next pc)"""
+        code = self.code
         if pc >= len(code):
             raise Fault(5)
         op = code[pc]
@@ -451,7 +474,11 @@ class VM:
         elif kind == "i32":
             arg = struct.unpack_from("<i", code, pc + 1)[0]
             npc = pc + 5
-        self.pc = npc
+        d = (_FAST.get(op), name, arg, npc)     # the fast handler, or None: _execute_op
+        self._decoded[pc] = d
+        return d
+
+    def _execute_op(self, name, arg, npc):
         push, pop = self.push, self.pop
 
         if name in ("PUSH", "PUSH8"):
@@ -701,3 +728,287 @@ BINOPS = {
     "BAND": "&", "BOR": "|", "BXOR": "^", "SHL": "<<", "SHR": ">>",
     "EQ": "==", "NE": "!=", "LT": "<", "LE": "<=", "GT": ">", "GE": ">=",
 }
+
+
+# ---- fast paths for the hot instructions ---------------------------------------------------
+# Each does exactly what VM._execute_op does for the instruction (same results, same
+# faults in the same order); anything unusual falls back to it.  vm.pc is already the
+# next instruction.
+from .bytecode import OPCODES as _OPC
+from .intops import BINARY as _IBIN
+
+
+def _push(vm, v):
+    st = vm.stack
+    if len(st) >= vm.stack_size:
+        raise Fault(1)
+    st.append(v)
+    return RUNNING
+
+
+def _op_push(vm, arg):
+    return _push(vm, arg)
+
+
+def _op_loadg(vm, arg):
+    g = vm.globals
+    if arg >= len(g):
+        raise Fault(5)
+    return _push(vm, g[arg])
+
+
+def _op_storeg(vm, arg):
+    g = vm.globals
+    if arg >= len(g):
+        raise Fault(5)
+    st = vm.stack
+    if not st:
+        raise Fault(2)
+    g[arg] = st.pop()
+    return RUNNING
+
+
+def _op_loadl(vm, arg):
+    st = vm.stack
+    i = vm.frames[-1][1] + arg
+    if i >= len(st):
+        raise Fault(5)
+    return _push(vm, st[i])
+
+
+def _op_storel(vm, arg):
+    st = vm.stack
+    if not st:
+        raise Fault(2)
+    v = st.pop()
+    i = vm.frames[-1][1] + arg
+    if i >= len(st):
+        raise Fault(5)
+    st[i] = v
+    return RUNNING
+
+
+def _op_pop(vm, arg):
+    st = vm.stack
+    if not st:
+        raise Fault(2)
+    st.pop()
+    return RUNNING
+
+
+def _pop_int(vm):
+    st = vm.stack
+    if not st:
+        raise Fault(2)
+    v = st.pop()
+    if type(v) is not int and V.type_of(v) != INT:
+        raise Fault(10)
+    return v
+
+
+def _op_jmp(vm, arg):
+    vm.pc = arg
+    return RUNNING
+
+
+def _op_jz(vm, arg):
+    if _pop_int(vm) == 0:
+        vm.pc = arg
+    return RUNNING
+
+
+def _op_jnz(vm, arg):
+    if _pop_int(vm) != 0:
+        vm.pc = arg
+    return RUNNING
+
+
+def _op_not(vm, arg):
+    return _push(vm, 0 if _pop_int(vm) else 1)
+
+
+def _op_bool(vm, arg):
+    return _push(vm, 1 if _pop_int(vm) else 0)
+
+
+_FLOAT_FAST = {
+    "+": lambda a, b: a + b, "-": lambda a, b: a - b, "*": lambda a, b: a * b, "/": V.fdiv,
+    "==": lambda a, b: int(a == b), "!=": lambda a, b: int(a != b), "<": lambda a, b: int(a < b),
+    "<=": lambda a, b: int(a <= b), ">": lambda a, b: int(a > b), ">=": lambda a, b: int(a >= b),
+}
+
+
+def _binop(name):
+    """ints, and + - * and comparisons on two floats, here; everything else as before."""
+    op = BINOPS[name]
+    ifn = _IBIN[op]
+    ffn = _FLOAT_FAST.get(op)
+
+    def run(vm, arg):
+        st = vm.stack
+        if len(st) >= 2:
+            a, b = st[-2], st[-1]
+            ta, tb = type(a), type(b)
+            if ta is int and tb is int:
+                try:
+                    r = ifn(a, b)
+                except DivZero:
+                    raise Fault(3)
+            elif ta is float and tb is float and ffn is not None:
+                r = ffn(a, b)
+            else:
+                return vm._execute_op(name, arg, vm.pc)
+            del st[-2:]
+            return _push(vm, r)
+        return vm._execute_op(name, arg, vm.pc)
+    return run
+
+
+_PYTYPE = {INT: int, FLOAT: float, STR: Str, TIME: Time}
+
+
+def _types_ok(args, ptypes):
+    """The quick form of check_types: exact Python types (anything else: the full check)."""
+    for a, t in zip(args, ptypes):
+        if type(a) is not _PYTYPE[t]:
+            return False
+    return True
+
+
+def _op_xcall(vm, arg):
+    if arg >= len(vm.bound):
+        raise Fault(5)
+    _xn, argc, ptypes, ret = vm.prog.externs[arg]
+    st = vm.stack
+    if len(st) < argc:
+        raise Fault(2)
+    args = st[len(st) - argc:] if argc else []
+    fn = vm.bound[arg]
+    if fn is None or not _types_ok(args, ptypes):
+        return vm._execute_op("XCALL", arg, vm.pc)      # faults exactly as before
+    r = fn(vm, list(args))          # the arguments stay on the stack (roots) meanwhile
+    if ret == NONE_TYPE:
+        r = 0
+    elif ret == FLOAT and type(r) is float:
+        if vm.rec:
+            vm.rec.result(arg, r)
+    elif ret == INT and type(r) is int:
+        r = wrap(r)
+        if vm.rec:
+            vm.rec.result(arg, r)
+    else:
+        try:
+            r = vm.host_value(r, ret)
+        except V.ValueFault as f:
+            if vm.rec:
+                vm.rec.xfault(arg, f.code, r)
+            raise Fault(f.code)
+        if vm.rec:
+            vm.rec.result(arg, r)
+    if argc:
+        del st[len(st) - argc:]
+    return _push(vm, r)
+
+
+# built-ins without faults or text: float(int), abs, min, max (values.call_builtin's rules)
+_BUILTIN_FAST = {
+    0: lambda a: float(a[0]),
+    24: lambda a: wrap(abs(a[0])),
+    26: lambda a: a[1] if a[1] < a[0] else a[0], 27: lambda a: a[1] if a[1] > a[0] else a[0],
+    28: lambda a: a[1] if a[1] < a[0] else a[0], 29: lambda a: a[1] if a[1] > a[0] else a[0],
+}
+
+
+def _op_builtin(vm, arg):
+    fast = _BUILTIN_FAST.get(arg)
+    if fast is None:
+        return vm._execute_op("BUILTIN", arg, vm.pc)
+    ptypes = V.BUILTINS[arg][1]
+    argc = len(ptypes)
+    st = vm.stack
+    if len(st) < argc:
+        raise Fault(2)
+    args = st[len(st) - argc:]
+    if not _types_ok(args, ptypes):
+        return vm._execute_op("BUILTIN", arg, vm.pc)
+    r = fast(args)
+    del st[len(st) - argc:]
+    return _push(vm, r)
+
+
+def _op_pushs(vm, arg):
+    cache = vm._strs
+    s = cache.get(arg)
+    if s is None:
+        if arg >= len(vm.prog.strings):
+            raise Fault(5)
+        s = cache[arg] = Str(vm.prog.strings[arg].encode("utf-8", "surrogateescape"))
+    return _push(vm, s)
+
+
+def _op_neg(vm, arg):
+    st = vm.stack
+    if not st:
+        raise Fault(2)
+    v = st.pop()
+    if type(v) is int:
+        return _push(vm, wrap(-v))
+    if type(v) is float:
+        return _push(vm, -v)
+    st.append(v)
+    return vm._execute_op("NEG", arg, vm.pc)
+
+
+def _op_call(vm, arg):
+    funcs = vm.prog.funcs
+    if arg >= len(funcs):
+        raise Fault(5)
+    _n, argc, nlocals, off = funcs[arg]
+    if len(vm.frames) >= vm.max_frames:
+        raise Fault(6)
+    st = vm.stack
+    base = len(st) - argc
+    if base < 0:
+        raise Fault(2)
+    for _ in range(nlocals - argc):
+        _push(vm, 0)
+    vm.frames.append([vm.pc, base])
+    vm.pc = off
+    return RUNNING
+
+
+def _op_ret(vm, arg):
+    st = vm.stack
+    if not st:
+        raise Fault(2)
+    v = st.pop()
+    ret_pc, base = vm.frames.pop()
+    del st[base:]
+    if not vm.frames:
+        vm.finish()
+        return DONE
+    vm.pc = ret_pc
+    return _push(vm, v)
+
+
+def _op_ret0(vm, arg):
+    ret_pc, base = vm.frames.pop()
+    del vm.stack[base:]
+    if not vm.frames:
+        vm.finish()
+        return DONE
+    vm.pc = ret_pc
+    return _push(vm, 0)
+
+
+_FAST = {_OPC["PUSH"][0]: _op_push, _OPC["PUSH8"][0]: _op_push, _OPC["PUSHF"][0]: _op_push,
+         _OPC["LOADG"][0]: _op_loadg, _OPC["STOREG"][0]: _op_storeg,
+         _OPC["LOADL"][0]: _op_loadl, _OPC["STOREL"][0]: _op_storel, _OPC["POP"][0]: _op_pop,
+         _OPC["JMP"][0]: _op_jmp, _OPC["JZ"][0]: _op_jz, _OPC["JNZ"][0]: _op_jnz,
+         _OPC["NOT"][0]: _op_not, _OPC["BOOL"][0]: _op_bool,
+         _OPC["XCALL"][0]: _op_xcall, _OPC["BUILTIN"][0]: _op_builtin, _OPC["PUSHS"][0]: _op_pushs,
+         _OPC["NEG"][0]: _op_neg, _OPC["CALL"][0]: _op_call, _OPC["RET"][0]: _op_ret,
+         _OPC["RET0"][0]: _op_ret0}
+for _name in BINOPS:
+    if _name != "CONCAT":
+        _FAST[_OPC[_name][0]] = _binop(_name)

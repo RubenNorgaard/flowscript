@@ -623,8 +623,12 @@ def sat32(v):
     return max(-2 ** 31, min(2 ** 31 - 1, v))
 
 
+_CMP = {"==": lambda a, b: a == b, "!=": lambda a, b: a != b, "<": lambda a, b: a < b,
+        "<=": lambda a, b: a <= b, ">": lambda a, b: a > b, ">=": lambda a, b: a >= b}
+
+
 def fcompare(op, a, b):
-    return int({"==": a == b, "!=": a != b, "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[op])
+    return int(_CMP[op](a, b))
 
 
 # ---- builtin functions --------------------------------------------------------------------
@@ -721,10 +725,9 @@ def binary(op, a, b):
 
     Returns int/float/Time or bytes (a new string from +). Raises ValueFault / intops.DivZero.
     """
-    from . import intops
     ta, tb = type_of(a), type_of(b)
     if ta == INT and tb == INT:
-        return intops.BINARY[op](a, b)
+        return _intops.BINARY[op](a, b)
     if ta == FLOAT and tb == FLOAT:
         if op == "+":
             return a + b
@@ -802,3 +805,6 @@ def unpack_value(data, off, strings):
     if t == TIME:
         return Time(struct.unpack_from("<q", data, off + 1)[0])
     raise ValueError("bad global type %d" % t)
+
+
+from . import intops as _intops  # noqa: E402  (at the end: intops is a leaf module)
