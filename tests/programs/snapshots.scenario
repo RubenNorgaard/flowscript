@@ -1,0 +1,15 @@
+snapshot
+post go "ann"
+tick 150
+keyframe
+snapshot
+tick 100
+tick 100
+restore
+tick 100
+tick 100
+post next
+snapshot
+restore
+post go "bo"
+tick 300

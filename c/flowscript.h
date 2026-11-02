@@ -123,6 +123,14 @@ extern "C" {
 #else
 #define FS_HAS_STR 1
 #endif
+/* FS_NO_RECORD leaves out recording (fs_set_record_sink and friends do nothing): a
+ * host choice, not a program feature, so images don't mention it.  Snapshots stay
+ * (a device that never calls fs_snapshot/fs_restore drops them at link time). */
+#if defined(FS_NO_RECORD)
+#define FS_HAS_RECORD 0
+#else
+#define FS_HAS_RECORD 1
+#endif
 #if defined(FS_NO_TEXT)
 #define FS_HAS_TEXT 0
 #else
@@ -144,6 +152,8 @@ extern "C" {
 #define FS_ERR_NOTLOADED (-10)  /* no valid image loaded                       */
 #define FS_ERR_MEM       (-11)  /* fs_post: no room for a string argument (fault 11/12 reported) */
 #define FS_ERR_FEATURE   (-12)  /* the image needs a feature this build left out (FS_NO_*) */
+#define FS_ERR_BUSY      (-13)  /* fs_snapshot/fs_record_keyframe: not idle (call after fs_run) */
+#define FS_ERR_IMAGE     (-14)  /* fs_restore: the snapshot belongs to another image */
 
 /* ---- fs_step() results ----------------------------------------------------- */
 #define FS_IDLE       0         /* nothing to do                               */
@@ -254,6 +264,11 @@ typedef void (*fs_timer_fn)(fs_vm *vm, int timer, int start, int32_t ms, int per
  * the message for hosts that want it.  The values are valid during the call. */
 typedef void (*fs_log_fn)(fs_vm *vm, int level, const char *tmpl, uint16_t len,
                           const fs_value *values, int n, void *user);
+/* Recording (SPEC 10): the VM hands each recorded input to the host as one frame
+ * (a varint length, then that many bytes).  A frame may arrive in several calls;
+ * end = 1 on its last piece.  Write them to a UART, a file or a radio packet as they
+ * come; a viewer replays them against the same image. */
+typedef void (*fs_record_fn)(fs_vm *vm, const uint8_t *data, int len, int end, void *user);
 #define FS_LOG_DEBUG   0
 #define FS_LOG_INFO    1
 #define FS_LOG_WARNING 2
@@ -306,6 +321,7 @@ struct fs_vm {
     const uint8_t *handlers_tab;/* 8 bytes each */
     const uint8_t *code;
     uint32_t code_size;
+    uint32_t image_hash;        /* CRC-32 of the image (snapshots, recordings) */
     uint16_t n_strings, n_globals, n_externs, n_events, n_states, n_timers,
              n_funcs, n_handlers;
     uint16_t prog_name;         /* string index or FS_NONE16 */
@@ -318,6 +334,9 @@ struct fs_vm {
     fs_fault_fn  on_fault;
     fs_timer_fn  on_timer;      /* NULL: built-in timers driven by fs_tick() */
     fs_log_fn    on_log;        /* NULL: log statements do nothing           */
+#if FS_HAS_RECORD
+    fs_record_fn on_record;     /* NULL: not recording                      */
+#endif
 #if FS_HAS_TIME
     fs_clock_fn  clock;         /* NULL: now() is 0                          */
 #endif
@@ -345,6 +364,9 @@ struct fs_vm {
     int      cur_extern;        /* extern being called, -1 = none           */
     uint32_t faults;            /* total number of faults reported          */
     int      chain;             /* dispatches since the VM was last idle    */
+#if FS_HAS_RECORD
+    uint32_t rec_steps;         /* recording: steps not handed over yet     */
+#endif
     fs_qentry queue[FS_QUEUE_SIZE];
     int      q_head, q_count;
     fs_timer timers[FS_MAX_TIMERS];
@@ -394,6 +416,24 @@ void fs_tick(fs_vm *vm, int32_t ms);    /* built-in timers only (no-op with a ti
  * Returns FS_OK (timer event queued), FS_TIMER_STOPPED (the script stopped the
  * timer meanwhile: ignored), FS_ERR_FULL (fault 7 reported) or FS_ERR_ARG. */
 void fs_set_timer_handler(fs_vm *vm, fs_timer_fn fn);
+/* ---- snapshots and recording (SPEC 10) ---------------------------------------
+ * A snapshot is the state while idle (current state, globals, timers) in a few dozen
+ * bytes, tied to the image by its CRC-32.  fs_snapshot() writes it if size allows and
+ * returns its length (> size: call again with a bigger buffer), or FS_ERR_BUSY while a
+ * handler runs or work is pending (take it after fs_run()).  fs_restore() resumes from one
+ * instead of fs_start(): FS_OK, FS_ERR_MAGIC, FS_ERR_IMAGE, FS_ERR_TRUNCATED, FS_ERR_INDEX
+ * or FS_ERR_MEM (its strings don't fit); host-run timers are started again (their
+ * remaining time is lost).  The Python VM writes and reads the same bytes. */
+uint32_t fs_image_hash(const fs_vm *vm);
+int  fs_snapshot(const fs_vm *vm, uint8_t *buf, size_t size);
+int  fs_restore(fs_vm *vm, const uint8_t *data, size_t len);
+/* Record the VM's inputs (NULL: stop).  Kept across fs_load().  Set it before fs_start():
+ * the START frame opens the recording.  fs_record_keyframe() adds a keyframe (session +
+ * snapshot) where a viewer can join; FS_ERR_BUSY when not idle.  fs_record_flush() hands
+ * over the steps counted so far (call it before sending a packet). */
+void fs_set_record_sink(fs_vm *vm, fs_record_fn fn);
+int  fs_record_keyframe(fs_vm *vm);
+void fs_record_flush(fs_vm *vm);
 /* Where log statements go (NULL: nowhere).  Kept across fs_load(). */
 void fs_set_log_handler(fs_vm *vm, fs_log_fn fn);
 /* The message of a log statement: each '{}' replaced by its value (a str as itself,

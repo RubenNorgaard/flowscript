@@ -91,6 +91,7 @@ class Program:
         self.ast = None
         self.debug_info = None
         self.warnings = []
+        self.image = None      # set by from_bytes: the image bytes it was loaded from
 
     # -- helpers -------------------------------------------------------------
     def event_index(self, name):
@@ -162,7 +163,9 @@ class Program:
     @classmethod
     def from_bytes(cls, data):
         try:
-            return cls._from_bytes(data)
+            p = cls._from_bytes(data)
+            p.image = bytes(data)              # the exact image (its CRC-32 identifies it)
+            return p
         except ValueError:
             raise
         except (IndexError, struct.error, UnicodeDecodeError) as e:
@@ -246,7 +249,10 @@ def features(prog):
             need.add("str-result")          # the host's strings are copied into slots
     pc = 0
     while pc < len(prog.code):
-        name, val, size = decode(prog.code, pc)
+        try:
+            name, val, size = decode(prog.code, pc)
+        except struct.error:                    # a cut-off operand (hand-made code): stop here
+            break
         if name == "PUSHF":
             need.add(FLOAT)
         elif name == "PUSHT":

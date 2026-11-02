@@ -80,6 +80,34 @@ Values cross the boundary as plain Python: `int`, `float`, `str` and timezone-aw
 program behaves exactly as on the C VM, including faults (a faulting handler is aborted
 and reported; the machine carries on).
 
+### Snapshots and remote viewing
+
+The VM is deterministic, and the Python and C VMs are bit-identical, so a running
+program can be followed elsewhere from its inputs alone (events, ticks, extern results,
+clock reads): a few bytes per input. A viewer that has the same program re-runs them and
+sees everything: the current state, every variable, every log line.
+
+```python
+frames = []
+machine = flowscript.Machine(program, externs=..., record=frames.append)   # or a socket's send
+machine.start()
+...
+machine.record_keyframe()                      # now and then: where a late viewer can join
+
+viewer = flowscript.Replay(program, on_log=lambda lv, msg, *_: print(lv, msg))
+viewer.feed(b"".join(frames))                  # bytes as they arrive, in any chunks
+viewer.state, viewer["aggression"]
+svg = flowscript.to_svg(program, view="states", state=viewer.state)
+
+snap = machine.snapshot()                      # state, variables, timers: a few dozen bytes
+other = flowscript.Machine(program, externs=...)
+other.restore(snap)                            # continues exactly where it was
+```
+
+From a terminal, `flowscript replay FILE.fs REC` prints the trace a recording reproduces;
+`cat /dev/ttyUSB0 | flowscript replay FILE.fs - --svg live.svg` follows a device live and
+keeps an SVG of its state diagram. The formats are in SPEC section 10.
+
 ### Upgrading scripts from 0.1
 
 0.2 dropped `any_state`: only states handle events, `on boot` lives in the initial state,
@@ -269,6 +297,29 @@ void main_loop(void) {                              /* or an RTOS task */
 fs_set_timer_handler(&vm, on_timer);
 ```
 
+A recording streams the VM's inputs to the host in small pieces (no frame buffer needed),
+and `fs_snapshot` / `fs_restore` save and resume the state, e.g. across deep sleep with
+RAM off:
+
+```c
+static void on_record(fs_vm *vm, const uint8_t *data, int len, int end, void *u) {
+    uart_write(data, len);                  /* end = 1: the frame is complete */
+}
+
+/* in logic_init, before fs_start(): */
+fs_set_record_sink(&vm, on_record);
+
+/* before deep sleep, while idle: */
+static uint8_t snap[256];
+int n = fs_snapshot(&vm, snap, sizeof snap);          /* n > sizeof snap: too small */
+flash_write(SNAP_ADDR, snap, n);
+/* after waking: fs_load(...), bind, then instead of fs_start(): */
+fs_restore(&vm, flash_ptr(SNAP_ADDR), n);
+```
+
+Recording costs about 2 KB of code (`-DFS_NO_RECORD` leaves it out); snapshots about
+2 KB, and only if called.
+
 Log statements (`warning "battery at {mv} mV"`) reach the host as a template and typed
 values; the VM never builds the text, so they work in the smallest build. Render them, or
 ship the template's position in the image and the raw values to be formatted elsewhere:
@@ -303,7 +354,8 @@ firmware.
 SPEC.md                 language + bytecode specification (normative)
 pyproject.toml          the Python package (pip install flowscript-vm)
 flowscript/             Python toolchain
-  api.py                host API: compile(), load(), Machine
+  api.py                host API: compile(), load(), Machine, Replay
+  record.py             snapshots, recordings, replay (SPEC 10)
   svg.py                SVG flowcharts and state diagrams (to_svg)
   lexer.py parser.py    source -> AST (= visual model, JSON)
   printer.py            AST -> canonical source
@@ -333,7 +385,7 @@ cd c && make size                         # code size of the VM
 C VM footprint (default sizes): **about 16 KB** of code for Cortex-M4 (`-Os`, Thumb-2,
 what a `--gc-sections` link keeps, measured with `c/codesize.py`; v1, ints only, was
 6.6 KB), plus the C library's double-precision routines (soft-float on a Cortex-M4) and
-`floor ceil sqrt exp log pow fmod`; no data/bss of its own; a `fs_vm` struct of 6,080
+`floor ceil sqrt exp log pow fmod`; no data/bss of its own; a `fs_vm` struct of 6,088
 bytes RAM on a 32-bit target with the default `FS_*` macros in `flowscript.h`. Most of
 that is headroom: see below. Build with `-ffp-contract=off` (fused multiply-add would
 change float results) and link `-lm`.
@@ -364,16 +416,16 @@ every build (the test runner prints its traces with them). A device that never c
 them should link with `-ffunction-sections -Wl,--gc-sections`, so they and, with
 `FS_NO_TEXT`, all the text code are dropped; the figures below assume that.
 
-| Switches | VM code (Cortex-M4 `-Os`) | RAM per stored value |
-|---|---|---|
-| none | 15.7 KB + soft-float and libm | 9 bytes |
-| `FS_NO_STR` | 13.5 KB + soft-float and libm | 9 bytes |
-| `FS_NO_TEXT` | 12.5 KB + soft-float and libm | 9 bytes |
-| `FS_NO_STR FS_NO_TEXT` (e.g. `pct_pid`) | 11.5 KB + soft-float and libm | 9 bytes |
-| `FS_NO_TIME` | 12.5 KB + soft-float and libm | 9 bytes |
-| `FS_NO_FLOAT` | 13.2 KB | 9 bytes |
-| `FS_NO_FLOAT FS_NO_TIME` | 9.2 KB | 5 bytes |
-| `FS_NO_FLOAT FS_NO_TIME FS_NO_STR` (e.g. the GPS tracker) | **8.2 KB**, needing only `memcpy memset memcmp strlen` | 5 bytes |
+| Switches | VM code (Cortex-M4 `-Os`) | with `FS_NO_RECORD` | RAM per stored value |
+|---|---|---|---|
+| none | 18.5 KB + soft-float and libm | 16.4 KB | 9 bytes |
+| `FS_NO_STR` | 16.2 KB + soft-float and libm | 14.3 KB | 9 bytes |
+| `FS_NO_TEXT` | 15.3 KB + soft-float and libm | 13.3 KB | 9 bytes |
+| `FS_NO_STR FS_NO_TEXT` (e.g. `pct_pid`) | 14.2 KB + soft-float and libm | 12.3 KB | 9 bytes |
+| `FS_NO_TIME` | 15.3 KB + soft-float and libm | 13.2 KB | 9 bytes |
+| `FS_NO_FLOAT` | 15.9 KB | 14.0 KB | 9 bytes |
+| `FS_NO_FLOAT FS_NO_TIME` | 11.8 KB | 9.9 KB | 5 bytes |
+| `FS_NO_FLOAT FS_NO_TIME FS_NO_STR FS_NO_TEXT` (e.g. the GPS tracker) | 10.7 KB | **8.8 KB**, needing only `memcpy memset memcmp strlen` | 5 bytes |
 
 `python3 c/codesize.py` prints all 16 combinations. Every combination compiles
 warning-free (`make switches`), and the conformance test runs each program on four
@@ -391,13 +443,13 @@ debugger's bytecode pane) shows the three budgets separately:
 * **RAM** (`sizeof(fs_vm)`): computed for the defaults and for the smallest `FS_*`
   settings this program runs with. Stack and call depth come from a worst-case analysis of
   the bytecode; the report prints ready-to-use `-D` build flags, including the feature
-  switches. For the GPS example that is 384 bytes instead of 6,080: it uses no floats,
+  switches. For the GPS example that is 392 bytes instead of 6,088: it uses no floats,
   times or run-time strings, so those switches apply, a stored value is 5 bytes and
   there are no string slots. These settings are also load-time limits, so size them
   for the largest program you plan to download. Recursion has no static bound and keeps
   the defaults.
 * **C VM code**: independent of the program, but set by the feature switches: about
-  16 KB with everything, 8.2 KB with the smallest set (see the table above).
+  18.5 KB with everything, 8.8 KB with the smallest set without recording (see the table above).
 
 It also lists concrete savings: unused externs, functions, events, timers and globals,
 globals that could be constants, the cost of names, and the debug section (`-g`).

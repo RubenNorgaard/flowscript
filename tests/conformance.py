@@ -11,6 +11,10 @@ By default the ASan/UBSan build (c/fsrun-asan) is checked as well, plus the
 reduced builds (FS_NO_FLOAT / FS_NO_TIME / FS_NO_STR, see c/Makefile): a program
 runs on each one whose left-out features it does not need (identical trace) and
 must be refused at load by the others.
+
+Recordings (SPEC 10): every run is also recorded; each C runner's recording must be
+byte-identical to the Python one, and replaying it (flowscript replay) must reproduce
+the run: the same trace lines from the program and the same final globals.
 Exit status is non-zero on any mismatch.
 """
 
@@ -50,6 +54,33 @@ def run(cmd):
     return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
 
 
+HOST_LINES = ("global[", "snapshot ", "restored", "fire ")   # the host's own trace lines
+
+
+def check_recording(name, tag, fsb, crec, precording, pout):
+    """The C recording equals Python's, and replaying it reproduces the run."""
+    with open(crec, "rb") as f:
+        crecording = f.read()
+    if crecording != precording:
+        print("FAIL %s [%s]: the recording differs from Python's (%d vs %d bytes)"
+              % (name, tag, len(crecording), len(precording)))
+        return False
+    rrc, rout, rerr = run([sys.executable, "-m", "flowscript", "replay", fsb, crec])
+    live = pout.splitlines()
+    got = rout.splitlines()
+    n = len(got) - len([l for l in got if not l.startswith("global[")])    # the replay's final globals
+    final = live[len(live) - n:] if n else []
+    want = [l for l in live[:len(live) - n] if not l.startswith(HOST_LINES)] + final
+    if rrc != 0 or got != want:
+        print("FAIL %s [%s]: the replay does not reproduce the run" % (name, tag))
+        sys.stdout.writelines(difflib.unified_diff([l + "\n" for l in want], [l + "\n" for l in got],
+                                                   "run", "replay", n=2))
+        if rerr:
+            print(rerr)
+        return False
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-asan", action="store_true", help="skip the sanitizer build")
@@ -76,11 +107,17 @@ def main():
                 continue
             scen = base + ".scenario"
             extra = [scen] if os.path.exists(scen) else []
-            prc, pout, perr = run([sys.executable, "-m", "flowscript", "run", fsb] + extra)
+            prec = os.path.join(tmp, "py.rec")
+            prc, pout, perr = run([sys.executable, "-m", "flowscript", "run", fsb] + extra + ["--record", prec])
+            with open(prec, "rb") as f:
+                precording = f.read()
             ok = True
             for runner in runners:
-                crc, cout, cerr = run([runner, fsb] + extra)
+                crec = os.path.join(tmp, "c.rec")
+                crc, cout, cerr = run([runner, "-r", crec, fsb] + extra)
                 tag = os.path.basename(runner)
+                if crc == 0 and not check_recording(name, tag, fsb, crec, precording, pout):
+                    ok = False
                 if cout != pout or (prc == 0) != (crc == 0):
                     ok = False
                     print("FAIL %s [%s] (python rc=%d, c rc=%d)" % (name, tag, prc, crc))

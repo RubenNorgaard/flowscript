@@ -23,22 +23,38 @@ SWITCHES = ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT")   # c/flowsc
 # does not call fs_format/fs_parse_*), by the switches that are set.  Measured with
 # c/codesize.py.  Builds with floats also link soft-float and libm routines.
 VM_CODE_BYTES = {
-    (): 16087,
-    ("FS_NO_FLOAT",): 13495,
-    ("FS_NO_TIME",): 12801,
-    ("FS_NO_STR",): 13841,
-    ("FS_NO_TEXT",): 12817,
-    ("FS_NO_FLOAT", "FS_NO_TIME"): 9421,
-    ("FS_NO_FLOAT", "FS_NO_STR"): 11877,
-    ("FS_NO_FLOAT", "FS_NO_TEXT"): 11955,
-    ("FS_NO_TIME", "FS_NO_STR"): 10979,
-    ("FS_NO_TIME", "FS_NO_TEXT"): 11083,
-    ("FS_NO_STR", "FS_NO_TEXT"): 11811,
-    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR"): 8383,
-    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_TEXT"): 9421,
-    ("FS_NO_FLOAT", "FS_NO_STR", "FS_NO_TEXT"): 10747,
-    ("FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT"): 10065,
-    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT"): 8383,
+    (): 18928,
+    ("FS_NO_FLOAT",): 16328,
+    ("FS_NO_TIME",): 15634,
+    ("FS_NO_STR",): 16576,
+    ("FS_NO_TEXT",): 15686,
+    ("FS_NO_RECORD",): 16844,
+    ("FS_NO_FLOAT", "FS_NO_TIME"): 12134,
+    ("FS_NO_FLOAT", "FS_NO_STR"): 14534,
+    ("FS_NO_FLOAT", "FS_NO_TEXT"): 14780,
+    ("FS_NO_FLOAT", "FS_NO_RECORD"): 14290,
+    ("FS_NO_TIME", "FS_NO_STR"): 13678,
+    ("FS_NO_TIME", "FS_NO_TEXT"): 13912,
+    ("FS_NO_TIME", "FS_NO_RECORD"): 13512,
+    ("FS_NO_STR", "FS_NO_TEXT"): 14538,
+    ("FS_NO_STR", "FS_NO_RECORD"): 14606,
+    ("FS_NO_TEXT", "FS_NO_RECORD"): 13602,
+    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR"): 10926,
+    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_TEXT"): 12134,
+    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_RECORD"): 10098,
+    ("FS_NO_FLOAT", "FS_NO_STR", "FS_NO_TEXT"): 13408,
+    ("FS_NO_FLOAT", "FS_NO_STR", "FS_NO_RECORD"): 12640,
+    ("FS_NO_FLOAT", "FS_NO_TEXT", "FS_NO_RECORD"): 12746,
+    ("FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT"): 12764,
+    ("FS_NO_TIME", "FS_NO_STR", "FS_NO_RECORD"): 11696,
+    ("FS_NO_TIME", "FS_NO_TEXT", "FS_NO_RECORD"): 11794,
+    ("FS_NO_STR", "FS_NO_TEXT", "FS_NO_RECORD"): 12574,
+    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT"): 10926,
+    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR", "FS_NO_RECORD"): 9058,
+    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_TEXT", "FS_NO_RECORD"): 10098,
+    ("FS_NO_FLOAT", "FS_NO_STR", "FS_NO_TEXT", "FS_NO_RECORD"): 11510,
+    ("FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT", "FS_NO_RECORD"): 10782,
+    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT", "FS_NO_RECORD"): 9058,
 }
 
 
@@ -60,8 +76,10 @@ def queue_entry_layout(cfg):
     return _layout([(csize * n, calign), (2, 2), (n, 1)])   # args, event, types
 
 
-def vm_code_bytes(cfg):
-    return VM_CODE_BYTES[tuple(k for k in SWITCHES if cfg.get(k))]
+def vm_code_bytes(cfg, record=True):
+    """Code kept by a device link with these switches; record=False adds FS_NO_RECORD."""
+    key = tuple(k for k in SWITCHES if cfg.get(k)) + (() if record else ("FS_NO_RECORD",))
+    return VM_CODE_BYTES[key]
 
 # net stack effect of instructions that just fall through (CALL/XCALL/EMIT/RET handled apart)
 _EFFECT = {
@@ -99,13 +117,15 @@ def fs_vm_size(cfg, ptr=4):
     qentry, qalign = queue_entry_layout(cfg)
     timer, talign = _layout([u8, u8, (2, 2), i32, (8, 8)])
     strslot, salign = _layout([u16, u8, u8, (cfg["FS_STR_LEN"] + 1, 1)])
-    fields = [P, P] + [P] * 9 + [i32] + [u16] * 10 + [u8]
-    fields += [(ptr * cfg["FS_MAX_EXTERNS"], ptr), P, P, P, P]   # bound, on_emit/fault/timer/log
+    fields = [P, P] + [P] * 9 + [i32, i32] + [u16] * 10 + [u8]          # ..., code_size, image_hash
+    fields += [(ptr * cfg["FS_MAX_EXTERNS"], ptr), P, P, P, P]      # bound, on_emit/fault/timer/log
+    fields += [] if cfg.get("FS_NO_RECORD") else [P]                 # on_record
     fields += [] if cfg.get("FS_NO_TIME") else [P]               # clock
     fields += [P]                                                # user
     fields += [(csize * cfg["FS_MAX_GLOBALS"], calign), (csize * cfg["FS_STACK_SIZE"], calign), i32,
                (8 * cfg["FS_MAX_FRAMES"], 4)]
-    fields += [i32] * 7 + [u8, u8] + [i32] * 4
+    fields += [i32] * 7 + [u8, u8] + [i32] * 4                       # ..., chain
+    fields += [] if cfg.get("FS_NO_RECORD") else [i32]               # rec_steps
     fields += [(qentry * cfg["FS_QUEUE_SIZE"], qalign), i32, i32,
                (timer * cfg["FS_MAX_TIMERS"], talign),
                (cfg["FS_MAX_GLOBALS"], 1), (cfg["FS_STACK_SIZE"], 1)]     # gtypes, stypes
@@ -461,7 +481,8 @@ def size_report(prog, debug=False, image=None):
         "sections": [{"name": n, "bytes": b, "detail": d} for n, b, d in sections],
         "routines": routines, "strings": string_rows, "strings_by_role": by_role,
         "ram": ram, "vm_code_bytes": vm_code_bytes(DEFAULTS),
-        "minimum_vm_code_bytes": vm_code_bytes(minimum), "hints": hints,
+        "minimum_vm_code_bytes": vm_code_bytes(minimum),
+        "minimum_vm_code_bytes_no_record": vm_code_bytes(minimum, record=False), "hints": hints,
     }
 
 
@@ -526,6 +547,8 @@ def format_report(rep, title=""):
       "switches this program allows" % (rep["vm_code_bytes"] / 1024, rep["minimum_vm_code_bytes"] / 1024))
     if not any(sw["macro"] == "FS_NO_FLOAT" and sw["allowed"] for sw in ram["switches"]):
         w("  plus the C library's soft-float and libm routines")
+    w("  recording (fs_set_record_sink) is included; -DFS_NO_RECORD leaves it out: ~%.1f KB"
+      % (rep["minimum_vm_code_bytes_no_record"] / 1024))
     if rep["hints"]:
         w("")
         w("HINTS")

@@ -21,6 +21,17 @@ static int stub_set[FS_MAX_EXTERNS];
 static int64_t clock_ms;
 static int last_state = -1;
 static int prepass;            /* first pass over the scenario: only look for host_timers */
+static FILE *rec_file;         /* -r FILE: the recording */
+static uint8_t snap[16384];    /* the last snapshot (scenario: snapshot / restore) */
+static int snap_len;
+
+static void on_record(fs_vm *v, const uint8_t *data, int len, int end, void *user)
+{
+    (void)v;
+    (void)end;
+    (void)user;
+    fwrite(data, 1, (size_t)len, rec_file);
+}
 static int host_timers;
 
 static void die(const char *msg, const char *arg)
@@ -489,6 +500,22 @@ static void exec_line(char *line)
 #endif
     } else if (strcmp(w[0], "dump") == 0) {
         dump();
+    } else if (strcmp(w[0], "snapshot") == 0) {
+        int k;
+        snap_len = fs_snapshot(&vm, snap, sizeof(snap));
+        if (snap_len < 0 || snap_len > (int)sizeof(snap))
+            die("snapshot failed", NULL);
+        printf("snapshot ");
+        for (k = 0; k < snap_len; k++)
+            printf("%02x", snap[k]);
+        putchar('\n');
+    } else if (strcmp(w[0], "restore") == 0) {
+        if (fs_restore(&vm, snap, (size_t)snap_len) != FS_OK)
+            die("restore failed", NULL);
+        last_state = fs_state(&vm);
+        printf("restored\n");
+    } else if (strcmp(w[0], "keyframe") == 0) {
+        fs_record_keyframe(&vm);
     } else {
         die("unknown scenario command", w[0]);
     }
@@ -516,8 +543,15 @@ int main(int argc, char **argv)
     char *img, *sc = NULL;
     int rc, i;
 
+    if (argc >= 3 && strcmp(argv[1], "-r") == 0) {     /* -r FILE: record the run */
+        rec_file = fopen(argv[2], "wb");
+        if (!rec_file)
+            die("cannot write the recording", argv[2]);
+        argv += 2;
+        argc -= 2;
+    }
     if (argc < 2 || argc > 3) {
-        fprintf(stderr, "usage: fsrun program.fsb [scenario]\n");
+        fprintf(stderr, "usage: fsrun [-r recording] program.fsb [scenario]\n");
         return 2;
     }
     img = read_file(argv[1], &len);
@@ -548,11 +582,16 @@ int main(int argc, char **argv)
     }
     if (host_timers)
         fs_set_timer_handler(&vm, on_timer);
+    if (rec_file)
+        fs_set_record_sink(&vm, on_record);
 
     fs_start(&vm);
     run();
     if (sc)
         exec_scenario(sc, slen);
+    fs_record_flush(&vm);
+    if (rec_file)
+        fclose(rec_file);
     dump();
     free(sc);
     free(img);

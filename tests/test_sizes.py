@@ -39,10 +39,10 @@ class Report(unittest.TestCase):
         self.assertEqual(mins["FS_MAX_EXTERNS"], 5)
         self.assertIsNone(mins["FS_QUEUE_SIZE"])
         self.assertIn("-DFS_STACK_SIZE=4", rep["ram"]["cflags"])
-        self.assertEqual(rep["ram"]["default_bytes"], 6080)
+        self.assertEqual(rep["ram"]["default_bytes"], 6088)
         # the GPS tracker uses no floats, times or run-time strings: all three switches apply
         self.assertTrue(rep["ram"]["cflags"].startswith("-DFS_NO_FLOAT -DFS_NO_TIME -DFS_NO_STR "))
-        self.assertEqual(rep["ram"]["minimum_bytes"], 384)
+        self.assertEqual(rep["ram"]["minimum_bytes"], 392)
         self.assertEqual(rep["ram"]["minimum_value_bytes"], 5)
 
     def test_recursion_has_no_bound(self):
@@ -73,7 +73,8 @@ class AgainstC(unittest.TestCase):
             small = dict(DEFAULTS, FS_STACK_SIZE=3, FS_MAX_EXTERNS=5, FS_MAX_TIMERS=1,
                          FS_MAX_EVENT_ARGS=1, FS_QUEUE_SIZE=3, FS_MAX_FRAMES=2)
             # every combination of the feature switches, on the default and a small config
-            combos = [{k: 1 for k, bit in zip(SWITCHES, (1, 2, 4)) if m & bit} for m in range(8)]
+            combos = [{k: 1 for k, bit in zip(SWITCHES + ("FS_NO_RECORD",), (1, 2, 4, 8, 16)) if m & bit}
+                      for m in range(32)]
             for cfg in [dict(base, **sw) for base in (DEFAULTS, small) for sw in combos]:
                 flags = ["-D%s=%d" % kv for kv in cfg.items()]
                 exe = os.path.join(tmp, "sz")

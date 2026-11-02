@@ -23,8 +23,8 @@ declared with their type (`int x = 0`) instead of `var`. v3 made it a strict sta
 machine: only states handle events (`any_state` is gone, `on boot` lives in the initial
 state), functions can return several results (`a, b = f(x)`), and a periodic timer
 restarted with the same period keeps running across transitions. v4 (this document)
-adds log statements (`warning "x is {x}"`, see 5.1). Older images are rejected (format
-version 4).
+adds log statements (`warning "x is {x}"`, see 5.1), and snapshots, recordings and
+replay (section 10). Older images are rejected (format version 4).
 
 ---
 
@@ -622,3 +622,77 @@ node has a stable `id`, a `type` and type-specific fields; statements carry an o
 turns the JSON back into canonical source. Editing the chart edits the JSON; editing
 the source re-parses into JSON. The compiler emits a *pc → node id* table, which is how
 the debugger knows which flowchart node and which logic gate is executing.
+
+## 10. Snapshots, recordings and replay
+
+Both VMs produce and accept the same bytes (checked by the conformance test). All
+integers are little-endian.
+
+**Image hash.** The CRC-32 (IEEE 802.3, as zlib's `crc32`) of the exact image bytes
+the VM loaded. A `-g` image is a different image (it carries names), with another hash.
+
+### 10.1 Snapshot
+
+The state of an **idle** VM: no handler running, nothing pending (boot, transition,
+queued events, timers being stopped). Taking one while busy is an error (`FS_ERR_BUSY`).
+
+```
+u8[4] "FSNP"   u16 version (1)   u32 image hash   i16 state (-1: none)   u16 n_globals
+n_globals × { u8 type, value }   int: i32   float: f64   time: i64 ms
+                                 str: u8 kind: 0 empty | 1 image string, u16 index |
+                                               2 run-time string, u16 len, bytes
+u16 n_timers
+n_timers × { u8 flags (bit0 active, bit1 periodic), i32 period, i64 remaining, i16 owner }
+                                 a stopped timer is all zeros with owner -1
+```
+
+Restoring replaces the run-time state (as `reset`, then the snapshot's state, globals and
+timers; no `boot`, no `enter`). It checks the hash, the counts and every global's type.
+In host-timer mode the host is asked to start every active timer again with its
+remaining time (built-in timers keep counting from where they were).
+
+### 10.2 Recording
+
+The VM is deterministic, so a run is reproduced by its inputs. A recording is a sequence
+of frames, each `varint length` followed by that many bytes: `u8 tag`, then the payload.
+`varint` is LEB128 (7 bits a byte, low first, bit 7 = more); `zigzag` maps signed to
+unsigned (0, -1, 1, -2 … → 0, 1, 2, 3 …). Inside frames a value is encoded by the type
+the image declares for it, without a tag: int zigzag varint, float f64, time zigzag
+varint (ms), str varint length + bytes.
+
+| tag | frame | payload | when |
+|---|---|---|---|
+| 1 | START | u32 hash, u8 flags (bit0 host timers), bitmap of bound externs (⌈n/8⌉ bytes) | `start()` |
+| 2 | KEYFRAME | as START, then a snapshot (10.1) | `record_keyframe()`, `restore()` |
+| 3 | POST | varint event, its arguments by their declared types | the host posts an event |
+| 4 | POSTFAIL | varint fault | the host's post failed (fault 7, 11, 12) |
+| 5 | TICK | zigzag ms | `tick(ms)` |
+| 6 | EXPIRED | varint timer | `timer_expired(timer)` on an active timer |
+| 7 | STEPS | varint n | the steps since the previous input (see below) |
+| 8 | RESULT | varint extern, the value by the extern's return type | an extern returned (not for externs without a result) |
+| 9 | XFAULT | varint extern, u8 fault[, a refused str: varint len, bytes] | the VM refused an extern's result |
+| 10 | CLOCK | zigzag ms | `now()` read the clock |
+| 11 | RESET | – | `reset()` |
+| 12 | SETG | varint global, the value by its type | the debugger set a global (Python) |
+
+* Every call of `step` counts (also an idle one). The count is handed over as a STEPS
+  frame before the next host input (START, KEYFRAME, POST, POSTFAIL, TICK, EXPIRED,
+  RESET, SETG) and on `record_flush()`. RESULT, XFAULT and CLOCK happen inside steps and
+  are emitted as they happen, so they come before the STEPS frame of those steps.
+* Events the VM queues itself (`raise_event`, timers) are not recorded: the replay
+  queues them again.
+* A recording starts with START; KEYFRAME frames let a viewer join later.
+
+### 10.3 Replay
+
+A replay VM runs the same image. START/KEYFRAME set which externs are bound and whether
+timers are host-managed, then `start()` (START) or restore the snapshot (KEYFRAME);
+RESULT, XFAULT and CLOCK frames are queued; STEPS n runs n steps, during which every
+extern call takes the next queued result (XFAULT: the call faults with that code) and
+every `now()` the next clock value; POST, POSTFAIL, TICK, EXPIRED, RESET and SETG repeat
+the input. The replay therefore goes through exactly the recorded run: the same states,
+variables, log statements, raised events and faults. Frames before the first START or
+KEYFRAME are skipped. A frame of another image, or a missing result, is an error.
+
+A host input made from inside a callback (e.g. `fs_post` in an extern) is replayed just
+before the step it happened in; the outcome is the same.

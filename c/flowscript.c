@@ -26,6 +26,19 @@ enum {
     OP_LOGD = 0x65, OP_LOGI = 0x66, OP_LOGW = 0x67, OP_LOGE = 0x68
 };
 
+/* recording frame tags and snapshot string kinds (flowscript/record.py) */
+enum { TAG_START = 1, TAG_KEYFRAME, TAG_POST, TAG_POSTFAIL, TAG_TICK, TAG_EXPIRED, TAG_STEPS,
+       TAG_RESULT, TAG_XFAULT, TAG_CLOCK, TAG_RESET };
+enum { STR_EMPTY = 0, STR_IMAGE = 1, STR_RUNTIME = 2 };
+
+static uint32_t crc32_bytes(const uint8_t *p, size_t n);
+static void reset_vm(fs_vm *vm);
+static void rec_simple(fs_vm *vm, int tag, int64_t num, int flush);
+#if FS_HAS_RECORD
+static void rec_keyframe(fs_vm *vm);
+#endif
+static int leaving_timers(const fs_vm *vm);
+
 #define EV_BOOT  0
 #define EV_ENTER 1
 #define EV_EXIT  2
@@ -624,6 +637,9 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     fs_fault_fn on_fault;
     fs_timer_fn on_timer;
     fs_log_fn on_log;
+#if FS_HAS_RECORD
+    fs_record_fn on_record;
+#endif
 #if FS_HAS_TIME
     fs_clock_fn clock;
 #endif
@@ -639,6 +655,9 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     on_fault = vm->on_fault;
     on_timer = vm->on_timer;
     on_log = vm->on_log;
+#if FS_HAS_RECORD
+    on_record = vm->on_record;
+#endif
 #if FS_HAS_TIME
     clock = vm->clock;
 #endif
@@ -648,6 +667,9 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     vm->on_fault = on_fault;
     vm->on_timer = on_timer;
     vm->on_log = on_log;
+#if FS_HAS_RECORD
+    vm->on_record = on_record;
+#endif
 #if FS_HAS_TIME
     vm->clock = clock;
 #endif
@@ -780,11 +802,20 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     vm->image = img;
     vm->image_len = len;
     vm->loaded = 1;
-    fs_reset(vm);
+    vm->image_hash = crc32_bytes(img, len);
+    reset_vm(vm);
     return FS_OK;
 }
 
 void fs_reset(fs_vm *vm)
+{
+    if (!vm || !vm->loaded)
+        return;
+    reset_vm(vm);
+    rec_simple(vm, TAG_RESET, 0, 1);
+}
+
+static void reset_vm(fs_vm *vm)
 {
     unsigned i;
     if (!vm || !vm->loaded)
@@ -1176,6 +1207,487 @@ int fs_format(const fs_vm *vm, fs_value v, char *buf, int size)
     return n;
 }
 
+/* ---- snapshots and recording (SPEC 10, flowscript/record.py) -------------------- */
+
+static uint32_t crc32_bytes(const uint8_t *p, size_t n)
+{
+    uint32_t c = 0xFFFFFFFFu;
+    size_t i;
+    int k;
+    for (i = 0; i < n; i++) {
+        c ^= p[i];
+        for (k = 0; k < 8; k++)
+            c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+uint32_t fs_image_hash(const fs_vm *vm) { return vm && vm->loaded ? vm->image_hash : 0; }
+
+/* Output: into memory (snapshots), counting only, or streamed to the record sink in
+ * small pieces (so no frame-sized buffer is needed). */
+typedef struct {
+    fs_vm *vm;                  /* stream to vm->on_record; NULL: memory / count */
+    uint8_t *mem;
+    size_t cap, n;              /* n: bytes produced, also past cap */
+    uint8_t chunk[32];
+    int c;
+} fs_out;
+
+static void out_put(fs_out *o, const void *data, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    size_t i;
+    for (i = 0; i < len; i++) {
+#if FS_HAS_RECORD
+        if (o->vm) {
+            o->chunk[o->c++] = p[i];
+            if (o->c == (int)sizeof(o->chunk)) {
+                o->vm->on_record(o->vm, o->chunk, o->c, 0, o->vm->user);
+                o->c = 0;
+            }
+        } else
+#endif
+        if (o->mem && o->n < o->cap) {
+            o->mem[o->n] = p[i];
+        }
+        o->n++;
+    }
+}
+
+static void out_byte(fs_out *o, unsigned b) { uint8_t x = (uint8_t)b; out_put(o, &x, 1); }
+
+static void out_le(fs_out *o, uint64_t v, int bytes)
+{
+    int i;
+    for (i = 0; i < bytes; i++)
+        out_byte(o, (unsigned)(v >> (8 * i)) & 0xFFu);
+}
+
+#if FS_HAS_RECORD
+static void out_varint(fs_out *o, uint64_t v)
+{
+    do {
+        unsigned b = (unsigned)(v & 0x7Fu);
+        v >>= 7;
+        out_byte(o, v ? b | 0x80u : b);
+    } while (v);
+}
+
+static void out_zig(fs_out *o, int64_t v)
+{
+    out_varint(o, v < 0 ? ((~(uint64_t)v) << 1) | 1u : (uint64_t)v << 1);
+}
+
+#endif
+
+#if FS_HAS_RECORD
+/* a value of declared type t, without a type tag (frames) */
+static void out_value(fs_out *o, const fs_vm *vm, int t, fs_value v)
+{
+    if (t == FS_INT) {
+        out_zig(o, v.as.i);
+#if FS_HAS_FLOAT
+    } else if (t == FS_FLOAT) {
+        uint64_t u;
+        memcpy(&u, &v.as.f, sizeof(u));
+        out_le(o, u, 8);
+#endif
+#if FS_HAS_TIME
+    } else if (t == FS_TIME) {
+        out_zig(o, v.as.t);
+#endif
+    } else {
+        uint16_t n = 0;
+        const char *p = fs_str(vm, v, &n);
+        out_varint(o, p ? n : 0);
+        if (p)
+            out_put(o, p, n);
+    }
+}
+
+#endif
+
+static int vm_idle(const fs_vm *vm)
+{
+    return vm->handler < 0 && !vm->boot_pending && vm->pending < 0 && vm->transition < 0 &&
+           vm->q_count == 0 && !leaving_timers(vm);
+}
+
+static void out_snapshot(fs_out *o, const fs_vm *vm)
+{
+    unsigned i;
+    out_put(o, "FSNP", 4);
+    out_le(o, 1, 2);
+    out_le(o, vm->image_hash, 4);
+    out_le(o, (uint64_t)(uint16_t)(int16_t)vm->state, 2);
+    out_le(o, vm->n_globals, 2);
+    for (i = 0; i < vm->n_globals; i++) {
+        fs_value g = gget(vm, (int)i);
+        out_byte(o, g.type);
+        if (g.type == FS_INT) {
+            out_le(o, (uint32_t)g.as.i, 4);
+#if FS_HAS_FLOAT
+        } else if (g.type == FS_FLOAT) {
+            uint64_t u;
+            memcpy(&u, &g.as.f, sizeof(u));
+            out_le(o, u, 8);
+#endif
+#if FS_HAS_TIME
+        } else if (g.type == FS_TIME) {
+            out_le(o, (uint64_t)g.as.t, 8);
+#endif
+        } else {
+            uint16_t n = 0;
+            const char *p = fs_str(vm, g, &n);
+            if (!p || n == 0) {
+                out_byte(o, STR_EMPTY);
+            } else if (g.as.s >= 0) {
+                out_byte(o, STR_IMAGE);
+                out_le(o, (uint32_t)g.as.s, 2);
+            } else {
+                out_byte(o, STR_RUNTIME);
+                out_le(o, n, 2);
+                out_put(o, p, n);
+            }
+        }
+    }
+    out_le(o, vm->n_timers, 2);
+    for (i = 0; i < vm->n_timers; i++) {       /* a stopped timer is all zeros (owner -1) */
+        const fs_timer *t = &vm->timers[i];
+        out_byte(o, t->active ? 1u | (t->periodic ? 2u : 0u) : 0u);
+        out_le(o, t->active ? (uint32_t)t->period : 0u, 4);
+        out_le(o, t->active ? (uint64_t)t->remaining : 0u, 8);
+        out_le(o, (uint16_t)(t->active ? t->owner : -1), 2);
+    }
+}
+
+int fs_snapshot(const fs_vm *vm, uint8_t *buf, size_t size)
+{
+    fs_out o;
+    if (!vm || !vm->loaded)
+        return FS_ERR_NOTLOADED;
+    if (!vm_idle(vm))
+        return FS_ERR_BUSY;
+    memset(&o, 0, sizeof(o));
+    out_snapshot(&o, vm);                       /* count first: write only if it fits */
+    if (buf && o.n <= size) {
+        size_t n = o.n;
+        memset(&o, 0, sizeof(o));
+        o.mem = buf;
+        o.cap = size;
+        out_snapshot(&o, vm);
+        return (int)n;
+    }
+    return (int)o.n;
+}
+
+#if FS_HAS_STR
+static int alloc_str(fs_vm *vm, const char *p, size_t n, fs_value *out);
+#endif
+
+int fs_restore(fs_vm *vm, const uint8_t *d, size_t len)
+{
+    size_t off;
+    unsigned i, pass, nstr = 0;
+    int16_t state;
+    if (!vm || !vm->loaded)
+        return FS_ERR_NOTLOADED;
+    if (!d || len < 14 || memcmp(d, "FSNP", 4) != 0 || rd16(d + 4) != 1)
+        return FS_ERR_MAGIC;
+    if (rd32(d + 6) != vm->image_hash)
+        return FS_ERR_IMAGE;
+    state = (int16_t)rd16(d + 10);
+    if (state < -1 || state >= (int)vm->n_states || rd16(d + 12) != vm->n_globals)
+        return FS_ERR_INDEX;
+    /* pass 0 checks everything, pass 1 applies it */
+    for (pass = 0; pass < 2; pass++) {
+        off = 14;
+        if (pass == 1) {
+            reset_vm(vm);
+            vm->state = state;
+        }
+        for (i = 0; i < vm->n_globals; i++) {
+            int t;
+            if (off >= len)
+                return FS_ERR_TRUNCATED;
+            t = d[off++];
+            if (t != vm->globals_init[9 * i])
+                return FS_ERR_INDEX;
+            if (t == FS_INT) {
+                if (len - off < 4)
+                    return FS_ERR_TRUNCATED;
+                if (pass)
+                    gset(vm, (int)i, fs_int(s32(rd32(d + off))));
+                off += 4;
+            } else if (t == FS_FLOAT || t == FS_TIME) {
+                if (len - off < 8)
+                    return FS_ERR_TRUNCATED;
+#if FS_HAS_FLOAT
+                if (pass && t == FS_FLOAT)
+                    gset(vm, (int)i, fs_float(f64(rd64(d + off))));
+#endif
+#if FS_HAS_TIME
+                if (pass && t == FS_TIME)
+                    gset(vm, (int)i, fs_time(s64(rd64(d + off))));
+#endif
+                off += 8;
+            } else {
+                int kind;
+                if (off >= len)
+                    return FS_ERR_TRUNCATED;
+                kind = d[off++];
+                if (kind == STR_EMPTY) {
+                    if (pass)
+                        gset(vm, (int)i, v_str(EMPTY_STR));
+                } else if (kind == STR_IMAGE) {
+                    unsigned k;
+                    if (len - off < 2)
+                        return FS_ERR_TRUNCATED;
+                    k = rd16(d + off);
+                    off += 2;
+                    if (k >= vm->n_strings)
+                        return FS_ERR_INDEX;
+                    if (pass)
+                        gset(vm, (int)i, v_str((int32_t)k));
+                } else if (kind == STR_RUNTIME) {
+                    unsigned n;
+                    if (len - off < 2)
+                        return FS_ERR_TRUNCATED;
+                    n = rd16(d + off);
+                    off += 2;
+                    if (len - off < n)
+                        return FS_ERR_TRUNCATED;
+                    if (!pass && (n > FS_STR_LEN || ++nstr > (FS_HAS_STR ? FS_STR_SLOTS : 0)))
+                        return FS_ERR_MEM;
+#if FS_HAS_STR
+                    if (pass) {
+                        fs_value v;
+                        if (alloc_str(vm, (const char *)d + off, n, &v) != 0)
+                            return FS_ERR_MEM;
+                        gset(vm, (int)i, v);
+                    }
+#endif
+                    off += n;
+                } else {
+                    return FS_ERR_INDEX;
+                }
+            }
+        }
+        if (len - off < 2 || rd16(d + off) != vm->n_timers)
+            return len - off < 2 ? FS_ERR_TRUNCATED : FS_ERR_INDEX;
+        off += 2;
+        if (len - off != (size_t)vm->n_timers * 15)
+            return FS_ERR_TRUNCATED;
+        for (i = 0; i < vm->n_timers; i++) {
+            const uint8_t *q = d + off + 15 * i;
+            int16_t owner = (int16_t)rd16(q + 13);
+            if (owner < -1 || owner >= (int)vm->n_states)
+                return FS_ERR_INDEX;
+            if (pass) {
+                fs_timer *t = &vm->timers[i];
+                t->active = q[0] & 1u;
+                t->periodic = (q[0] & 2u) ? 1 : 0;
+                t->period = s32(rd32(q + 1));
+#if FS_HAS_TIME
+                t->remaining = s64(rd64(q + 5));
+#else
+                t->remaining = (int64_t)rd64(q + 5);
+#endif
+                t->owner = owner;
+            }
+        }
+    }
+    if (vm->on_timer)
+        for (i = 0; i < vm->n_timers; i++)
+            if (vm->timers[i].active)
+                vm->on_timer(vm, (int)i, 1, (int32_t)(vm->timers[i].remaining > 0 ? vm->timers[i].remaining
+                                                      : vm->timers[i].period),
+                             vm->timers[i].periodic, vm->user);
+#if FS_HAS_RECORD
+    rec_keyframe(vm);                           /* a recording says where the run continues from */
+#endif
+    return FS_OK;
+}
+
+#if FS_HAS_RECORD
+/* recording: payloads are written twice, once to count them (the frame's length
+ * comes first) and once to the sink */
+typedef struct {
+    int tag;
+    int event, ext, code;       /* POST, RESULT/XFAULT, POSTFAIL/XFAULT */
+    int64_t num;                /* TICK/EXPIRED/STEPS/CLOCK */
+    const fs_qentry *entry;     /* POST */
+    fs_value value;             /* RESULT; XFAULT: the refused host value */
+} rec_frame;
+
+static void out_session(fs_out *o, const fs_vm *vm)
+{
+    unsigned i, nb = (vm->n_externs + 7u) / 8u;
+    out_le(o, vm->image_hash, 4);
+    out_byte(o, vm->on_timer ? 1u : 0u);
+    for (i = 0; i < nb; i++) {
+        unsigned b = 0, k;
+        for (k = 0; k < 8 && 8 * i + k < vm->n_externs; k++)
+            if (vm->bound[8 * i + k])
+                b |= 1u << k;
+        out_byte(o, b);
+    }
+}
+
+static void out_payload(fs_out *o, const fs_vm *vm, const rec_frame *f)
+{
+    out_byte(o, (unsigned)f->tag);
+    switch (f->tag) {
+    case TAG_START: out_session(o, vm); break;
+    case TAG_POST: {
+        int i, n = vm->events_tab[6 * f->event + 2];
+        uint16_t types = rd16(vm->events_tab + 6 * f->event + 4);
+        out_varint(o, (uint64_t)f->event);
+        for (i = 0; i < n; i++)
+            out_value(o, vm, ptype(types, i), qget(f->entry, i));
+        break;
+    }
+    case TAG_POSTFAIL: out_varint(o, (uint64_t)f->code); break;
+    case TAG_TICK: case TAG_CLOCK: out_zig(o, f->num); break;
+    case TAG_EXPIRED: case TAG_STEPS: out_varint(o, (uint64_t)f->num); break;
+    case TAG_RESULT:
+        out_varint(o, (uint64_t)f->ext);
+        out_value(o, vm, vm->externs_tab[8 * f->ext + 3], f->value);
+        break;
+    case TAG_XFAULT:
+        out_varint(o, (uint64_t)f->ext);
+        out_byte(o, (unsigned)f->code);
+        /* a str that was too long / didn't fit is kept (the replay can show it) */
+        if ((f->code == FS_FAULT_STR_LONG || f->code == FS_FAULT_NO_STRINGS) &&
+            vm->externs_tab[8 * f->ext + 3] == FS_STR) {
+#if FS_HAS_STR
+            if (f->value.type == FS_CSTR) {
+                size_t n = strlen(f->value.as.c);
+                out_varint(o, n);
+                out_put(o, f->value.as.c, n);
+            } else
+#endif
+                out_value(o, vm, FS_STR, f->value);
+        }
+        break;
+    default: break;                             /* RESET: no payload */
+    }
+}
+
+static void rec_emit(fs_vm *vm, const rec_frame *f)
+{
+    fs_out o;
+    size_t n;
+    memset(&o, 0, sizeof(o));
+    out_payload(&o, vm, f);
+    n = o.n;
+    memset(&o, 0, sizeof(o));
+    o.vm = vm;
+    out_varint(&o, n);
+    out_payload(&o, vm, f);
+    vm->on_record(vm, o.chunk, o.c, 1, vm->user);
+}
+
+/* a keyframe (session + snapshot): apart from out_payload, so a device that records
+ * without keyframes doesn't link the snapshot code */
+static void rec_keyframe(fs_vm *vm)
+{
+    fs_out o;
+    size_t n;
+    int pass;
+    if (!vm->on_record)
+        return;
+    fs_record_flush(vm);
+    n = 0;
+    for (pass = 0; pass < 2; pass++) {
+        memset(&o, 0, sizeof(o));
+        if (pass) {
+            o.vm = vm;
+            out_varint(&o, n);
+        }
+        out_byte(&o, TAG_KEYFRAME);
+        out_session(&o, vm);
+        out_snapshot(&o, vm);
+        if (!pass)
+            n = o.n;
+    }
+    vm->on_record(vm, o.chunk, o.c, 1, vm->user);
+}
+
+void fs_record_flush(fs_vm *vm)
+{
+    if (vm && vm->on_record && vm->rec_steps) {
+        rec_frame f;
+        memset(&f, 0, sizeof(f));
+        f.tag = TAG_STEPS;
+        f.num = vm->rec_steps;
+        vm->rec_steps = 0;
+        rec_emit(vm, &f);
+    }
+}
+
+/* a host input: the steps before it go first */
+static void rec_input(fs_vm *vm, rec_frame *f)
+{
+    if (!vm->on_record)
+        return;
+    fs_record_flush(vm);
+    rec_emit(vm, f);
+}
+
+static void rec_simple(fs_vm *vm, int tag, int64_t num, int flush)
+{
+    rec_frame f;
+    if (!vm->on_record)
+        return;
+    memset(&f, 0, sizeof(f));
+    f.tag = tag;
+    f.num = num;
+    f.code = (int)num;
+    if (flush)
+        rec_input(vm, &f);
+    else
+        rec_emit(vm, &f);
+}
+
+#else
+static void rec_simple(fs_vm *vm, int tag, int64_t num, int flush)
+{
+    (void)vm;
+    (void)tag;
+    (void)num;
+    (void)flush;
+}
+
+void fs_record_flush(fs_vm *vm) { (void)vm; }
+#endif
+
+void fs_set_record_sink(fs_vm *vm, fs_record_fn fn)
+{
+#if FS_HAS_RECORD
+    if (vm) {
+        vm->on_record = fn;
+        vm->rec_steps = 0;
+    }
+#else
+    (void)vm;
+    (void)fn;
+#endif
+}
+
+int fs_record_keyframe(fs_vm *vm)
+{
+    if (!vm || !vm->loaded)
+        return FS_ERR_NOTLOADED;
+    if (!vm_idle(vm))
+        return FS_ERR_BUSY;
+#if FS_HAS_RECORD
+    rec_keyframe(vm);
+#endif
+    return FS_OK;
+}
+
 void fs_start(fs_vm *vm)
 {
     if (!vm || !vm->loaded)
@@ -1183,17 +1695,26 @@ void fs_start(fs_vm *vm)
     vm->boot_pending = 1;
     if (vm->n_states)
         vm->pending = 0;
+    rec_simple(vm, TAG_START, 0, 1);
 }
 
-int fs_post(fs_vm *vm, int event, const fs_value *args, int argc)
+/* record: a host input (fs_post); not for the VM's own events (raise_event, timers) */
+static int post_event(fs_vm *vm, int event, const fs_value *args, int argc, int record)
 {
     fs_qentry *e;
     int i, n, pc;
     uint16_t types;
     if (!vm || !vm->loaded || event < 0 || event >= vm->n_events)
         return FS_ERR_ARG;
+#if FS_HAS_RECORD
+    record = record && vm->on_record;
+#else
+    record = 0;
+#endif
     pc = vm->handler >= 0 ? (int)vm->cur_pc : -1;
     if (vm->q_count >= FS_QUEUE_SIZE) {
+        if (record)
+            rec_simple(vm, TAG_POSTFAIL, FS_FAULT_QUEUE_FULL, 1);
         report_fault(vm, FS_FAULT_QUEUE_FULL, pc);
         return FS_ERR_FULL;
     }
@@ -1215,11 +1736,28 @@ int fs_post(fs_vm *vm, int event, const fs_value *args, int argc)
             vm->q_count--;
             if (err == FS_FAULT_TYPE)
                 return FS_ERR_ARG;
+            if (record)
+                rec_simple(vm, TAG_POSTFAIL, err, 1);
             report_fault(vm, err, pc);
             return FS_ERR_MEM;
         }
     }
+#if FS_HAS_RECORD
+    if (record) {
+        rec_frame f;
+        memset(&f, 0, sizeof(f));
+        f.tag = TAG_POST;
+        f.event = event;
+        f.entry = e;
+        rec_input(vm, &f);
+    }
+#endif
     return FS_OK;
+}
+
+int fs_post(fs_vm *vm, int event, const fs_value *args, int argc)
+{
+    return post_event(vm, event, args, argc, 1);
 }
 
 void fs_set_clock(fs_vm *vm, fs_clock_fn fn)
@@ -1333,15 +1871,19 @@ int fs_timer_expired(fs_vm *vm, int timer)
     t = &vm->timers[timer];
     if (!t->active)
         return FS_TIMER_STOPPED;
+    rec_simple(vm, TAG_EXPIRED, timer, 1);
     if (!t->periodic)
         t->active = 0;
-    return fs_post(vm, rd16(vm->timers_tab + 2 * timer), NULL, 0);
+    return post_event(vm, rd16(vm->timers_tab + 2 * timer), NULL, 0, 0);
 }
 
 void fs_tick(fs_vm *vm, int32_t ms)
 {
     unsigned i;
-    if (!vm || !vm->loaded || vm->on_timer)
+    if (!vm || !vm->loaded)
+        return;
+    rec_simple(vm, TAG_TICK, ms, 1);
+    if (vm->on_timer)
         return;
     for (i = 0; i < vm->n_timers; i++) {
         fs_timer *t = &vm->timers[i];
@@ -1353,7 +1895,7 @@ void fs_tick(fs_vm *vm, int32_t ms)
         if (t->remaining < -FS_REM_LIMIT)
             t->remaining = -FS_REM_LIMIT;
         if (t->remaining <= 0) {
-            fs_post(vm, rd16(vm->timers_tab + 2 * i), NULL, 0);
+            post_event(vm, rd16(vm->timers_tab + 2 * i), NULL, 0, 0);
             if (t->periodic) {
                 t->remaining += t->period;
                 if (t->remaining <= 0)
@@ -1754,7 +2296,12 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
         *r = fs_time(t);
         return 0;
     }
-    case 11: *r = fs_time(vm->clock ? vm->clock(vm, vm->user) : 0); return 0;
+    case 11: {
+        int64_t ms = vm->clock ? vm->clock(vm, vm->user) : 0;
+        rec_simple(vm, TAG_CLOCK, ms, 0);
+        *r = fs_time(ms);
+        return 0;
+    }
     case 12: *r = fs_time(floor_div(a[0].as.t, DAY_MS) * DAY_MS); return 0;
     case 13: case 14: case 15: case 16: case 17: case 18: case 19: case 20: {
         int64_t f[8];
@@ -2072,10 +2619,32 @@ static int execute(fs_vm *vm)
         vm->cur_extern = (int)arg;
         v = fn(vm, args, xargc, vm->user);   /* the arguments stay on the stack meanwhile */
         vm->cur_extern = -1;
-        if (ret == FS_NONE_TYPE)
+        if (ret == FS_NONE_TYPE) {
             r = fs_int(0);
-        else if ((err = host_value(vm, v, ret, &r)) != 0)
+        } else if ((err = host_value(vm, v, ret, &r)) != 0) {
+#if FS_HAS_RECORD
+            if (vm->on_record) {
+                rec_frame f;
+                memset(&f, 0, sizeof(f));
+                f.tag = TAG_XFAULT;
+                f.ext = (int)arg;
+                f.code = err;
+                f.value = v;
+                rec_emit(vm, &f);
+            }
+#endif
             FAULT(err);
+        }
+#if FS_HAS_RECORD
+        else if (vm->on_record) {
+            rec_frame f;
+            memset(&f, 0, sizeof(f));
+            f.tag = TAG_RESULT;
+            f.ext = (int)arg;
+            f.value = r;
+            rec_emit(vm, &f);
+        }
+#endif
         vm->sp -= xargc;
         PUSH(r);
         break;
@@ -2127,7 +2696,7 @@ static int execute(fs_vm *vm)
         if (vm->on_emit)
             vm->on_emit(vm, (int)arg, copy, eargc, vm->user);
         /* queue-full is reported but does not abort the handler (as vm.py) */
-        fs_post(vm, (int)arg, copy, eargc);
+        post_event(vm, (int)arg, copy, eargc, 0);
         vm->sp -= eargc;
         break;
     }
@@ -2195,6 +2764,10 @@ int fs_step(fs_vm *vm)
 {
     if (!vm || !vm->loaded)
         return FS_IDLE;
+#if FS_HAS_RECORD
+    if (vm->on_record)
+        vm->rec_steps++;
+#endif
     if (vm->handler < 0) {
         if (vm->chain >= FS_MAX_CHAIN && (vm->boot_pending || vm->pending >= 0 ||
                                           vm->transition >= 0 || vm->q_count > 0 ||

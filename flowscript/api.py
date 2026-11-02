@@ -27,7 +27,7 @@ from .parser import parse
 from . import values as V
 from .vm import VM
 
-__all__ = ["compile", "load", "Machine", "CompileError", "Diagnostic", "Fault"]
+__all__ = ["compile", "load", "Machine", "Replay", "CompileError", "Diagnostic", "Fault"]
 
 _EPOCH = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
 
@@ -145,12 +145,15 @@ class Machine:
     on_timer: None: timers run inside the machine, driven by ``advance(ms)``.  Or
               callable(name, start, ms, periodic): the host runs the timers (start=False stops
               one) and calls ``timer_expired(name)`` when one fires.
+    record:   callable(bytes) receiving the recording (one frame per call; SPEC 10), so a
+              ``Replay`` elsewhere (another process, the desk, a laptop) can follow the run
+              exactly.  Call ``record_keyframe()`` now and then so a viewer can join late.
     limits:   VM limits (stack_size, queue_size, budget, str_slots, str_len, ...), defaulting
               to the C VM's defaults so a script that runs here also runs there.
     """
 
     def __init__(self, program, *, externs=None, clock=None, on_event=None, on_fault=None,
-                 on_timer=None, on_log=None, **limits):
+                 on_timer=None, on_log=None, record=None, **limits):
         if isinstance(program, (bytes, bytearray, memoryview)):
             program = load(program)
         self.program = program
@@ -175,7 +178,7 @@ class Machine:
         self.vm = VM(program, {name: self._wrap(fn) for name, fn in externs.items()},
                      on_emit=self._emit, on_fault=self._fault,
                      on_timer=self._timer if on_timer else None, clock=self._now,
-                     on_log=self._log if on_log else None, **limits)
+                     on_log=self._log if on_log else None, record=record, **limits)
 
     # -- glue ---------------------------------------------------------------------------
     @staticmethod
@@ -263,6 +266,25 @@ class Machine:
         """Back to the initial values (globals, no state, empty queue).  Call ``start()`` again."""
         self.vm.reset()
 
+    # -- snapshots and recording ------------------------------------------------------------
+    def snapshot(self):
+        """The machine's state (current state, variables, timers) as bytes, while idle.
+        The C VM's fs_restore() accepts them too.  RuntimeError while a handler runs."""
+        return self.vm.snapshot()
+
+    def restore(self, data):
+        """Continue from a snapshot of this program (instead of ``start()``).  ValueError if
+        it is of another program or doesn't fit."""
+        self.vm.restore(data)
+
+    def record_keyframe(self):
+        """Recording: a keyframe, where a viewer can join the stream."""
+        self.vm.record_keyframe()
+
+    def record_flush(self):
+        """Recording: hand over the steps counted so far (before sending a batch)."""
+        self.vm.record_flush()
+
     # -- state ----------------------------------------------------------------------------
     @property
     def state(self):
@@ -294,3 +316,98 @@ class Machine:
 
     def __repr__(self):
         return "<Machine %s state=%s>" % (self.program.name or "program", self.state)
+
+
+class Replay:
+    """Follow a recorded run (from a ``Machine(record=...)`` or the C VM's record sink).
+
+        viewer = flowscript.Replay(program, on_log=..., on_event=...)
+        viewer.feed(frames)            # bytes as they arrive, in any chunks
+        viewer.state, viewer["aggression"], viewer.globals
+        flowscript.to_svg(program, state=viewer.state)
+
+    The program must be the one that was recorded (checked by the image's CRC-32: compile
+    the same source, or load the same .fsb).  The replay runs the program itself, so it
+    sees everything: states, variables, log lines, raised events, faults.  A viewer that
+    starts mid-stream waits for the next keyframe (``joined`` is False until then).
+    Callbacks take Python values, as ``Machine``'s: on_log(level, message, template, values),
+    on_event(name, args), on_fault(Fault), on_extern(name, args, result),
+    on_state(name) on every state change.
+    """
+
+    def __init__(self, program, *, on_log=None, on_event=None, on_fault=None, on_extern=None,
+                 on_state=None, **limits):
+        from . import record as R
+        if isinstance(program, (bytes, bytearray, memoryview)):
+            program = bytes(program)              # the exact image: its hash is the recorded one
+        self._on_fault = on_fault
+        self._on_state = on_state
+        self._last_state = None
+        self.faults = []
+        prog_obj = program if not isinstance(program, bytes) else load(program)
+        names = list(prog_obj.global_names) if getattr(prog_obj, "global_names", None) else []
+        self._globals = {n: i for i, n in enumerate(names) if n}
+        self.program = prog_obj
+
+        def log(vm, level, template, values):
+            message = V.format_log(template, values).decode("utf-8", "surrogateescape")
+            on_log(V.LOG_LEVELS[level], message, template, [_to_py(v) for v in values])
+
+        def fault(vm, code, pc):
+            line = 0
+            for p, ln, _n in getattr(prog_obj, "lines", None) or []:
+                if p > pc:
+                    break
+                line = ln
+            dbg = getattr(prog_obj, "debug_info", None)
+            r = dbg.routine_at(pc) if dbg is not None and pc >= 0 else None
+            f = Fault(code, pc, line if pc >= 0 else 0, r["name"] if r else None)
+            self.faults.append(f)
+            del self.faults[:-100]
+            if on_fault:
+                on_fault(f)
+
+        def step(_r):
+            st = self._rp.vm.state_name()
+            if st != self._last_state:
+                self._last_state = st
+                if on_state:
+                    on_state(st)
+
+        self._rp = R.Replay(program, on_log=log if on_log else None,
+                            on_emit=(lambda vm, n, a: on_event(n, [_to_py(x) for x in a])) if on_event else None,
+                            on_fault=fault,
+                            on_extern=(lambda n, a, r: on_extern(n, [_to_py(x) for x in a],
+                                                                   None if r is None or isinstance(r, Exception)
+                                                                   else _to_py(r))) if on_extern else None,
+                            on_step=step, **limits)
+
+    def feed(self, data):
+        """Apply recorded bytes (frames may be split anywhere between calls)."""
+        self._rp.feed(data)
+
+    @property
+    def joined(self):
+        """True once a START or KEYFRAME frame has been seen."""
+        return self._rp.started
+
+    @property
+    def state(self):
+        return self._rp.vm.state_name()
+
+    @property
+    def globals(self):
+        return {n: _to_py(self._rp.vm.globals[i]) for n, i in self._globals.items()}
+
+    def __getitem__(self, name):
+        if name not in self._globals:
+            raise KeyError("no global variable %r (or no global names: compile the source, or use a "
+                           ".fsb built with -g)" % name)
+        return _to_py(self._rp.vm.globals[self._globals[name]])
+
+    def snapshot(self):
+        """The followed machine's state, as the device would snapshot it."""
+        return self._rp.vm.snapshot()
+
+    def __repr__(self):
+        return "<Replay %s state=%s>" % (self.program.name or "program", self.state)

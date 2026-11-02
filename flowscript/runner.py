@@ -71,7 +71,8 @@ def show_args(args):
     return ",".join(V.show(a) for a in args)
 
 
-def run_scenario(prog, scenario_text, out):
+def run_scenario(prog, scenario_text, out, record=None):
+    """Run a scenario, writing the trace with out(line).  record: a sink for the recording."""
     stubs = {}
     clock = [0]
 
@@ -110,7 +111,8 @@ def run_scenario(prog, scenario_text, out):
     host_timers = any(c == "host_timers" for c, _a in cmds)
 
     vm = VM(prog, externs, on_emit=on_emit, on_fault=on_fault, on_log=on_log,
-            on_timer=on_timer if host_timers else None, clock=lambda vm: clock[0])
+            on_timer=on_timer if host_timers else None, clock=lambda vm: clock[0], record=record)
+    snap = [None]
     last_state = [None]
 
     def run():
@@ -154,6 +156,15 @@ def run_scenario(prog, scenario_text, out):
             dump()
         elif cmd == "host_timers":
             pass
+        elif cmd == "snapshot":
+            snap[0] = vm.snapshot()
+            out("snapshot " + snap[0].hex())
+        elif cmd == "restore":
+            vm.restore(snap[0])
+            last_state[0] = vm.state
+            out("restored")
+        elif cmd == "keyframe":
+            vm.record_keyframe()
         elif cmd == "fire":
             idx = vm.timer_index(args[0])
             if vm.timers[idx][0]:
@@ -163,5 +174,46 @@ def run_scenario(prog, scenario_text, out):
             run()
         else:
             raise ValueError("unknown scenario command %r" % cmd)
+    vm.record_flush()
     dump()
     return vm
+
+
+def replay_recording(prog, data, out, on_state=None):
+    """Replay a recording, writing the trace lines the program produces (as run_scenario
+    does for the same run, without the host's own lines: dump, snapshot, restored ...).
+    data: bytes, or an iterable of byte chunks (a stream: lines come as frames arrive).
+    on_state(name): called on every state change (e.g. to redraw a chart)."""
+    from .record import Replay
+
+    def on_extern(name, args, result):
+        if result is None:
+            out("call %s(%s)" % (name, show_args(args)))
+        elif isinstance(result, Exception):
+            if getattr(result, "value", None) is not None:      # a refused str result
+                out("call %s(%s) -> %s" % (name, show_args(args), V.show(result.value)))
+        else:
+            out("call %s(%s) -> %s" % (name, show_args(args), V.show(result)))
+
+    def on_timer(vm, i, start, ms, periodic):
+        name = prog.events[prog.timers[i]][0]
+        out("timer %s %s %d" % ("every" if periodic else "start", name, ms) if start else "timer stop %s" % name)
+
+    last_state = [None]
+
+    def on_step(_r):
+        if rp.vm.state != last_state[0]:
+            last_state[0] = rp.vm.state
+            out("state %s" % prog.states[rp.vm.state])
+            if on_state:
+                on_state(prog.states[rp.vm.state])
+
+    rp = Replay(prog, on_emit=lambda vm, n, a: out("emit %s(%s)" % (n, show_args(a))),
+                on_fault=lambda vm, c, pc: out("fault %d at %d" % (c, pc)),
+                on_log=lambda vm, lv, t, vals: out("log %s %s" % (V.LOG_LEVELS[lv], V.quote(V.format_log(t, vals)))),
+                on_timer=on_timer, on_extern=on_extern, on_step=on_step)
+    for chunk in ([data] if isinstance(data, (bytes, bytearray)) else data):
+        rp.feed(chunk)
+    for i, v in enumerate(rp.vm.globals):
+        out("global[%d] = %s" % (i, V.show(v)))
+    return rp

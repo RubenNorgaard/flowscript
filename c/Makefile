@@ -41,12 +41,12 @@ VARIANTS = fsrun-nofloat fsrun-notime-nostr fsrun-notext fsrun-min
 # every combination of the switches must compile without warnings
 switches:
 	@for a in "" -DFS_NO_FLOAT; do for b in "" -DFS_NO_TIME; do for c in "" -DFS_NO_STR; do \
-	 for d in "" -DFS_NO_TEXT; do f="$$a $$b $$c $$d"; \
+	 for d in "" -DFS_NO_TEXT; do for e in "" -DFS_NO_RECORD; do f="$$a $$b $$c $$d $$e"; \
 	  $(CC) -std=c99 -Wall -Wextra -pedantic -Werror -O2 -ffp-contract=off $$f -c -o /dev/null flowscript.c || exit 1; \
 	  $(CC) -std=c99 -Wall -Wextra -pedantic -Werror -O2 -ffp-contract=off $$f -c -o /dev/null fsrun.c || exit 1; \
-	done; done; done; done; \
+	done; done; done; done; done; \
 	$(CC) -std=c2x -Wall -Wextra -pedantic -Werror -O2 -ffp-contract=off -c -o /dev/null flowscript.c && \
-	echo "switches: all 16 combinations compile (C99), and the VM compiles as C23"
+	echo "switches: all 32 combinations compile (C99), and the VM compiles as C23"
 
 flowscript.o: flowscript.c flowscript.h
 	$(CC) -std=c99 -Wall -Wextra -pedantic -Werror -Os -ffp-contract=off -c -o $@ flowscript.c

@@ -8,7 +8,12 @@
   disasm   FILE.fs|FILE.fsb             print a disassembly
   fmt      FILE.fs [-w]                 print (or rewrite) in canonical format
   ast      FILE.fs                      print the visual model (AST JSON)
-  run      FILE.fs|FILE.fsb [SCENARIO]  run with stubbed externs, print trace
+  run      FILE.fs|FILE.fsb [SCENARIO] [--record OUT.rec]
+                                        run with stubbed externs, print trace (and record it)
+  replay   FILE.fs|FILE.fsb REC|- [--svg OUT.svg]
+                                        replay a recording (- : stream it from stdin, e.g. a
+                                        serial port) and print the trace; --svg redraws the
+                                        state diagram, current state highlighted, on changes
   mermaid  FILE.fs                      print a Mermaid flowchart
   migrate  FILE.fs [-w]                 rewrite a 0.1 program (any_state) for 0.2
   debug    FILE.fs [--port N]           start the 3-view web debugger
@@ -58,6 +63,11 @@ def main(argv=None):
     p = sub.add_parser("run")
     p.add_argument("file")
     p.add_argument("scenario", nargs="?")
+    p.add_argument("--record", help="write the recording (inputs) to this file")
+    p = sub.add_parser("replay")
+    p.add_argument("file")
+    p.add_argument("recording")
+    p.add_argument("--svg", help="keep this SVG file showing the current state")
     p = sub.add_parser("migrate")
     p.add_argument("file")
     p.add_argument("-w", "--write", action="store_true")
@@ -113,7 +123,44 @@ def main(argv=None):
             if args.scenario:
                 with open(args.scenario) as f:
                     text = f.read()
-            run_scenario(prog, text, print)
+            sink = None
+            if args.record:
+                rec = open(args.record, "wb")
+                sink = rec.write
+            run_scenario(prog, text, print, record=sink)
+            if args.record:
+                rec.close()
+        elif args.cmd == "replay":
+            from .runner import replay_recording
+            from .svg import to_svg
+            prog = load_program(args.file)
+            source = None
+            if not args.file.endswith(".fsb"):
+                with open(args.file) as f:
+                    source = f.read()
+            if args.svg and source is None:
+                raise FlowError("--svg needs the source (FILE.fs): bytecode has no flowchart")
+
+            def redraw(state):
+                tmp = args.svg + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(to_svg(source, "states", state=state))
+                os.replace(tmp, args.svg)            # a viewer never reads a half-written file
+
+            def chunks(fd):
+                while True:
+                    b = os.read(fd, 4096)
+                    if not b:
+                        return
+                    yield b
+
+            out = lambda line: print(line, flush=True)
+            on_state = redraw if args.svg else None
+            if args.recording == "-":
+                replay_recording(prog, chunks(sys.stdin.fileno()), out, on_state)
+            else:
+                with open(args.recording, "rb") as f:
+                    replay_recording(prog, f.read(), out, on_state)
         elif args.cmd == "migrate":
             from .migrate import migrate
             with open(args.file) as f:

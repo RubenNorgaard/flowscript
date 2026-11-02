@@ -49,11 +49,22 @@ class VM:
               timer_expired() when one fires; tick() then does nothing.
     """
 
-    def __init__(self, prog, externs=None, on_emit=None, on_fault=None, on_timer=None, on_log=None,
+    def __init__(self, prog, externs=None, on_emit=None, on_fault=None, on_timer=None, on_log=None, record=None,
                  stack_size=STACK_SIZE, max_frames=MAX_FRAMES, queue_size=QUEUE_SIZE, budget=BUDGET,
                  max_chain=MAX_CHAIN, str_slots=STR_SLOTS, str_len=STR_LEN, clock=None):
+        from . import record as R
         if isinstance(prog, (bytes, bytearray)):
+            self.image_hash = R.image_hash(prog)
             prog = Program.from_bytes(prog)
+            self.image_strings = prog.strings
+        elif getattr(prog, "image", None):     # loaded from bytes: those exact bytes
+            self.image_hash = R.image_hash(prog.image)
+            self.image_strings = prog.strings
+        else:
+            image = prog.to_bytes(debug=False)
+            self.image_hash = R.image_hash(image)
+            self.image_strings = None          # the image's string table, built when first needed
+            self._image = image
         self.prog = prog
         self.code = prog.code
         self.externs = externs or {}
@@ -72,12 +83,20 @@ class VM:
         self.bound = []
         for ext in prog.externs:
             self.bound.append(self.externs.get(ext[0]))
-        self.reset()
+        self.rec = None
+        self._reset()
+        self.rec = R.Recorder(self, record) if record else None
 
     def unbound_externs(self):
         return [self.prog.externs[i][0] for i, f in enumerate(self.bound) if f is None]
 
     def reset(self):
+        """Back to the initial values (globals, no state, empty queue).  Call start() again."""
+        self._reset()
+        if self.rec:
+            self.rec.reset()
+
+    def _reset(self):
         for i, t in enumerate(getattr(self, "timers", [])):
             if t[0] and self.on_timer:
                 self.on_timer(self, i, 0, 0, 0)
@@ -106,7 +125,41 @@ class VM:
         self.boot_pending = True
         if self.prog.states:
             self.pending = 0
+        if self.rec:
+            self.rec.start()
         return self
+
+    # -- snapshots and recording (record.py) ------------------------------------------------
+    def snapshot(self):
+        """The state while idle (state, globals, timers) as bytes; RuntimeError when busy."""
+        from . import record as R
+        return R.snapshot(self)
+
+    def restore(self, data):
+        """Resume from a snapshot of this image (instead of start()).  ValueError if it doesn't fit."""
+        from . import record as R
+        try:
+            R.restore(self, data)
+        except V.ValueFault as f:
+            raise ValueError("the snapshot's strings do not fit (fault %d)" % f.code)
+        if self.rec:
+            self.rec.keyframe()             # a recording says where the run continues from
+
+    def record_keyframe(self):
+        """Recording: a keyframe (session + snapshot), where a viewer can start replaying."""
+        if self.rec:
+            self.rec.keyframe()
+
+    def record_flush(self):
+        """Recording: hand over the steps counted so far (e.g. before sending a packet)."""
+        if self.rec:
+            self.rec.flush()
+
+    def string_table(self):
+        """The string table of the image as the C VM sees it (names and initial values included)."""
+        if self.image_strings is None:
+            self.image_strings = Program.from_bytes(self._image).strings
+        return self.image_strings
 
     def post(self, event, *args):
         """Queue an event. Arguments are converted to the event's parameter types (an int
@@ -117,8 +170,13 @@ class VM:
             if idx < 0:
                 raise KeyError("unknown event %r" % event)
             event = idx
+        return self._post(event, args, record=bool(self.rec))
+
+    def _post(self, event, args, record=False):
         pc = self.cur_pc if self.handler is not None else -1
         if len(self.queue) >= self.queue_size:
+            if record:
+                self.rec.postfail(7)
             self.report_fault(7, pc)
             return False
         _name, argc, ptypes = self.prog.events[event]
@@ -132,8 +190,12 @@ class VM:
             self.queue.remove(entry)
             if f.code == V.TYPE_MISMATCH:
                 raise TypeError("event %s: argument has the wrong type" % _name)
+            if record:
+                self.rec.postfail(f.code)
             self.report_fault(f.code, pc)
             return False
+        if record:
+            self.rec.post(event, entry[1])
         return True
 
     def host_value(self, v, t):
@@ -157,6 +219,8 @@ class VM:
     def set_global(self, index, value):
         """Debugger/host: set a global (converted to its current type)."""
         self.globals[index] = self.host_value(value, V.type_of(self.globals[index]))
+        if self.rec:
+            self.rec.setg(index, self.globals[index])
 
     # -- strings -------------------------------------------------------------------------
     def alloc(self, b):
@@ -202,9 +266,11 @@ class VM:
         t = self.timers[self.timer_index(timer)]
         if not t[0]:
             return False                        # stopped by the script meanwhile: ignore
+        if self.rec:
+            self.rec.expired(self.timer_index(timer))
         if not t[1]:
             t[0] = False
-        return self.post(self.prog.timers[self.timer_index(timer)])
+        return self._post(self.prog.timers[self.timer_index(timer)], ())
 
     def stop_timer(self, i):
         if self.timers[i][0]:
@@ -213,6 +279,8 @@ class VM:
                 self.on_timer(self, i, 0, 0, 0)
 
     def tick(self, ms):
+        if self.rec:
+            self.rec.tick(ms)
         if self.on_timer:
             return
         for i, t in enumerate(self.timers):
@@ -220,7 +288,7 @@ class VM:
                 continue
             t[3] -= ms
             if t[3] <= 0:
-                self.post(self.prog.timers[i])
+                self._post(self.prog.timers[i], ())
                 if t[1]:
                     t[3] += t[2]
                     if t[3] <= 0:
@@ -316,6 +384,8 @@ class VM:
                 or bool(self.queue) or any(t[0] and t[4] == LEAVING for t in self.timers))
 
     def step(self):
+        if self.rec:
+            self.rec.steps += 1
         if self.handler is None:
             if self.chain >= self.max_chain and self.has_work():
                 # the script keeps itself busy (goto_state/emit loop): drop the pending work
@@ -517,7 +587,11 @@ class VM:
                 try:
                     r = self.host_value(r, ret)
                 except V.ValueFault as f:
+                    if self.rec:
+                        self.rec.xfault(arg, f.code, r)
                     raise Fault(f.code)
+                if self.rec:
+                    self.rec.result(arg, r)
             del self.stack[len(self.stack) - argc:]
             push(r)
         elif name == "BUILTIN":
@@ -530,7 +604,7 @@ class VM:
             args = self.stack[len(self.stack) - argc:] if argc else []
             self.check_types(args, ptypes)
             try:
-                r = V.call_builtin(arg, args, (lambda: self.clock(self)) if self.clock else None)
+                r = V.call_builtin(arg, args, self._now)
             except V.ValueFault as f:
                 raise Fault(f.code)
             if isinstance(r, bytes):
@@ -554,7 +628,7 @@ class VM:
             self.check_types(args, ptypes)
             if self.on_emit:
                 self.on_emit(self, self.prog.events[arg][0], list(args))
-            self.post(arg, *args)
+            self._post(arg, args)
             del self.stack[len(self.stack) - argc:]
         elif name in ("TSTART", "TEVERY"):
             if arg >= len(self.timers):
@@ -599,6 +673,12 @@ class VM:
         if V.type_of(v) != INT:
             raise Fault(10)
         return v
+
+    def _now(self):
+        ms = V.wrap64(self.clock(self)) if self.clock else 0
+        if self.rec:
+            self.rec.clock(ms)
+        return ms
 
     def check_types(self, args, ptypes):
         for v, t in zip(args, ptypes):

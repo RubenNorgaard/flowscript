@@ -9,6 +9,8 @@
  * - typed values: fs_post with C strings and int -> float, wrong types, a string
  *   too long (FS_ERR_MEM + fault 12), an extern returning the wrong type (fault 10),
  *   fs_format / fs_parse_float / fs_parse_time, the clock
+ * - snapshots: fs_snapshot busy / too small / round trip, fs_restore errors
+ * - recording: frames arrive in pieces with end = 1 last, lengths are right
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +56,35 @@ static fs_value x_wrong(fs_vm *vm, const fs_value *args, int argc, void *user)
 {
     (void)vm; (void)args; (void)argc; (void)user;
     return fs_cstr("not a float");
+}
+
+/* recording sink: frames may come in pieces; check each frame's length prefix */
+static uint8_t rec_buf[4096];
+static int rec_len, rec_frames, rec_bad, rec_frame_start;
+static void x_record_sink(fs_vm *vm, const uint8_t *data, int len, int end, void *user)
+{
+    (void)vm; (void)user;
+    if (rec_len + len > (int)sizeof(rec_buf)) {
+        rec_bad++;
+        return;
+    }
+    memcpy(rec_buf + rec_len, data, (size_t)len);
+    rec_len += len;
+    if (end) {                          /* the whole frame is in: varint length + that many bytes */
+        int pos = rec_frame_start, shift = 0;
+        unsigned n = 0;
+        while (pos < rec_len) {
+            unsigned b = rec_buf[pos++];
+            n |= (b & 0x7Fu) << shift;
+            shift += 7;
+            if (!(b & 0x80u))
+                break;
+        }
+        if ((int)(pos + n) != rec_len)
+            rec_bad++;
+        rec_frames++;
+        rec_frame_start = rec_len;
+    }
 }
 
 static int64_t x_clock(fs_vm *vm, void *user)
@@ -260,6 +291,66 @@ int main(int argc, char **argv)
     fs_reset(&vm);                                    /* active timer: host is told to stop it */
     CHECK(t_calls == 1 && t_last_start == 0 && t_last_timer == 0);
     fs_set_timer_handler(&vm, NULL);
+
+    /* ---- snapshots ---- */
+    {
+        int ev_text = fs_event_id(&vm, "text");
+        uint8_t snap[512], small[8];
+        int n, m;
+        fs_value a[2];
+        fs_reset(&vm);
+        fs_start(&vm);
+        CHECK(fs_snapshot(&vm, snap, sizeof(snap)) == FS_ERR_BUSY);   /* boot is pending */
+        fs_run(&vm, 100000);
+        a[0] = fs_cstr("snap");
+        a[1] = fs_float(2.5);
+        CHECK(fs_post(&vm, ev_text, a, 2) == FS_OK);
+        fs_run(&vm, 100000);
+        n = fs_snapshot(&vm, NULL, 0);                                /* the size it needs */
+        CHECK(n > 14 && n < (int)sizeof(snap));
+        CHECK(fs_snapshot(&vm, small, sizeof(small)) == n);           /* too small: nothing written */
+        CHECK(fs_snapshot(&vm, snap, sizeof(snap)) == n);
+        CHECK(memcmp(snap, "FSNP", 4) == 0);
+        fs_reset(&vm);
+        CHECK(fs_restore(&vm, snap, (size_t)n) == FS_OK);
+        {
+            uint16_t sl = 0;
+            const char *t = fs_str(&vm, fs_global(&vm, 1), &sl);      /* last = echo("snap!") */
+            CHECK(t && strcmp(t, "snap!?") == 0 && fs_global(&vm, 2).as.f == 2.5);
+        }
+        m = fs_snapshot(&vm, small, 0);
+        CHECK(m == n);                                                /* the same state again */
+        CHECK(fs_restore(&vm, snap, (size_t)n - 1) == FS_ERR_TRUNCATED);
+        snap[6] ^= 1;
+        CHECK(fs_restore(&vm, snap, (size_t)n) == FS_ERR_IMAGE);
+        snap[6] ^= 1;
+        snap[0] = 'X';
+        CHECK(fs_restore(&vm, snap, (size_t)n) == FS_ERR_MAGIC);
+        snap[0] = 'F';
+        CHECK(fs_restore(&vm, snap, (size_t)n) == FS_OK);
+    }
+
+    /* ---- recording ---- */
+    {
+        int ev_text = fs_event_id(&vm, "text"), ev_noop = fs_event_id(&vm, "noop");
+        fs_value a[2];
+        fs_set_record_sink(&vm, x_record_sink);
+        fs_reset(&vm);
+        fs_start(&vm);
+        fs_run(&vm, 100000);
+        a[0] = fs_cstr("a text long enough for pieces of 32 bytes!");
+        a[1] = fs_int(3);                                             /* an int for a float */
+        CHECK(fs_post(&vm, ev_text, a, 2) == FS_OK);
+        fs_run(&vm, 100000);
+        CHECK(fs_record_keyframe(&vm) == FS_OK);
+        fs_post(&vm, ev_noop, NULL, 0);
+        CHECK(fs_record_keyframe(&vm) == FS_ERR_BUSY);               /* an event is waiting */
+        fs_run(&vm, 100000);
+        fs_record_flush(&vm);
+        /* reset, start, steps, post, steps(+result), keyframe, post, steps */
+        CHECK(rec_bad == 0 && rec_frames >= 7 && rec_len > 100);
+        fs_set_record_sink(&vm, NULL);
+    }
 
     if (failures) {
         printf("test_api: %d failures\n", failures);
