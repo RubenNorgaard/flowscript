@@ -1,5 +1,5 @@
 # Timers started by a state's handlers (or functions they call) stop when the
-# state is left; timers started by global handlers keep running.
+# state is left, also the ones its 'on boot' and shared handlers start.
 
 extern log(int x) -> int
 
@@ -15,17 +15,10 @@ timer keep
 func arm_helper():
   start helper every 300
 
-any_state:
+initial state a:
   on boot:
     start keep every 250
 
-  on arm:
-    start slow every 100
-
-  on keep:
-    log(9)
-
-initial state a:
   on enter:
     start blink every 100
 
@@ -48,6 +41,12 @@ initial state a:
   on exit:
     start late 50
 
+  on arm:
+    start slow every 100
+
+  on keep:
+    log(9)
+
 state b:
   on blink:
     log(10)
@@ -63,3 +62,9 @@ state b:
 
   on go(to):
     goto_state a
+
+  on arm:
+    start slow every 100
+
+  on keep:
+    log(9)

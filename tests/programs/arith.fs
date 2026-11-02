@@ -20,7 +20,7 @@ int fold_mul = 65536 * 65536
 int hex = 0xFFFFFFFF
 int last = 0
 
-any_state:
+state main:
   on calc(a, b):
     raise_event out(a + b, a - b, a * b, a & b, a | b, a ^ b, a == b, a < b)
     raise_event out(a <= b, a > b, a >= b, a != b, -a, ~b, a + 1, b - 1)

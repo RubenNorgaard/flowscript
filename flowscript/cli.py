@@ -10,6 +10,7 @@
   ast      FILE.fs                      print the visual model (AST JSON)
   run      FILE.fs|FILE.fsb [SCENARIO]  run with stubbed externs, print trace
   mermaid  FILE.fs                      print a Mermaid flowchart
+  migrate  FILE.fs [-w]                 rewrite a 0.1 program (any_state) for 0.2
   debug    FILE.fs [--port N]           start the 3-view web debugger
 """
 
@@ -57,6 +58,9 @@ def main(argv=None):
     p = sub.add_parser("run")
     p.add_argument("file")
     p.add_argument("scenario", nargs="?")
+    p = sub.add_parser("migrate")
+    p.add_argument("file")
+    p.add_argument("-w", "--write", action="store_true")
     p = sub.add_parser("mermaid")
     p.add_argument("file")
     p = sub.add_parser("debug")
@@ -110,6 +114,17 @@ def main(argv=None):
                 with open(args.scenario) as f:
                     text = f.read()
             run_scenario(prog, text, print)
+        elif args.cmd == "migrate":
+            from .migrate import migrate
+            with open(args.file) as f:
+                out, notes = migrate(f.read())
+            for n in notes:
+                print("%s: %s" % (args.file, n), file=sys.stderr)
+            if args.write:
+                with open(args.file, "w") as f:
+                    f.write(out)
+            else:
+                sys.stdout.write(out)
         elif args.cmd == "mermaid":
             from .mermaid import to_mermaid
             with open(args.file) as f:

@@ -13,7 +13,7 @@ event hoard(int n)
 str acc = ""
 str keep = "const"
 
-any_state:
+state main:
   on boot:
     say("a" + "b")
     say(keep + "!" + str(42))

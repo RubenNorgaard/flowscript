@@ -23,6 +23,7 @@ def tname(t):
 MAX_EVENT_ARGS = 8
 MAX_LOCALS = 32     # params + locals per routine; must stay well below the VM stack (64)
 MAX_PARAMS = 16
+MAX_RESULTS = 8   # values a function can return (the VMs accept up to 16)
 
 BIN_OPS = {
     "+": "ADD", "-": "SUB", "*": "MUL", "/": "DIV", "%": "MOD",
@@ -65,7 +66,7 @@ class Routine:
         self.locals = list(params)
         self.types = list(types)  # type code per local slot
         self.declared = set(params)
-        self.returns = returns    # functions: return type code or None
+        self.returns = returns    # functions: None, a type code, or a tuple of them (several results)
 
     def declare(self, name, t, node, comp):
         if name in self.locals:
@@ -107,7 +108,7 @@ class Compiler:
         self.funcs = {}     # name -> (index, argc, node, param types, return type or None)
         self.states = {}    # name -> index
         self.strings = {}
-        self.any_state = None   # the any_state item (handlers for every state)
+        self.in_boot = False    # compiling 'on boot' (runs before the initial state is entered)
         self.state_vars = {}    # state name -> {var name: global index}
         self.cur_state = None   # name of the state whose handler is being compiled
 
@@ -249,17 +250,12 @@ class Compiler:
             elif t == "func":
                 self.define(item["name"], t, item)
                 self.check_params(item["params"], item)
-                ret = self.type_code(item["returns"], item) if item.get("returns") else None
+                ret = self.result_types(item)
                 self.funcs[item["name"]] = (len(self.funcs), len(item["params"]), item,
                                             self.param_types(item), ret)
             elif t == "state":
                 self.define(item["name"], t, item)
                 self.states[item["name"]] = None   # numbered below: the initial state is 0
-            elif t == "any_state":
-                if self.any_state is not None:
-                    raise self.err("only one 'any_state' block is allowed (first one at line %d)"
-                                   % self.any_state["line"], item)
-                self.any_state = item
             else:
                 raise self.err("unknown declaration type '%s'" % t, item)
         # the initial state gets index 0, the VM's start state; the rest keep source order
@@ -292,6 +288,19 @@ class Compiler:
                 self.global_types.append(self.type_code(v.get("vtype") or "int", v))
                 p.global_names.append("%s.%s" % (item["name"], v["name"]))
 
+    def result_types(self, f):
+        """A function's results: None, one type code, or a tuple of codes ('-> float, int')."""
+        if not f.get("returns"):
+            return None
+        codes = tuple(self.type_code(t.strip(), f) for t in f["returns"].split(","))
+        if len(codes) > MAX_RESULTS:
+            raise self.err("a function returns at most %d values" % MAX_RESULTS, f)
+        return codes[0] if len(codes) == 1 else codes
+
+    @staticmethod
+    def n_results(ret):
+        return 0 if ret is None else len(ret) if isinstance(ret, tuple) else 1
+
     def global_index(self, name, node=None):
         """Slot of a state variable of the current state, else of a global, else None.
 
@@ -300,6 +309,9 @@ class Compiler:
         """
         own = self.state_vars.get(self.cur_state) or {}
         if name in own:
+            if self.in_boot:
+                raise self.err("'on boot' runs before '%s' is entered, and entering resets its variables: "
+                               "use '%s' in 'on enter' instead" % (self.cur_state, name), node)
             return own[name]
         if name in self.globals and self.routine.kind == "func":
             raise self.err("functions cannot use global variables: pass '%s' in as a parameter, "
@@ -435,10 +447,6 @@ class Compiler:
             t = item["type"]
             if t == "func":
                 func_offsets[item["name"]] = self.compile_func(item)
-            elif t == "any_state":
-                for h in item["handlers"]:
-                    if h["type"] != "comment":
-                        self.compile_handler(h, None, seen_handlers)
             elif t == "state":
                 for h in item["handlers"]:
                     if h["type"] == "comment":
@@ -447,7 +455,6 @@ class Compiler:
                 if self.state_vars[item["name"]] and \
                         (item["name"], EV_ENTER) not in seen_handlers:
                     self.compile_reset_handler(item)
-        self.shadow_warnings()
         self.magic_number_warnings()
         self.dbg.warnings.sort(key=lambda w: w["line"])
         p = self.prog
@@ -459,22 +466,6 @@ class Compiler:
         p.code = bytes(self.code)
         p.lines = [(pc, self.dbg.pc_line.get(pc, 0), nid) for pc, nid in sorted(self.dbg.pc_node.items())]
         return p
-
-    def shadow_warnings(self):
-        """A state handler silently replaces the any_state handler for the same event."""
-        if self.any_state is None:
-            return
-        anywhere = {h["event"]: h for h in self.any_state["handlers"] if h["type"] == "on"}
-        for item in self.ast["items"]:
-            if item["type"] != "state":
-                continue
-            for h in item["handlers"]:
-                if h["type"] == "on" and h["event"] in anywhere:
-                    self.dbg.warnings.append({
-                        "msg": "in state '%s', 'on %s' replaces the any_state handler (line %d), "
-                               "which then does not run in this state"
-                               % (item["name"], h["event"], anywhere[h["event"]]["line"]),
-                        "line": h["line"], "col": 1})
 
     MAGIC_OK = (-1, 0, 1)    # idioms, not magic: n > 0, x == 1, i != -1
 
@@ -504,7 +495,7 @@ class Compiler:
         for item in self.ast["items"]:
             if item["type"] == "func":
                 walk(item["body"])
-            elif item["type"] in ("state", "any_state"):
+            elif item["type"] == "state":
                 walk(item["handlers"])
 
     def begin_routine(self, kind, name, params, types, node, state=None, returns=None):
@@ -560,7 +551,11 @@ class Compiler:
         self.predeclare(f["body"], f)
         self.block(f["body"])
         if not self.ends_flow(f["body"]):
-            if ret is None or ret == INT:
+            if isinstance(ret, tuple):    # falling off the end returns the zero value of each result
+                for t in ret:
+                    self.push_const(V.zero(t), f)
+                self.emit("RETN", len(ret), node=f)
+            elif ret is None or ret == INT:
                 self.emit("RET0", node=f)
             else:               # falling off the end returns the zero value of the type
                 self.push_const(V.zero(ret), f)
@@ -572,13 +567,12 @@ class Compiler:
         ev = h["event"]
         sname = state["name"] if state else None
         if ev in ("enter", "exit"):
-            if state is None:
-                raise self.err("'on %s' is only allowed inside a state (any_state is never "
-                               "entered or left)" % ev, h)
             evi, argc, eparams, etypes = BUILTIN_EVENTS.index(ev), 0, [], []
         elif ev == "boot":
-            if state is not None:
-                raise self.err("'on boot' belongs in any_state", h)
+            if self.states[sname] != 0:
+                initial = next(n for n, i in self.states.items() if i == 0)
+                raise self.err("'on boot' goes in the initial state ('%s'): it runs once at start, "
+                               "before that state is entered" % initial, h)
             evi, argc, eparams, etypes = EV_BOOT, 0, [], []
         elif ev in self.events:
             evi, argc, eparams, etypes = self.events[ev]
@@ -606,15 +600,17 @@ class Compiler:
             self.routine.types.append(etypes[len(self.routine.locals)])
             self.routine.locals.append("$arg%d" % len(self.routine.locals))
         self.cur_state = sname
+        self.in_boot = ev == "boot"
         self.predeclare(h["body"], h)
         if ev == "enter":
             self.reset_state_vars(state)
         self.block(h["body"])
         self.cur_state = None
+        self.in_boot = False
         if not self.ends_flow(h["body"]):
             self.emit("RET0", node=h)
         nlocals = self.end_routine(start, h, sname)
-        self.prog.handlers.append((self.states[sname] if sname else None, evi, argc, nlocals, start))
+        self.prog.handlers.append((self.states[sname], evi, argc, nlocals, start))
 
     def reset_state_vars(self, state):
         """Entering a state sets its variables back to their initial values."""
@@ -702,8 +698,42 @@ class Compiler:
         self.emit("STOREL", idx, s)
 
     def stmt_call(self, s):
+        _kind, _idx, _pt, ret = self.call_target(s)
         self.call(s, s)
-        self.emit("POP", node=s)
+        for _ in range(max(1, self.n_results(ret))):    # a call without results pushes int 0
+            self.emit("POP", node=s)
+
+    def stmt_massign(self, s):
+        """a, b, c = f(...): the results of a function, assigned in order."""
+        call = s["value"]
+        targets = s["targets"]
+        if call.get("name") not in self.funcs:
+            raise self.err("'%s' is not a function of this program: only a func with several results "
+                           "can be assigned to several variables" % call.get("name"), s)
+        _kind, _idx, _pt, ret = self.call_target(call)
+        n = self.n_results(ret)
+        if n != len(targets):
+            raise self.err("'%s' returns %d value%s, but %d variable%s are assigned"
+                           % (call["name"], n, "" if n == 1 else "s", len(targets), "" if len(targets) == 1 else "s"), s)
+        dup = next((t for i, t in enumerate(targets) if t in targets[:i]), None)
+        if dup:
+            raise self.err("'%s' is assigned twice" % dup, s)
+        ttypes = [self.target_type(t, s) for t in targets]
+        self.track(call)
+        self.call(call, s)
+        r = self.routine
+        for name, tt, rt in reversed(list(zip(targets, ttypes, ret))):     # the last result is on top
+            if rt != tt:
+                if rt == INT and tt == FLOAT:
+                    self.emit("BUILTIN", 0, node=s)                       # float(int)
+                else:
+                    raise self.err("'%s' is %s, but result %d of %s() is %s"
+                                   % (name, TYPE_NAMES[tt], targets.index(name) + 1, call["name"],
+                                      TYPE_NAMES[rt]), s)
+            if name in r.locals and r.visible(name):
+                self.emit("STOREL", r.locals.index(name), s)
+            else:
+                self.emit("STOREG", self.global_index(name, s), s)
 
     def stmt_if(self, s):
         end = Label()
@@ -769,9 +799,24 @@ class Compiler:
 
     def stmt_return(self, s):
         v = s.get("value")
+        ret = self.routine.returns
+        if s.get("values"):
+            if self.routine.kind == "handler":
+                raise self.err("event handlers cannot return a value", s)
+            n = self.n_results(ret)
+            if not isinstance(ret, tuple) or n != len(s["values"]):
+                raise self.err("'%s' returns %d value%s, not %d" % (self.routine.name, n, "" if n == 1 else "s",
+                                                                    len(s["values"])), s)
+            for i, (e, t) in enumerate(zip(s["values"], ret)):
+                self.expr(e, t, "result %d of '%s' is %s:" % (i + 1, self.routine.name, TYPE_NAMES[t]))
+            self.emit("RETN", len(ret), node=s)
+            return
+        if isinstance(ret, tuple):
+            raise self.err("'%s' returns %d values: return %s" % (self.routine.name, len(ret),
+                                                              ", ".join("..." for _ in ret)), s)
         if v is None:
-            if self.routine.kind == "func" and self.routine.returns is not None:
-                raise self.err("'%s' must return a %s value" % (self.routine.name, TYPE_NAMES[self.routine.returns]), s)
+            if self.routine.kind == "func" and ret is not None:
+                raise self.err("'%s' must return a %s value" % (self.routine.name, TYPE_NAMES[ret]), s)
             self.emit("RET0", node=s)
             return
         if self.routine.kind == "handler":
@@ -802,7 +847,12 @@ class Compiler:
         if t == "name":
             return self.var_type(e["name"], e)
         if t in ("callx", "call"):
-            return self.call_target(e)[3]
+            ret = self.call_target(e)[3]
+            if isinstance(ret, tuple):
+                raise self.err("'%s' returns %d values: assign them with %s = %s(...)"
+                               % (e["name"], len(ret), ", ".join("abcdefgh"[i] for i in range(len(ret))),
+                                  e["name"]), e)
+            return ret
         if t == "unary":
             ot = self.value_type(e["operand"])
             if e["op"] == "-" and ot in (INT, FLOAT):

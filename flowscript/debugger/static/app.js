@@ -32,7 +32,7 @@
   }
 
   // ------------------------------------------------------------------ source editor
-  const KW = new Set("flow version extern event timer const int float str time func on state initial any_state pass if elif else while goto_state raise_event start every stop return and or xor not true false".split(" "));
+  const KW = new Set("flow version extern event timer const int float str time func on state initial pass if elif else while goto_state raise_event start every stop return and or xor not true false".split(" "));
   function highlightLine(line) {
     let out = "";
     const re = /(#.*$)|("(?:[^"\\]|\\.)*"?)|(\b\d[\w]*(?:\.\d[\d_]*)?(?:[eE][-+]?\d+)?\b)|([A-Za-z_]\w*)(\s*\()?|(->|==|!=|<=|>=|<<|>>|[-+*/%&|^~<>=(),:])|(\s+)|(.)/g;

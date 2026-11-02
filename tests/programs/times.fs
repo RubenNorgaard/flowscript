@@ -15,7 +15,7 @@ const NEWYEAR = time("2026-01-01T00:00:00Z")
 
 time last = time(2000, 2, 29, 12, 30, 15)
 
-any_state:
+state main:
   on boot:
     show(EPOCH)
     show(NEWYEAR + 1500)

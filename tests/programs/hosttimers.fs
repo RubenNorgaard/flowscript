@@ -10,17 +10,10 @@ timer beat
 timer once
 timer local
 
-any_state:
+initial state idle:
   on boot:
     start beat every 1s
 
-  on beat:
-    log(1)
-
-  on halt:
-    stop beat
-
-initial state idle:
   on enter:
     start once 500
     start local every 200
@@ -34,6 +27,12 @@ initial state idle:
   on go:
     goto_state busy
 
+  on beat:
+    log(1)
+
+  on halt:
+    stop beat
+
 state busy:
   on enter:
     start once 100
@@ -41,3 +40,9 @@ state busy:
   on once:
     log(4)
     goto_state idle
+
+  on beat:
+    log(1)
+
+  on halt:
+    stop beat

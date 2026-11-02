@@ -41,8 +41,7 @@ THEMES = {
         "n-goto": "#5a2c3a", "n-emit": "#2a4b55", "n-timer": "#3d4423", "n-ret": "#3a3a3a",
         "n-ev": "#55401f", "n-note": "#2a2d33", "n-end": "#444a55", "n-leaf": "#222833",
         "n-gate": "#2a303c", "decl-bg": "#1b1f27", "state": "#3d5a80", "state-title": "#9ec5ff",
-        "state-fill": "rgba(90,169,255,.04)", "any": "#7a68b8", "any-title": "#c3b5ff",
-        "any-fill": "rgba(160,130,255,.04)", "sd-fill": "#22324a", "sd-stroke": "#5a7fb0",
+        "state-fill": "rgba(90,169,255,.04)", "sd-fill": "#22324a", "sd-stroke": "#5a7fb0",
         "cur-fill": "rgba(255,204,77,.08)",
     },
     "light": {
@@ -53,8 +52,7 @@ THEMES = {
         "n-goto": "#f6dde2", "n-emit": "#d9eef2", "n-timer": "#ebefd6", "n-ret": "#e6e6e6",
         "n-ev": "#f7e4c6", "n-note": "#f5f6f8", "n-end": "#d7dbe2", "n-leaf": "#f1f3f6",
         "n-gate": "#e4e8ee", "decl-bg": "#f7f8fa", "state": "#8fb0d8", "state-title": "#2357a0",
-        "state-fill": "rgba(31,111,209,.04)", "any": "#8f7fd0", "any-title": "#5a46b0",
-        "any-fill": "rgba(110,90,200,.04)", "sd-fill": "#e3edf9", "sd-stroke": "#6f95c8",
+        "state-fill": "rgba(31,111,209,.04)", "sd-fill": "#e3edf9", "sd-stroke": "#6f95c8",
         "cur-fill": "rgba(201,138,0,.10)",
     },
 }
@@ -294,6 +292,10 @@ class _Chart:
         E = expr_to_str
         if t == "assign":
             return self.node(s, "proc", "%s = %s" % (s["target"], E(s["value"])))
+        if t == "massign":
+            v = s["value"]
+            return self.node(s, "sub" if v["name"] in self.funcs else "io",
+                             "%s = %s" % (", ".join(s["targets"]), E(v)))
         if t == "local":
             return self.node(s, "proc", "%s %s%s" % (s.get("vtype") or "int", s["name"],
                                                      " = " + E(s["value"]) if s.get("value") else ""))
@@ -302,7 +304,8 @@ class _Chart:
         if t == "goto":
             return self.node(s, "goto", "⇒ " + s["state"], term=True, min_w=80)
         if t == "return":
-            return self.node(s, "ret", "return" + (" " + E(s["value"]) if s.get("value") else ""),
+            vs = s.get("values") or ([s["value"]] if s.get("value") else [])
+            return self.node(s, "ret", "return" + (" " + ", ".join(E(v) for v in vs) if vs else ""),
                              term=True, min_w=70)
         if t == "emit":
             args = s.get("args") or []
@@ -477,7 +480,6 @@ class _Chart:
         width = 0
         items = self.ast["items"]
         states = [i for i in items if i["type"] == "state"]
-        any_state = next((i for i in items if i["type"] == "any_state"), None)
         name = self.ast.get("name")
         title = "flow %s%s" % (name, " v%d" % self.ast["version"] if self.ast.get("version") else "") if name else "program"
         self.P('<text class="sec-title" x="%s" y="%s">%s</text>' % (M, y + 4, _esc(title)))
@@ -502,30 +504,23 @@ class _Chart:
         y += row_h + 36
 
         start = next((s for s in states if s.get("initial")), states[0] if states else None)
-        containers = ([(True, any_state)] if any_state else []) + [(False, s) for s in states]
-        for is_any, st in containers:
+        for st in states:
             handlers = [self.routine(h) for h in st["handlers"] if h["type"] == "on"]
             svars = [v for v in st.get("vars") or [] if v["type"] == "var"]
             notes = [h for h in (st.get("vars") or []) + st["handlers"] if h["type"] == "comment"]
             top, pad = y, 18
             sx, sh = M + pad, 0
-            cur = not is_any and self.cur_state == st["name"]
+            cur = self.cur_state == st["name"]
             title_y = top + 22
             box_at = len(self.out)
             self.P("")
-            if is_any:
-                self.P('<text class="state-title any-title" x="%s" y="%s">any_state</text>'
-                       '<text class="small" x="%s" y="%s">handlers for every state · a state\'s own '
-                       'handler for the same event takes precedence</text>'
-                       % (M + pad, title_y, _f(M + pad + _tw("any_state") * 1.25 + 18), title_y))
-            else:
-                is_start = st is start
-                self.P('<text class="state-title" x="%s" y="%s">%sstate %s%s</text>'
-                       % (M + pad + (18 if is_start else 0), title_y, "initial " if st.get("initial") else "",
-                          _esc(st["name"]), "  ◀ current" if cur else ""))
-                if is_start:
-                    self.P('<circle class="initial" cx="%s" cy="%s" r="5"><title>initial state</title></circle>'
-                           % (M + pad + 5, title_y - 5))
+            is_start = st is start
+            self.P('<text class="state-title" x="%s" y="%s">%sstate %s%s</text>'
+                   % (M + pad + (18 if is_start else 0), title_y, "initial " if st.get("initial") else "",
+                      _esc(st["name"]), "  \u25c0 current" if cur else ""))
+            if is_start:
+                self.P('<circle class="initial" cx="%s" cy="%s" r="5"><title>initial state</title></circle>'
+                       % (M + pad + 5, title_y - 5))
             iy = top + 36
             if svars:
                 rows = [(v.get("vtype") or "int",
@@ -543,15 +538,11 @@ class _Chart:
                 R.draw(sx + R.l, iy)
                 sx += R.l + R.r + 36
                 sh = max(sh, R.h)
-            bw = max(sx - M - 36 + pad + 18, 560 if is_any else 260)
+            bw = max(sx - M - 36 + pad + 18, 260)
             bh = sh + 36 + 18
-            if is_any:
-                self.out[box_at] = ('<rect class="state-box any-box" x="%s" y="%s" width="%s" height="%s" rx="12"/>'
-                                    % (M, top, _f(bw), _f(bh)))
-            else:
-                self.out[box_at] = ('<g class="state%s" data-state="%s"><rect class="state-box" x="%s" y="%s" '
-                                    'width="%s" height="%s" rx="12"/></g>'
-                                    % (" cur" if cur else "", _esc(st["name"]), M, top, _f(bw), _f(bh)))
+            self.out[box_at] = ('<g class="state%s" data-state="%s"><rect class="state-box" x="%s" y="%s" '
+                                'width="%s" height="%s" rx="12"/></g>'
+                                % (" cur" if cur else "", _esc(st["name"]), M, top, _f(bw), _f(bh)))
             width = max(width, M + bw)
             y += bh + 26
         return math.ceil(width + M), math.ceil(y + M)
@@ -570,7 +561,6 @@ class _Chart:
         for i, s in enumerate(states):
             a = -math.pi / 2 + i * 2 * math.pi / n + (math.pi / 2 if n == 2 else 0)
             pos[s["name"]] = (cx0 + ring * math.cos(a), cy0 + ring * math.sin(a))
-        anyp = (70, 40)
         edges = {}
 
         def gotos(stmts, acc):
@@ -588,21 +578,13 @@ class _Chart:
         def add(frm, to, label):
             edges.setdefault((frm, to), []).append(label)
 
-        any_state = next((i for i in items if i["type"] == "any_state"), None)
-        any_handlers = [h for h in any_state["handlers"] if h["type"] == "on"] if any_state else []
         W, H = math.ceil(cx0 * 2 + 40), math.ceil(cy0 + ring + RAD + 60)
-        if any_state:
-            self.P('<rect class="any-frame" x="8" y="12" width="%s" height="%s" rx="16">'
-                   '<title>any_state: its handlers apply in every state</title></rect>' % (W - 16, H - 20))
         for st in states:
             for h in st["handlers"]:
                 if h["type"] == "on":
                     for g in gotos(h["body"], []):
                         add(st["name"], g["state"], h["event"])
-        for h in any_handlers:
-            for g in gotos(h["body"], []):
-                add("*", g["state"], h["event"])
-        pt = lambda name: anyp if name == "*" else pos.get(name)
+        pt = pos.get
         arr = self.marker("arr2")
         for (frm, to), labels in edges.items():
             a, b = pt(frm), pt(to)
@@ -621,20 +603,13 @@ class _Chart:
             d = math.hypot(dx, dy) or 1
             ux, uy = dx / d, dy / d
             nx, ny = -uy, ux
-            r0, r1 = (8 if frm == "*" else RAD), RAD + 2
+            r0, r1 = RAD, RAD + 2
             sx, sy = a[0] + ux * r0 + nx * 10, a[1] + uy * r0 + ny * 10
             ex, ey = b[0] - ux * r1 + nx * 10, b[1] - uy * r1 + ny * 10
             mx, my = (sx + ex) / 2 + nx * 26, (sy + ey) / 2 + ny * 26
             self.P('<path class="sd-edge" d="M%s %s Q%s %s %s %s" marker-end="%s"/>'
                    % (_f(sx), _f(sy), _f(mx), _f(my), _f(ex), _f(ey), arr))
             self.P('<text class="sd-label" x="%s" y="%s" text-anchor="middle">%s</text>' % (_f(mx), _f(my), label))
-        if any_state:
-            self.P('<rect class="any-tag" x="%s" y="%s" width="100" height="28" rx="6"/>'
-                   '<text class="any-tag-text" x="%s" y="%s" text-anchor="middle">any_state</text>'
-                   % (anyp[0] - 50, anyp[1] - 14, anyp[0], anyp[1] + 4))
-            evs = " · ".join(h["event"] for h in any_handlers)
-            if evs:
-                self.P('<text class="small" x="%s" y="%s">%s</text>' % (anyp[0] + 60, anyp[1] + 4, _esc(_clip(evs, 60))))
         start = next((s for s in states if s.get("initial")), states[0])
         for s in states:
             x, y = pos[s["name"]]
@@ -678,11 +653,6 @@ _RULES = """
 .fs-chart .state.cur .state-box{stroke:var(--fs-cur);stroke-width:2.5;fill:var(--fs-cur-fill)}
 .fs-chart .state-title{font-size:14px;font-weight:bold;fill:var(--fs-state-title)}
 .fs-chart .state.cur+.state-title{fill:var(--fs-cur)}
-.fs-chart .any-box{fill:var(--fs-any-fill);stroke:var(--fs-any);stroke-dasharray:6 4}
-.fs-chart .any-title{fill:var(--fs-any-title)}
-.fs-chart .any-frame{fill:var(--fs-any-fill);stroke:var(--fs-any);stroke-width:1.5;stroke-dasharray:6 4}
-.fs-chart .any-tag{fill:var(--fs-decl-bg);stroke:var(--fs-any)}
-.fs-chart .any-tag-text{font-weight:bold;fill:var(--fs-any-title)}
 .fs-chart .initial{fill:var(--fs-fg)}
 .fs-chart .sd-state>.sh{fill:var(--fs-sd-fill);stroke:var(--fs-sd-stroke);stroke-width:2}
 .fs-chart .sd-state.cur>.sh{fill:var(--fs-cur-fill);stroke:var(--fs-cur);stroke-width:3}

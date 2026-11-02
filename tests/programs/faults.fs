@@ -65,7 +65,7 @@ func lots_rec(int n) -> int:
     return lots_rec(n - 1)
   return lots()
 
-any_state:
+state main:
   on recurse(n):
     counter = 100
     ping(rec(n))

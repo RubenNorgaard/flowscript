@@ -21,7 +21,7 @@ enum {
     OP_EQ = 0x30, OP_NE = 0x31, OP_LT = 0x32, OP_LE = 0x33, OP_GT = 0x34, OP_GE = 0x35,
     OP_NOT = 0x36, OP_BOOL = 0x37,
     OP_JMP = 0x40, OP_JZ = 0x41, OP_JNZ = 0x42,
-    OP_CALL = 0x50, OP_RET = 0x51, OP_RET0 = 0x52, OP_XCALL = 0x53, OP_BUILTIN = 0x54,
+    OP_CALL = 0x50, OP_RET = 0x51, OP_RET0 = 0x52, OP_XCALL = 0x53, OP_BUILTIN = 0x54, OP_RETN = 0x55,
     OP_GOTO = 0x60, OP_EMIT = 0x61, OP_TSTART = 0x62, OP_TEVERY = 0x63, OP_TSTOP = 0x64
 };
 
@@ -657,7 +657,7 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
         return img ? FS_ERR_MAGIC : FS_ERR_ARG;
     if (memcmp(img, "FSB1", 4) != 0)
         return FS_ERR_MAGIC;
-    if (rd16(img + 4) != 2)
+    if (rd16(img + 4) != 3)
         return FS_ERR_VERSION;
     flags = rd16(img + 6);
     if (((flags & 2u) && !FS_HAS_FLOAT) || ((flags & 4u) && !FS_HAS_TIME) ||
@@ -1338,12 +1338,31 @@ static void begin(fs_vm *vm, int h, const fs_qentry *e)
     vm->steps = 0;
 }
 
+#define OWNER_LEAVING (-2)      /* timer owner while its state is being left (see dispatch) */
+#define MAX_RESULTS 16          /* RETN operand limit (the compiler allows 8) */
+
+/* Timers of a state being left whose new state's 'on enter' did not start them again. */
+static int leaving_timers(const fs_vm *vm)
+{
+    unsigned i;
+    for (i = 0; i < vm->n_timers; i++)
+        if (vm->timers[i].active && vm->timers[i].owner == OWNER_LEAVING)
+            return 1;
+    return 0;
+}
+
 static int dispatch(fs_vm *vm)
 {
     int h;
+    unsigned i;
+    /* A transition marked the old state's timers OWNER_LEAVING; the new state's 'on enter'
+     * has run (or there was none), so the ones it did not start again stop now. */
+    for (i = 0; i < vm->n_timers; i++)
+        if (vm->timers[i].active && vm->timers[i].owner == OWNER_LEAVING)
+            timer_stop(vm, i);
     if (vm->boot_pending) {
         vm->boot_pending = 0;
-        h = find_handler(vm, -1, EV_BOOT);
+        h = find_handler(vm, vm->n_states ? 0 : -1, EV_BOOT);   /* 'on boot' lives in the initial state */
         if (h >= 0) {
             begin(vm, h, NULL);
             return 1;
@@ -1362,12 +1381,14 @@ static int dispatch(fs_vm *vm)
         }
     }
     if (vm->transition >= 0) {
-        if (vm->state >= 0) {               /* leaving: stop the old state's timers */
-            unsigned i;
+        /* Leaving: the old state's timers stop once the new state has been entered, unless
+         * its 'on enter' starts them again (a periodic timer restarted with the same period
+         * keeps running).  Before the first entry they belong to the initial state ('on boot'). */
+        int old = vm->state >= 0 ? vm->state : 0;
+        if (!(vm->state < 0 && vm->transition == old))
             for (i = 0; i < vm->n_timers; i++)
-                if (vm->timers[i].owner == vm->state)
-                    timer_stop(vm, i);
-        }
+                if (vm->timers[i].active && vm->timers[i].owner == old)
+                    vm->timers[i].owner = OWNER_LEAVING;
         vm->state = vm->transition;
         vm->transition = -1;
         h = find_handler(vm, vm->state, EV_ENTER);
@@ -1752,7 +1773,7 @@ static int execute(fs_vm *vm)
     case OP_NOT: case OP_BOOL: case OP_RET: case OP_RET0: case OP_CONCAT:
         npc = pc + 1;
         break;
-    case OP_PUSH8: case OP_LOADL: case OP_STOREL: case OP_BUILTIN:
+    case OP_PUSH8: case OP_LOADL: case OP_STOREL: case OP_BUILTIN: case OP_RETN:
         if ((uint32_t)pc + 2 > csize)
             FAULT(FS_FAULT_BAD_OPCODE);
         arg = code[pc + 1];
@@ -1916,6 +1937,29 @@ static int execute(fs_vm *vm)
         vm->pc = rd16(f + 4);
         break;
     }
+    case OP_RETN: {         /* return several results, in order */
+        fs_value res[MAX_RESULTS];
+        const fs_frame *fr;
+        int n = (int)arg, i;
+        if (n > MAX_RESULTS)
+            FAULT(FS_FAULT_BAD_OPCODE);
+        if (vm->sp < n)
+            FAULT(FS_FAULT_STACK_UNDERFLOW);
+        for (i = 0; i < n; i++)
+            res[i] = SLOT(vm->sp - n + i);
+        vm->sp -= n;
+        fr = &vm->frames[--vm->nframes];
+        if (vm->sp > fr->base)
+            vm->sp = fr->base;
+        if (vm->nframes == 0) {
+            finish(vm);
+            return FS_DONE;
+        }
+        vm->pc = fr->ret_pc;
+        for (i = 0; i < n; i++)
+            PUSH(res[i]);
+        break;
+    }
     case OP_RET:
     case OP_RET0: {
         const fs_frame *fr;
@@ -2023,6 +2067,11 @@ static int execute(fs_vm *vm)
             FAULT(FS_FAULT_BAD_OPCODE);
         POPINT(iv);
         t = &vm->timers[arg];
+        if (op == OP_TEVERY && t->active && t->periodic && t->period == iv) {
+            /* already running with this period: keep it (and its phase) */
+            t->owner = (int16_t)handler_state(vm, vm->handler);
+            break;
+        }
         t->active = 1;
         t->periodic = op == OP_TEVERY;
         t->period = iv;
@@ -2055,7 +2104,8 @@ int fs_step(fs_vm *vm)
         return FS_IDLE;
     if (vm->handler < 0) {
         if (vm->chain >= FS_MAX_CHAIN && (vm->boot_pending || vm->pending >= 0 ||
-                                          vm->transition >= 0 || vm->q_count > 0)) {
+                                          vm->transition >= 0 || vm->q_count > 0 ||
+                                          leaving_timers(vm))) {
             /* the script keeps itself busy (goto_state/emit loop): drop the pending work */
             vm->boot_pending = 0;
             vm->pending = vm->transition = -1;

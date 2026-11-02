@@ -16,17 +16,13 @@ func jump(int n) -> int:
     goto_state c
   return n
 
-any_state:
+initial state a:
   on boot:
     log(1)
     # selects the initial state instead of the first declared one
     goto_state b
     log(999)
 
-  on poke:
-    log(50)
-
-initial state a:
   on enter:
     log(10)
 
@@ -39,6 +35,9 @@ initial state a:
   on go(n):
     log(jump(n))
     log(12)
+
+  on poke:
+    log(50)
 
 state b:
   on enter:
@@ -63,6 +62,9 @@ state b:
     else:
       log(jump(n))
 
+  on poke:
+    log(50)
+
 state c:
   on enter:
     log(30)
@@ -73,6 +75,6 @@ state c:
   on go(n):
     goto_state a
 
-  # state handler overrides the global one
+  # this state's own version of the handler
   on poke:
     log(31)

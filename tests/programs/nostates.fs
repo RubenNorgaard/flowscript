@@ -3,7 +3,7 @@ extern log(int x) -> int
 
 int g = -5
 
-any_state:
+state main:
   on boot:
     log(g)
     g = g * 3

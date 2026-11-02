@@ -61,9 +61,13 @@ class _M:
         if t == "goto":
             return self.node("goto", "goto_state " + s["state"]), []
         if t == "return":
-            return self.node("term", "return" + (" " + expr_to_str(s["value"]) if s.get("value") else "")), []
+            vs = s.get("values") or ([s["value"]] if s.get("value") else [])
+            return self.node("term", "return" + (" " + ", ".join(expr_to_str(v) for v in vs) if vs else "")), []
         if t == "assign":
             n = self.node("proc", "%s = %s" % (s["target"], expr_to_str(s["value"])))
+        elif t == "massign":
+            n = self.node("sub" if s["value"]["name"] in funcs else "io",
+                          "%s = %s" % (", ".join(s["targets"]), expr_to_str(s["value"])))
         elif t == "local":
             n = self.node("proc", "%s %s" % (s.get("vtype") or "int", s["name"]) + (" = " + expr_to_str(s["value"]) if s.get("value") else ""))
         elif t == "call":
@@ -94,12 +98,6 @@ def to_mermaid(ast):
             m.routine(it, funcs, "func %s(%s)%s" % (it["name"], params, (" -> " + it["returns"]) if it.get("returns") else ""))
         elif it["type"] == "on":
             m.routine(it, funcs, "on " + it["event"])
-        elif it["type"] == "any_state":
-            m.lines.append("  subgraph any_state [any_state]")
-            for h in it["handlers"]:
-                if h["type"] == "on":
-                    m.routine(h, funcs, "on " + h["event"])
-            m.lines.append("  end")
         elif it["type"] == "state":
             m.lines.append("  subgraph %s [state %s]" % ("s_" + it["name"], it["name"]))
             for h in it["handlers"]:

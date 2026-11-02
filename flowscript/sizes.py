@@ -148,7 +148,24 @@ def _routines(prog):
     return res
 
 
-def _local_peak(prog, start, nlocals):
+def _func_results(prog):
+    """Values each function leaves on its caller's stack: n for RETN n, else 1 (RET0 pushes 0)."""
+    starts = sorted({f[3] for f in prog.funcs} | {h[4] for h in prog.handlers} | {len(prog.code)})
+    out = []
+    for f in prog.funcs:
+        end = next((x for x in starts if x > f[3]), len(prog.code))
+        n, pc = 1, f[3]
+        while pc < end:
+            name, arg, size = decode(prog.code, pc)
+            if name == "RETN":
+                n = arg
+                break
+            pc += size
+        out.append(n)
+    return out
+
+
+def _local_peak(prog, start, nlocals, results=None):
     """Walk one routine. Returns (peak depth relative to its base, call sites).
 
     call sites: [(depth_before_call, func_index)].
@@ -166,13 +183,13 @@ def _local_peak(prog, start, nlocals):
             seen[pc] = d
             name, arg, size = decode(code, pc)
             npc = pc + size
-            if name in ("RET", "RET0", "GOTO", "???"):
+            if name in ("RET", "RET0", "RETN", "GOTO", "???"):
                 break
             if name == "CALL":
                 if arg >= len(prog.funcs):
                     break
                 calls.append((d, arg))
-                d = d - prog.funcs[arg][1] + 1
+                d = d - prog.funcs[arg][1] + (results[arg] if results else 1)
             elif name == "XCALL":
                 if arg >= len(prog.externs):
                     break
@@ -199,8 +216,9 @@ def _local_peak(prog, start, nlocals):
 def stack_analysis(prog):
     """Worst-case stack slots and call frames per routine (None = unbounded: recursion)."""
     funcs = {}
+    results = _func_results(prog)
     for i, (name, argc, nlocals, off) in enumerate(prog.funcs):
-        funcs[i] = _local_peak(prog, off, nlocals)
+        funcs[i] = _local_peak(prog, off, nlocals, results)
     memo = {}
 
     def total(i, path=()):
@@ -227,7 +245,7 @@ def stack_analysis(prog):
             idx = [i for i, f in enumerate(prog.funcs) if f[3] == start and f[0] == name][0]
             t = total(idx)
         else:
-            peak, calls = _local_peak(prog, start, nlocals)
+            peak, calls = _local_peak(prog, start, nlocals, results)
             frames = 1
             t = (peak, frames)
             for d, callee in calls:

@@ -235,13 +235,20 @@ const FC = (function () {
   function stmtLayout(s) {
     switch (s.type) {
       case "assign": return nodeLayout(s, "proc", s.target + " = " + exprStr(s.value));
+      case "massign": {
+        const isFunc = (OPTS.funcs || new Set()).has(s.value.name);
+        return nodeLayout(s, isFunc ? "sub" : "io", s.targets.join(", ") + " = " + exprStr(s.value));
+      }
       case "local": return nodeLayout(s, "proc", (s.vtype || "int") + " " + s.name + (s.value ? " = " + exprStr(s.value) : ""));
       case "call": {
         const isFunc = (OPTS.funcs || new Set()).has(s.name);
         return nodeLayout(s, isFunc ? "sub" : "io", exprStr(s));
       }
       case "goto": return nodeLayout(s, "goto", "⇒ " + s.state, { term: true, minW: 80 });
-      case "return": return nodeLayout(s, "ret", "return" + (s.value ? " " + exprStr(s.value) : ""), { term: true, minW: 70 });
+      case "return": {
+        const vs = s.values || (s.value ? [s.value] : []);
+        return nodeLayout(s, "ret", "return" + (vs.length ? " " + vs.map(exprStr).join(", ") : ""), { term: true, minW: 70 });
+      }
       case "emit": return nodeLayout(s, "emit", "raise_event " + s.event + ((s.args || []).length ? "(" + s.args.map(exprStr).join(", ") + ")" : ""));
       case "start": return nodeLayout(s, "timer", "⧗ start " + s.timer + (s.every ? " every " : " ") + exprStr(s.ms));
       case "stop": return nodeLayout(s, "timer", "⧗ stop " + s.timer);
@@ -393,7 +400,6 @@ const FC = (function () {
     const funcs = new Set(ast.items.filter((i) => i.type === "func").map((i) => i.name));
     OPTS.funcs = funcs;
     const states = ast.items.filter((i) => i.type === "state");
-    const anyState = ast.items.find((i) => i.type === "any_state");
 
     // --- global row: declarations card + funcs + top-level notes
     const decl = declLines(ast);
@@ -439,31 +445,23 @@ const FC = (function () {
     width = Math.max(width, x);
     y += rowH + 36;
 
-    // --- any_state (handlers for every state) and the states
+    // --- the states
     const stateBoxes = {};
-    const containers = [];
-    if (anyState || (OPTS.edit && states.length)) containers.push({ any: true, st: anyState || { name: "", handlers: [] } });
-    states.forEach((st) => containers.push({ any: false, st }));
     const startState = states.find((s) => s.initial) || states[0];
-    containers.forEach(({ any, st }) => {
-      const handlers = st.handlers.filter((h) => h.type === "on").map((h) => routineLayout(h, any ? null : st.name));
+    states.forEach((st) => {
+      const handlers = st.handlers.filter((h) => h.type === "on").map((h) => routineLayout(h, st.name));
       const svars = (st.vars || []).filter((v) => v.type === "var");
       const hnotes = (st.vars || []).concat(st.handlers).filter((h) => h.type === "comment");
       const top = y, pad = 18;
       let sx = M + pad;
       let sh = 0;
-      const cur = !any && OPTS.curState === st.name;
+      const cur = OPTS.curState === st.name;
       const titleY = top + 22;
       const boxStart = OUT.length;
       P(""); // placeholder for container rect
-      if (any) {
-        P(`<text class="state-title any-title" x="${M + pad}" y="${titleY}">any_state</text>` +
-          `<text class="small" x="${f1(M + pad + tw("any_state") * 1.25 + 18)}" y="${titleY}">handlers for every state · a state's own handler for the same event takes precedence</text>`);
-      } else {
-        const start = st === startState;
-        P(`<text class="state-title" x="${M + pad + (start ? 18 : 0)}" y="${titleY}">${st.initial ? "initial " : ""}state ${esc(st.name)}${cur ? "  ◀ current" : ""}</text>`);
-        if (start) P(`<circle class="initial" cx="${M + pad + 5}" cy="${titleY - 5}" r="5"><title>initial state</title></circle>`);
-      }
+      const start = st === startState;
+      P(`<text class="state-title" x="${M + pad + (start ? 18 : 0)}" y="${titleY}">${st.initial ? "initial " : ""}state ${esc(st.name)}${cur ? "  ◀ current" : ""}</text>`);
+      if (start) P(`<circle class="initial" cx="${M + pad + 5}" cy="${titleY - 5}" r="5"><title>initial state</title></circle>`);
       const iy = top + 36;
       if (svars.length) {
         // state variables: a small card, reset to these values on every entry
@@ -493,15 +491,13 @@ const FC = (function () {
       }
       if (OPTS.edit) {
         const bx = sx;
-        sx += addButton(bx, iy, "+ handler", any ? "any-handler" : "state-handler", st.name) + 16;
-        if (!any) sx = Math.max(sx, bx + addButton(bx, iy + 28, "+ variable", "state-var", st.name) + 16);
-        sh = Math.max(sh, any ? 22 : 50);
+        sx += addButton(bx, iy, "+ handler", "state-handler", st.name) + 16;
+        sx = Math.max(sx, bx + addButton(bx, iy + 28, "+ variable", "state-var", st.name) + 16);
+        sh = Math.max(sh, 50);
       }
-      const bw = Math.max(sx - M - 36 + pad + 18, any ? 560 : 260), bh = sh + 36 + 18;
-      OUT[boxStart] = any
-        ? `<g class="nd-any"><rect class="state-box any-box" x="${M}" y="${top}" width="${f1(bw)}" height="${f1(bh)}" rx="12"/></g>`
-        : `<g class="nd-state" data-state="${esc(st.name)}"><rect class="state-box${cur ? " cur" : ""}" x="${M}" y="${top}" width="${f1(bw)}" height="${f1(bh)}" rx="12"/></g>`;
-      if (!any) stateBoxes[st.name] = { x: M, y: top, w: bw, h: bh };
+      const bw = Math.max(sx - M - 36 + pad + 18, 260), bh = sh + 36 + 18;
+      OUT[boxStart] = `<g class="nd-state" data-state="${esc(st.name)}"><rect class="state-box${cur ? " cur" : ""}" x="${M}" y="${top}" width="${f1(bw)}" height="${f1(bh)}" rx="12"/></g>`;
+      stateBoxes[st.name] = { x: M, y: top, w: bw, h: bh };
       width = Math.max(width, M + bw);
       y += bh + 26;
     });
@@ -540,21 +536,15 @@ const FC = (function () {
       const a = -Math.PI / 2 + (i * 2 * Math.PI) / n + (n === 2 ? Math.PI / 2 : 0);
       pos[s.name] = { x: cx0 + ring * Math.cos(a), y: cy0 + ring * Math.sin(a) };
     });
-    const any = { x: 70, y: 40 };
     const edges = {};
     const addEdge = (from, to, label) => {
       const k = from + "→" + to;
       (edges[k] = edges[k] || { from, to, labels: [] }).labels.push(label);
     };
-    const anyState = ast.items.find((i) => i.type === "any_state");
-    const anyHandlers = anyState ? anyState.handlers.filter((h) => h.type === "on") : [];
-    const frameStart = OUT.length;
-    P("");  // placeholder: any_state frame around all states
     for (const it of ast.items) {
       if (it.type === "state") for (const h of it.handlers) if (h.type === "on") gotosIn(h.body, []).forEach((g) => addEdge(it.name, g.state, h.event));
     }
-    for (const h of anyHandlers) gotosIn(h.body, []).forEach((g) => addEdge("*", g.state, h.event));
-    const ptOf = (name) => (name === "*" || name === "(boot)" ? any : pos[name]);
+    const ptOf = (name) => pos[name];
     for (const e of Object.values(edges)) {
       const a = ptOf(e.from), b = ptOf(e.to);
       if (!a || !b) continue;
@@ -567,17 +557,12 @@ const FC = (function () {
       const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 1;
       const ux = dx / d, uy = dy / d, nx = -uy, ny = ux;
       const off = 26;
-      const r0 = ptOf(e.from) === any ? 8 : RAD, r1 = RAD + 2;
+      const r0 = RAD, r1 = RAD + 2;
       const sx = a.x + ux * r0 + nx * 10, sy = a.y + uy * r0 + ny * 10;
       const ex = b.x - ux * r1 + nx * 10, ey = b.y - uy * r1 + ny * 10;
       const mx = (sx + ex) / 2 + nx * off, my = (sy + ey) / 2 + ny * off;
       P(`<path class="sd-edge" d="M${f1(sx)} ${f1(sy)} Q${f1(mx)} ${f1(my)} ${f1(ex)} ${f1(ey)}" marker-end="url(#arr2)"/>`);
       P(`<text class="sd-label" x="${f1(mx)}" y="${f1(my)}" text-anchor="middle">${label}</text>`);
-    }
-    if (anyState) {
-      P(`<rect x="${any.x - 50}" y="${any.y - 14}" width="100" height="28" rx="6" class="any-tag"/><text x="${any.x}" y="${any.y + 4}" text-anchor="middle" class="any-tag-text">any_state</text>`);
-      const evs = anyHandlers.map((h) => h.event).join(" · ");
-      if (evs) P(`<text class="small" x="${any.x + 60}" y="${any.y + 4}">${esc(clip(evs, 60))}</text>`);
     }
     states.forEach((s, i) => {
       const p = pos[s.name];
@@ -591,24 +576,18 @@ const FC = (function () {
       }
     });
     const W = Math.ceil(cx0 * 2 + 40), H = Math.ceil(cy0 + ring + RAD + 60);
-    if (anyState) OUT[frameStart] = `<rect class="any-frame" x="8" y="12" width="${W - 16}" height="${H - 20}" rx="16"><title>any_state: its handlers apply in every state</title></rect>`;
-    return { svg: `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">` + DEFS + OUT.join("") + `</svg>` + stateEventTable(ast, states, anyHandlers) };
+    return { svg: `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">` + DEFS + OUT.join("") + `</svg>` + stateEventTable(ast, states) };
   }
 
   // state x event table: who handles each event in each state
-  function stateEventTable(ast, states, anyHandlers) {
+  function stateEventTable(ast, states) {
     const events = ast.items.filter((i) => i.type === "event" || i.type === "timer").map((i) => ({ name: i.name, timer: i.type === "timer" }));
-    const anyBy = {};
-    anyHandlers.forEach((h) => (anyBy[h.event] = h));
-    const rows = [{ name: "enter", life: true }, { name: "exit", life: true }].concat(events);
+    const rows = [{ name: "boot", life: true }, { name: "enter", life: true }, { name: "exit", life: true }].concat(events);
     const head = `<tr><th>event</th>${states.map((s) => `<th>${esc(s.name)}</th>`).join("")}</tr>`;
     const body = rows.map((ev) => {
       const cells = states.map((st) => {
         const own = st.handlers.find((h) => h.type === "on" && h.event === ev.name);
-        const anyH = !ev.life && anyBy[ev.name];
-        if (own && anyH) return `<td class="se-own se-over" data-sel="${own.id}" data-goto-node="${own.id}" title="the state's handler runs; the any_state handler (line ${anyH.line}) does not">● state <span>overrides any_state</span></td>`;
-        if (own) return `<td class="se-own" data-sel="${own.id}" data-goto-node="${own.id}" title="handled by state ${esc(st.name)} (line ${own.line})">● state</td>`;
-        if (anyH) return `<td class="se-any" data-sel="${anyH.id}" data-goto-node="${anyH.id}" title="handled by any_state (line ${anyH.line})">any_state</td>`;
+        if (own) return `<td class="se-own" data-sel="${own.id}" data-goto-node="${own.id}" title="handled by state ${esc(st.name)} (line ${own.line})">● handled</td>`;
         return `<td class="se-none" title="${ev.life ? "no handler" : "event is dropped in this state"}">–</td>`;
       }).join("");
       return `<tr><td class="se-ev">${ev.life ? `<i>${ev.name}</i>` : esc(ev.name)}${ev.timer ? ' <span class="muted">timer</span>' : ""}</td>${cells}</tr>`;

@@ -14,6 +14,7 @@ STACK_SIZE = 64
 MAX_FRAMES = 16
 QUEUE_SIZE = 16
 BUDGET = 10000
+LEAVING = -2             # timer owner while its state is being left (see dispatch)
 MAX_CHAIN = 256          # dispatches in a row without the VM becoming idle
 STR_SLOTS = V.STR_SLOTS  # run-time strings alive at once
 STR_LEN = V.STR_LEN      # bytes per run-time string
@@ -250,9 +251,14 @@ class VM:
     def dispatch(self):
         """Start the next handler. Returns True if one was started or a transition progressed."""
         p = self.prog
+        # A transition marked the old state's timers LEAVING; the new state's 'on enter' has
+        # run (or there was none), so the ones it did not start again stop now.
+        for i, t in enumerate(self.timers):
+            if t[0] and t[4] == LEAVING:
+                self.stop_timer(i)
         if self.boot_pending:
             self.boot_pending = False
-            h = p.find_handler(None, EV_BOOT)
+            h = p.find_handler(0 if p.states else None, EV_BOOT)   # 'on boot' lives in the initial state
             if h is not None:
                 self.begin(h, [])
                 return True
@@ -266,10 +272,15 @@ class VM:
                     self.begin(h, [])
                     return True
         if self.transition is not None:
-            if self.state is not None:          # leaving: stop the old state's timers
-                for i, t in enumerate(self.timers):
-                    if t[4] == self.state:
-                        self.stop_timer(i)
+            # Leaving: the old state's timers stop once the new state has been entered, unless
+            # its 'on enter' starts them again (a periodic timer restarted with the same period
+            # keeps running, phase and all).  Before the first entry, the timers belong to the
+            # initial state ('on boot'): they go too if the program starts in another state.
+            old = self.state if self.state is not None else 0
+            if not (self.state is None and self.transition == old):
+                for t in self.timers:
+                    if t[0] and t[4] == old:
+                        t[4] = LEAVING
             self.state = self.transition
             self.transition = None
             h = p.find_handler(self.state, EV_ENTER)
@@ -298,7 +309,7 @@ class VM:
     # -- execution -------------------------------------------------------------------
     def has_work(self):
         return (self.boot_pending or self.pending is not None or self.transition is not None
-                or bool(self.queue))
+                or bool(self.queue) or any(t[0] and t[4] == LEAVING for t in self.timers))
 
     def step(self):
         if self.handler is None:
@@ -460,6 +471,21 @@ class VM:
                 push(0)
             self.frames.append([npc, base])
             self.pc = off
+        elif name == "RETN":
+            if arg > 16:                            # MAX_RESULTS in the C VM
+                raise Fault(5)
+            if len(self.stack) < arg:
+                raise Fault(2)
+            vals = self.stack[len(self.stack) - arg:] if arg else []
+            del self.stack[len(self.stack) - arg:]
+            ret_pc, base = self.frames.pop()
+            del self.stack[base:]
+            if not self.frames:
+                self.finish()
+                return DONE
+            self.pc = ret_pc
+            for v in vals:
+                push(v)
         elif name in ("RET", "RET0"):
             v = pop() if name == "RET" else 0
             ret_pc, base = self.frames.pop()
@@ -531,6 +557,9 @@ class VM:
                 raise Fault(5)
             ms = self.pop_int()
             t = self.timers[arg]
+            if name == "TEVERY" and t[0] and t[1] and t[2] == ms:
+                t[4] = self.handler[0]      # already running with this period: keep it (and its phase)
+                return RUNNING
             t[0] = True
             t[1] = name == "TEVERY"
             t[2] = ms

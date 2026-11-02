@@ -32,7 +32,8 @@ if sys.getrecursionlimit() < 6000:
 
 
 class Parser:
-    def __init__(self, src):
+    def __init__(self, src, legacy=False):
+        self.legacy = legacy      # accept v0.1's any_state (only for flowscript.migrate)
         self.toks = tokenize(src)
         self.pos = 0
         self.next_id = 1
@@ -224,14 +225,24 @@ class Parser:
     def is_type(self):
         return self.tok.kind == "KW" and self.tok.value in TYPE_KEYWORDS
 
-    def parse_returns(self):
-        """Optional '-> type'."""
+    def parse_returns(self, several=False):
+        """Optional '-> type', or for functions '-> type, type, ...' (several results).
+
+        Several result types are kept as one string, "float, int", as written."""
         if not self.is_op("->"):
             return None
         self.advance()
-        if not self.is_type():
-            raise self.error("expected a return type after '->' (int, float, str or time)")
-        return self.advance().value
+        types = []
+        while True:
+            if not self.is_type():
+                raise self.error("expected a return type after '->' (int, float, str or time)")
+            types.append(self.advance().value)
+            if not self.is_op(","):
+                break
+            if not several:
+                raise self.error("a host function (extern) returns at most one value")
+            self.advance()
+        return ", ".join(types)
 
     def var_hint(self):
         """'var x' was FlowScript v1: point to the typed declarations."""
@@ -299,13 +310,32 @@ class Parser:
             params, types = self.parse_params(typed=True)
             if params is None:
                 raise self.error("func needs a parameter list, e.g. func %s()" % name)
-            n = self.node("func", t, name=name, params=params, ptypes=types, returns=self.parse_returns(), body=[])
+            n = self.node("func", t, name=name, params=params, ptypes=types,
+                          returns=self.parse_returns(several=True), body=[])
             self.open_block(n, "func")
             n["body"] = self.parse_block()
             return n
         if kw == "on":
-            raise self.error("event handlers go inside a state, or inside 'any_state:' to "
-                             "handle the event in every state")
+            raise self.error("event handlers go inside a state: a program is always in exactly one "
+                             "state, and only states handle events")
+        if kw == "any_state" and self.legacy:
+            self.advance()
+            n = self.node("any_state", t, handlers=[])
+            self.open_block(n, kw)
+            while True:
+                note = self.gather(n["handlers"])
+                if self.tok.kind == "DEDENT":
+                    self.advance()
+                    return n
+                if self.is_kw("pass"):
+                    self.skip_pass(n["handlers"], note)
+                    continue
+                if not self.is_kw("on"):
+                    raise self.error("only 'on' handlers are allowed inside any_state")
+                n["handlers"].append(self.attach(self.parse_handler(), note))
+        if kw == "any_state":
+            raise self.error("'any_state' was removed: handle the event in each state that needs it "
+                             "(share the logic with a func; 'on boot' goes in the initial state)")
         if kw == "initial":
             self.advance()
             if not self.is_kw("state"):
@@ -313,18 +343,15 @@ class Parser:
             n = self.parse_item()
             n["initial"] = True
             return n
-        if kw in ("state", "any_state"):
+        if kw == "state":
             self.advance()
-            if kw == "state":
-                n = self.node("state", t, name=self.expect_name("state name"), vars=[], handlers=[])
-            else:
-                n = self.node("any_state", t, handlers=[])
+            n = self.node("state", t, name=self.expect_name("state name"), vars=[], handlers=[])
             self.open_block(n, kw)
             while True:
                 loose = []
                 note = self.gather(loose)
                 # state variables come first; comments above them stay with them
-                in_vars = kw == "state" and self.is_type() and not n["handlers"]
+                in_vars = self.is_type() and not n["handlers"]
                 (n["vars"] if in_vars else n["handlers"]).extend(loose)
                 if self.tok.kind == "DEDENT":
                     self.advance()
@@ -334,17 +361,13 @@ class Parser:
                     continue
                 self.var_hint()
                 if self.is_type():
-                    if kw == "any_state":
-                        raise self.error("variables shared by every state are ordinary globals: "
-                                         "declare them at the top level")
                     if n["handlers"]:
                         raise self.error("state variables go at the top of the state, "
                                          "before its handlers")
                     n["vars"].append(self.attach(self.parse_decl("var"), note))
                     continue
                 if not self.is_kw("on"):
-                    raise self.error("only variables (int/float/str/time) and 'on' handlers are allowed inside a state" if kw == "state"
-                                     else "only 'on' handlers are allowed inside any_state")
+                    raise self.error("only variables (int/float/str/time) and 'on' handlers are allowed inside a state")
                 n["handlers"].append(self.attach(self.parse_handler(), note))
             return n
         raise self.error("unexpected '%s' at top level" % kw)
@@ -453,15 +476,36 @@ class Parser:
                 raise self.error("'%s' without a matching 'if' (check the indentation)" % kw)
             if kw == "return":
                 self.advance()
-                value = None
+                value, values = None, None
                 if self.tok.kind not in ("NEWLINE", "COMMENT", "EOF"):
                     value = self.parse_expr()
+                    if self.is_op(","):            # return a, b, ...: several results
+                        values = [value]
+                        while self.is_op(","):
+                            self.advance()
+                            values.append(self.parse_expr())
+                        value = None
                 n = self.node("return", t, value=value)
+                if values:
+                    n["values"] = values
                 self.end_of_line(n)
                 return n
             raise self.error("unexpected '%s'" % kw)
         if t.kind == "NAME":
             nxt = self.peek()
+            if nxt.kind == "OP" and nxt.value == ",":   # a, b, c = f(...)
+                targets = [self.advance().value]
+                while self.is_op(","):
+                    self.advance()
+                    targets.append(self.expect_name("variable name"))
+                self.expect_op("=")
+                if self.tok.kind != "NAME" or not (self.peek().kind == "OP" and self.peek().value == "("):
+                    raise self.error("several variables can only be assigned from a function call: "
+                                     "%s = f(...)" % ", ".join(targets))
+                call = self.parse_primary()
+                n = self.node("massign", t, targets=targets, value=call)
+                self.end_of_line(n)
+                return n
             if nxt.kind == "OP" and nxt.value == "=":
                 name = self.advance().value
                 self.advance()
@@ -561,9 +605,9 @@ class Parser:
         raise self.error("expected an expression, got %s" % self.describe(t))
 
 
-def parse(src):
+def parse(src, legacy=False):
     try:
-        return Parser(src).parse_program()
+        return Parser(src, legacy).parse_program()
     except RecursionError:
         raise FlowError("program is nested too deeply")
 

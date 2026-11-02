@@ -18,7 +18,7 @@ int g = 5
 str last = "none"
 float lastx = 0
 
-any_state:
+state main:
   on boot:
     start t 10
 

@@ -125,8 +125,8 @@ class Printer:
         prev = None
         for item in prog.get("items", []):
             kind = item["type"]
-            block = kind in ("func", "on", "state", "any_state")
-            if self.lines and (block or prev is None or prev in ("func", "on", "state", "any_state") or prev != kind):
+            block = kind in ("func", "on", "state")
+            if self.lines and (block or prev is None or prev in ("func", "on", "state") or prev != kind):
                 self.blank()
             self.item(0, item)
             prev = kind
@@ -159,9 +159,8 @@ class Printer:
             ps = it.get("params")
             self.emit(d, "on %s%s:" % (it["event"], self.params(ps) if ps else ""))
             self.block(d + 1, it.get("body", []))
-        elif t in ("state", "any_state"):
-            self.emit(d, ("%sstate %s:" % ("initial " if it.get("initial") else "", it["name"]))
-                      if t == "state" else "any_state:")
+        elif t == "state":
+            self.emit(d, "%sstate %s:" % ("initial " if it.get("initial") else "", it["name"]))
             vs = it.get("vars") or []
             for v in vs:
                 self.item(d + 1, v)
@@ -191,6 +190,8 @@ class Printer:
         self.note(d, s)
         if t == "assign":
             self.emit(d, "%s = %s" % (s["target"], expr_to_str(s["value"])))
+        elif t == "massign":
+            self.emit(d, "%s = %s" % (", ".join(s["targets"]), expr_to_str(s["value"])))
         elif t == "local":
             self.emit(d, self.decl(s))
         elif t == "call":
@@ -215,8 +216,8 @@ class Printer:
         elif t == "stop":
             self.emit(d, "stop " + s["timer"])
         elif t == "return":
-            v = s.get("value")
-            self.emit(d, "return" + ((" " + expr_to_str(v)) if v is not None else ""))
+            vs = s.get("values") or ([s["value"]] if s.get("value") is not None else [])
+            self.emit(d, "return" + ((" " + ", ".join(expr_to_str(v) for v in vs)) if vs else ""))
         else:
             raise ValueError("unknown statement type %r" % t)
 

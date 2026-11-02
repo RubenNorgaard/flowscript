@@ -1,0 +1,24 @@
+tick 60              # 'early' (from on boot) was stopped: b does not start it
+tick 30
+tick 20              # b beat (b's own start, 100ms after boot)
+tick 60
+post go              # b -> a: same period, keeps the phase (next beat 40ms after the last)
+tick 30
+tick 20              # a beat at 200ms
+post go              # a -> b again
+tick 100             # b beat at 300ms
+post kick
+tick 100
+post kick            # resets the one-shot
+tick 100             # no watchdog yet (only 100 of 150)
+tick 50              # watchdog
+post next            # b -> c: other period, restart
+tick 69
+tick 1               # c beat 70ms after entering c
+post go              # c -> b: restart with 100
+tick 99
+tick 1
+post self            # a self-transition from a state that does not handle it: nothing
+post go              # b -> a
+post self            # a -> a: exit, enter; beat started again with the same period: kept
+tick 100

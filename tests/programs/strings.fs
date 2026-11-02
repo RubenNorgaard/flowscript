@@ -4,7 +4,7 @@ extern say(str s, int n)
 
 event hello
 
-any_state:
+state main:
   on boot:
     say("hello", 1)
     say("world", 2)

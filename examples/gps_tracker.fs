@@ -17,7 +17,6 @@ event motion(int level)
 event button
 # --- events raised by the script itself ---
 event no_fix
-event report_sent
 # tells the host to sound the overspeed alarm (buzzer, LED); the script does not handle it
 event overspeed_alarm
 
@@ -38,34 +37,23 @@ const REASON_THEFT = 3
 
 int reports = 0
 
-any_state:
-  on boot:
-    log("tracker logic started", 3)
-    set_led(1)
-
-  # Started from any_state, so the timer keeps running when the state changes
-  on no_fix:
-    start fix_timeout 2min
-
-  on fix_timeout:
-    log("no gps fix", 0)
-
-  # Functions cannot change variables, so send_report announces each report
-  on report_sent:
-    reports = reports + 1
-
 # Battery check is shared by every state
 func battery_ok() -> int:
   return battery_mv() >= LOW_BATTERY
 
-func send_report(int reason):
+# 1 if the report went out (the caller counts it), 0 if there is no fix
+func send_report(int reason) -> int:
   if gps_has_fix():
     send_position(reason)
-    raise_event report_sent
-  else:
-    raise_event no_fix
+    return 1
+  raise_event no_fix
+  return 0
 
 initial state parked:
+  on boot:
+    log("tracker logic started", 3)
+    set_led(1)
+
   on enter:
     set_led(0)
     start report every 1h
@@ -81,7 +69,14 @@ initial state parked:
 
   on report:
     if battery_ok():
-      send_report(REASON_PERIODIC)
+      reports = reports + send_report(REASON_PERIODIC)
+
+  # no fix for 2 minutes in this state: log it (leaving the state stops the timer)
+  on no_fix:
+    start fix_timeout 2min
+
+  on fix_timeout:
+    log("no gps fix", 0)
 
 state driving:
   # Belongs to driving: starts at 0 every time the state is entered
@@ -96,10 +91,10 @@ state driving:
     if speed > LIMIT:
       overspeed_count = overspeed_count + 1
       if overspeed_count >= OVERSPEED_ALARM:
-        send_report(REASON_ALARM)
+        reports = reports + send_report(REASON_ALARM)
         raise_event overspeed_alarm
     elif speed > LIMIT / 2 xor not battery_ok():
-      send_report(REASON_PERIODIC)
+      reports = reports + send_report(REASON_PERIODIC)
     else:
       overspeed_count = 0
 
@@ -108,7 +103,14 @@ state driving:
       goto_state parked
 
   on exit:
-    send_report(REASON_PERIODIC)
+    reports = reports + send_report(REASON_PERIODIC)
+
+  # no fix for 2 minutes in this state: log it (leaving the state stops the timer)
+  on no_fix:
+    start fix_timeout 2min
+
+  on fix_timeout:
+    log("no gps fix", 0)
 
 state theft:
   on enter:
@@ -116,7 +118,14 @@ state theft:
     start report every 10s
 
   on report:
-    send_report(REASON_THEFT)
+    reports = reports + send_report(REASON_THEFT)
 
   on button:
     goto_state parked
+
+  # no fix for 2 minutes in this state: log it (leaving the state stops the timer)
+  on no_fix:
+    start fix_timeout 2min
+
+  on fix_timeout:
+    log("no gps fix", 0)

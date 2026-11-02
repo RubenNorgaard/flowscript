@@ -14,7 +14,7 @@ int n_once = 0
 int n_every = 0
 int n_zero = 0
 
-any_state:
+state main:
   on cmd(op, ms):
     if op == 1:
       start once ms

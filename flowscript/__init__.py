@@ -15,6 +15,7 @@ See https://github.com/RubenNorgaard/flowscript for the language (SPEC.md) and t
 
 from .api import compile, load, Machine, CompileError, Diagnostic, Fault
 from .svg import to_svg
+from .migrate import migrate
 from .bytecode import Program, disassemble, disassemble_text
 from .lexer import FlowError
 from .parser import parse, parse_expression
@@ -28,8 +29,8 @@ __all__ = [
     # the host API
     "compile", "load", "Machine", "to_svg", "Program", "CompileError", "Diagnostic", "Fault",
     # tools
-    "to_source", "to_mermaid", "size_report", "format_report", "disassemble", "disassemble_text",
+    "migrate", "to_source", "to_mermaid", "size_report", "format_report", "disassemble", "disassemble_text",
     # lower level
     "FlowError", "parse", "parse_expression", "expr_to_str", "compile_source", "compile_ast", "VM",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

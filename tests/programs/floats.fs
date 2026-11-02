@@ -12,7 +12,7 @@ const PI = 3.141592653589793
 float total = 0
 float big = 1e300
 
-any_state:
+state main:
   on boot:
     show(0.1 + 0.2)
     show(1 / 3.0)

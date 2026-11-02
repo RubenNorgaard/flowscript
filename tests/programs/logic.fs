@@ -10,7 +10,7 @@ event test
 
 int hits = 0
 
-any_state:
+state main:
   on test:
     if a() and b():
       mark(1)

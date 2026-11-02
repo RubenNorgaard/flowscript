@@ -14,7 +14,7 @@ const Edit = (function () {
   let tmpId = -1;
 
   const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-  const KEYWORDS = new Set("flow version extern event timer const int float str time func on state initial any_state pass if elif else while goto_state raise_event start every stop return and or xor not true false".split(" "));
+  const KEYWORDS = new Set("flow version extern event timer const int float str time func on state initial pass if elif else while goto_state raise_event start every stop return and or xor not true false".split(" "));
   const $ = (s) => document.querySelector(s);
   const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
@@ -156,23 +156,13 @@ const Edit = (function () {
     const evNames = () => ["boot"].concat(decls("event").map((e) => e.name), decls("timer").map((t) => t.name));
     const lastIdx = (pred) => { let k = -1; items.forEach((it, i) => { if (pred(it)) k = i; }); return k; };
     const insertItem = (it, afterPred) => { const k = lastIdx(afterPred); items.splice(k + 1, 0, it); commit(it); };
-    if (action === "any-handler") {
-      let any = items.find((i) => i.type === "any_state");
-      const used = new Set(any ? any.handlers.map((h) => h.event) : []);
-      showMenu(x, y, evNames().filter((e) => !used.has(e)).map((e) => ["on " + e, "in every state", () => {
-        const h = { id: nid(), type: "on", line: 0, event: e, params: null, body: [] };
-        if (!any) {
-          any = { id: nid(), type: "any_state", line: 0, handlers: [] };
-          const k = items.findIndex((i) => i.type === "state" || i.type === "func");
-          items.splice(k < 0 ? items.length : k, 0, any);
-        }
-        any.handlers.push(h);
-        commit(h);
-      }]));
-    } else if (action === "state-handler") {
+    if (action === "state-handler") {
       const st = items.find((i) => i.type === "state" && i.name === arg);
       const used = new Set(st.handlers.map((h) => h.event));
-      showMenu(x, y, ["enter", "exit"].concat(evNames().filter((e) => e !== "boot")).filter((e) => !used.has(e)).map((e) => ["on " + e, "in " + arg, () => {
+      // 'on boot' only in the initial state (marked, or the first one)
+      const sts = decls("state");
+      const initial = st === (sts.find((s) => s.initial) || sts[0]);
+      showMenu(x, y, ["enter", "exit"].concat(evNames().filter((e) => e !== "boot" || initial)).filter((e) => !used.has(e)).map((e) => ["on " + e, "in " + arg, () => {
         const h = { id: nid(), type: "on", line: 0, event: e, params: null, body: [] };
         st.handlers.push(h);
         commit(h);
@@ -184,7 +174,7 @@ const Edit = (function () {
       st.vars.push(v);
       commit(v);
     } else if (action === "func") {
-      insertItem({ id: nid(), type: "func", line: 0, name: uniqueName("func"), params: [], ptypes: [], returns: null, body: [] }, (i) => ["extern", "event", "timer", "const", "var", "func", "any_state"].includes(i.type));
+      insertItem({ id: nid(), type: "func", line: 0, name: uniqueName("func"), params: [], ptypes: [], returns: null, body: [] }, (i) => ["extern", "event", "timer", "const", "var", "func"].includes(i.type));
     } else if (action === "state") {
       // two or more states need a marked start state: keep the current first one as the start
       const sts = decls("state");
@@ -248,16 +238,19 @@ const Edit = (function () {
       case "emit": title = "Raise event"; f.push(field("event", "event", n.event, "select", events.includes(n.event) ? events : [n.event].concat(events)), field("arguments", "args", listStr(n.args))); break;
       case "start": title = "Start timer"; f.push(field("timer", "timer", n.timer, "select", timers.includes(n.timer) ? timers : [n.timer].concat(timers)), field("milliseconds (e.g. 500ms, 30s, 5min)", "ms", S(n.ms)), field("periodic (every)", "every", n.every, "check")); break;
       case "stop": title = "Stop timer"; f.push(field("timer", "timer", n.timer, "select", timers.includes(n.timer) ? timers : [n.timer].concat(timers))); break;
-      case "return": title = "Return"; f.push(field("value (functions only, optional)", "value", n.value ? S(n.value) : "")); break;
+      case "return": title = "Return"; f.push(field("value(s), comma-separated (functions only, optional)", "value", listStr(n.values || (n.value ? [n.value] : [])))); break;
+      case "massign": title = "Assign results"; f.push(field("variables (a, b, c)", "targets", n.targets.join(", ")), field("function call", "value", S(n.value))); break;
       case "comment": title = "Annotation"; f.push(field("text", "text", n.text, "area")); break;
       case "on": {
         title = "Event handler";
         const st = index[n.id] && index[n.id].parent && index[n.id].parent.type === "state";
-        const evs = (st ? ["enter", "exit"] : ["boot"]).concat(events, timers);
+        const sts = decls("state"), owner = index[n.id] && index[n.id].parent;
+        const initial = owner && owner === (sts.find((s) => s.initial) || sts[0]);
+        const evs = (st ? ["enter", "exit"] : []).concat(initial ? ["boot"] : [], events, timers);
         f.push(field("event", "event", n.event, "select", evs.includes(n.event) ? evs : [n.event].concat(evs)), field("parameter names (optional)", "params", (n.params || []).join(", ")));
         break;
       }
-      case "func": title = "Function"; f.push(field("name", "name", n.name), field("parameters (e.g. int n, float x)", "params", typedStr(n)), field("returns", "returns", n.returns || "nothing", "select", ["nothing"].concat(TYPES))); break;
+      case "func": title = "Function"; f.push(field("name", "name", n.name), field("parameters (e.g. int n, float x)", "params", typedStr(n)), field("returns (e.g. float, or float, int; empty = nothing)", "returns", n.returns || "")); break;
       case "state": title = "State"; f.push(field("name", "name", n.name), field("initial state (the program starts here)", "initial", !!n.initial, "check")); break;
       case "extern": title = "Host function (extern)"; f.push(field("name", "name", n.name), field("parameters (e.g. str msg, int level)", "params", typedStr(n)), field("returns", "returns", n.returns || "nothing", "select", ["nothing"].concat(TYPES))); break;
       case "event": title = "Event"; f.push(field("name", "name", n.name), field("parameters (e.g. int level, float x)", "params", typedStr(n))); break;
@@ -271,14 +264,14 @@ const Edit = (function () {
           f.push(field("operand for AND / OR / XOR", "operand", "true"));
         }
     }
-    if (["assign", "local", "call", "if", "while", "goto", "emit", "start", "stop", "return", "on", "func", "state", "extern", "event", "timer", "const", "var"].includes(n.type)) {
+    if (["assign", "massign", "local", "call", "if", "while", "goto", "emit", "start", "stop", "return", "on", "func", "state", "extern", "event", "timer", "const", "var"].includes(n.type)) {
       f.push(field("annotation (note)", "note", n.note || "", "area"));
     }
     return { title, html: f.join("") };
   }
 
   function isExpr(n) { return ["binary", "unary", "num", "name", "callx", "bool", "str"].includes(n.type); }
-  function isStmt(n) { return ["assign", "local", "call", "if", "while", "goto", "emit", "start", "stop", "return", "comment"].includes(n.type); }
+  function isStmt(n) { return ["assign", "massign", "local", "call", "if", "while", "goto", "emit", "start", "stop", "return", "comment"].includes(n.type); }
 
   function select(id, branch) {
     reindex();
@@ -388,13 +381,29 @@ const Edit = (function () {
       case "emit": n.event = val("event"); n.args = await exprList(val("args")); break;
       case "start": n.timer = val("timer"); n.every = !!val("every"); n.ms = (await exprs({ ms: val("ms") })).ms; break;
       case "stop": n.timer = val("timer"); break;
-      case "return": { const v = val("value").trim(); n.value = v ? (await exprs({ value: v })).value : null; break; }
+      case "return": {
+        const vs = val("value").trim() ? await exprList(val("value")) : [];
+        n.value = vs.length === 1 ? vs[0] : null;
+        if (vs.length > 1) n.values = vs; else delete n.values;
+        break;
+      }
+      case "massign": {
+        n.targets = val("targets").split(",").map((t) => checkName(t.trim(), "variable"));
+        const v = (await exprs({ value: val("value") })).value;
+        if (!v || (v.type !== "call" && v.type !== "callx")) throw new Error("the value must be a function call, e.g. f(x)");
+        n.value = v;
+        break;
+      }
       case "comment": n.text = val("text"); break;
       case "on": { n.event = val("event"); const p = val("params").trim(); n.params = p ? params(p) : null; break; }
       case "func": case "extern": {
         n.name = checkName(val("name").trim());
         Object.assign(n, typedParams(val("params")));
-        n.returns = val("returns") === "nothing" ? null : val("returns");
+        if (n.type === "func") {
+          const r = val("returns").split(",").map((t) => t.trim()).filter(Boolean);
+          r.forEach((t) => { if (!TYPES.includes(t)) throw new Error("unknown type '" + t + "' (int, float, str, time)"); });
+          n.returns = r.length ? r.join(", ") : null;
+        } else n.returns = val("returns") === "nothing" ? null : val("returns");
         break;
       }
       case "event": n.name = checkName(val("name").trim()); Object.assign(n, typedParams(val("params"))); break;

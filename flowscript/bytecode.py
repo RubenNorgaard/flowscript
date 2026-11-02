@@ -8,7 +8,7 @@ import struct
 from .values import pack_value, unpack_value, TYPE_NAMES, NONE_TYPE, show, BUILTINS
 
 MAGIC = b"FSB1"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 FLAG_DEBUG = 1
 # Features the program needs from the VM.  A C VM built without one (FS_NO_FLOAT,
 # FS_NO_TIME, FS_NO_STR) refuses images that set its flag.
@@ -38,7 +38,7 @@ OPCODES = {
     "GT": (0x34, None), "GE": (0x35, None), "NOT": (0x36, None), "BOOL": (0x37, None),
     "JMP": (0x40, "u16"), "JZ": (0x41, "u16"), "JNZ": (0x42, "u16"),
     "CALL": (0x50, "u16"), "RET": (0x51, None), "RET0": (0x52, None), "XCALL": (0x53, "u16"),
-    "BUILTIN": (0x54, "u8"),
+    "BUILTIN": (0x54, "u8"), "RETN": (0x55, "u8"),
     "GOTO": (0x60, "u16"), "EMIT": (0x61, "u16"), "TSTART": (0x62, "u16"),
     "TEVERY": (0x63, "u16"), "TSTOP": (0x64, "u16"),
 }

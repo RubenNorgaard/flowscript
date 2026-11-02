@@ -29,7 +29,7 @@ float total = 0
 str last = ""
 time seen
 
-any_state:
+initial state idle:
   on boot:
     start beat every 1s
 
@@ -39,7 +39,6 @@ any_state:
   on when(t):
     seen = t
 
-initial state idle:
   on ping(n):
     last = label("n=", n)
     say(last)
@@ -48,6 +47,16 @@ initial state idle:
 
 state busy:
   int pings = 0
+
+  # same period: the beat keeps running across the transition
+  on enter:
+    start beat every 1s
+
+  on beat:
+    total = total + scale(1)
+
+  on when(t):
+    seen = t
 
   on ping(n):
     pings = pings + 1
@@ -72,14 +81,13 @@ class Compile(unittest.TestCase):
         self.assertEqual(p.source, SRC)
         self.assertEqual(p.ast["type"], "program")
         self.assertEqual(p.warnings, [])
-        w = flowscript.compile("event e\nany_state:\n  on e:\n    pass\ninitial state a:\n  on e:\n"
-                               "    pass\nstate b:\n  pass\n").warnings
-        self.assertEqual([d.line for d in w], [6])
-        self.assertIn("replaces the any_state handler", w[0].message)
+        w = flowscript.compile("int x\nstate a:\n  on boot:\n    if x > 5:\n      pass\n").warnings
+        self.assertEqual([d.line for d in w], [4])
+        self.assertIn("magic number 5", w[0].message)
 
     def test_compile_error(self):
         with self.assertRaises(CompileError) as cm:
-            flowscript.compile("any_state:\n  on boot:\n    y = 1\n")
+            flowscript.compile("state main:\n  on boot:\n    y = 1\n")
         self.assertEqual(cm.exception.line, 3)
         self.assertIn("unknown variable 'y'", str(cm.exception))
         self.assertIsInstance(cm.exception, flowscript.FlowError)
@@ -151,12 +159,12 @@ class Run(unittest.TestCase):
 
     def test_faults_are_reported_with_line_and_handler(self):
         faults = []
-        src = "extern f() -> int\nint x\nany_state:\n  on boot:\n    x = 10 / f()\n    x = 99\n"
+        src = "extern f() -> int\nint x\nstate main:\n  on boot:\n    x = 10 / f()\n    x = 99\n"
         m = Machine(flowscript.compile(src), externs={"f": lambda: 0}, on_fault=faults.append).start()
         self.assertEqual(m["x"], 0)                       # the handler was aborted
         self.assertEqual(len(faults), 1)
         f = faults[0]
-        self.assertEqual((f.code, f.name, f.line, f.handler), (3, "division by zero", 5, "on boot"))
+        self.assertEqual((f.code, f.name, f.line, f.handler), (3, "division by zero", 5, "main.on boot"))
         self.assertEqual(m.faults, faults)
 
     def test_extern_checks(self):
@@ -184,6 +192,54 @@ class Run(unittest.TestCase):
         self.assertEqual(with_names["total"], 5.0)
         with self.assertRaisesRegex(KeyError, "no global names"):
             b["total"]
+
+
+class Migrate(unittest.TestCase):
+    OLD = """event e
+event f
+timer t
+int x
+any_state:
+  # shared
+  on boot:
+    start t every 1s
+
+  on e:
+    x = 1
+
+  on f:
+    x = 2
+
+initial state a:
+  on e:
+    x = 10
+
+state b:
+  pass
+"""
+
+    def test_any_state_is_rewritten(self):
+        new, notes = flowscript.migrate(self.OLD)
+        p = flowscript.compile(new)                     # valid 0.2
+        self.assertNotIn("any_state", new)
+        ast = p.ast
+        a, b = [i for i in ast["items"] if i["type"] == "state"]
+        self.assertEqual([h["event"] for h in a["handlers"] if h["type"] == "on"], ["boot", "e", "f"])
+        self.assertEqual([h["event"] for h in b["handlers"] if h["type"] == "on"], ["e", "f"])
+        self.assertIn("shared", a["handlers"][0]["note"])     # the comment moved with 'on boot'
+        # a's own 'on e' stays (it overrode the shared one); b got the shared one
+        m = Machine(p).start()
+        m.send("e")
+        self.assertEqual(m["x"], 10)
+        self.assertTrue(any("timer 't'" in n for n in notes))
+        self.assertTrue(any("'on f' is now in a, b" in n for n in notes))
+
+    def test_without_states_and_already_migrated(self):
+        new, notes = flowscript.migrate("int x\nany_state:\n  on boot:\n    x = 1\n")
+        self.assertIn("state main:", new)
+        self.assertEqual(Machine(flowscript.compile(new)).start()["x"], 1)
+        self.assertEqual(notes, [])
+        self.assertEqual(flowscript.migrate(new), (new, []))
 
 
 class Svg(unittest.TestCase):

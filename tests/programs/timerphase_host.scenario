@@ -1,0 +1,16 @@
+host_timers
+fire early           # stopped when the program started in b: ignored
+fire beat
+post go              # b -> a: same period, no new start for beat
+fire beat
+post next            # a does not handle next: dropped
+post go              # a -> b
+post kick
+post kick            # one-shot: started again
+fire watchdog
+post next            # b -> c: beat restarted with 70
+fire beat
+post go              # c -> b: restarted with 100
+post go              # b -> a
+post self            # a -> a: kept
+fire beat

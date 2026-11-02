@@ -78,6 +78,16 @@ Values cross the boundary as plain Python: `int`, `float`, `str` and timezone-aw
 program behaves exactly as on the C VM, including faults (a faulting handler is aborted
 and reported; the machine carries on).
 
+### Upgrading scripts from 0.1
+
+0.2 dropped `any_state`: only states handle events, `on boot` lives in the initial state,
+and functions can return several results instead. `flowscript.migrate(source)` (or
+`flowscript migrate FILE.fs [-w]`) rewrites a 0.1 program: `on boot` moves into the
+initial state and each shared handler is copied into the states that didn't override it.
+It returns notes on what may behave differently, chiefly timers started from
+`any_state`, which now stop when their state is left. Bytecode is format version 3:
+recompile `.fsb` files.
+
 ### Flowcharts as SVG
 
 ```python
@@ -108,32 +118,37 @@ const LIMIT = 90                # compile-time constant (any type)
 int reports = 0                 # global variables: int, float, str, time
 time since = time(2026, 1, 1)
 
-func notify(int reason, int count) -> int:   # sub-process: sees params, consts, externs, not globals
+func notify(int reason, int count) -> int, int:   # sub-process: sees params, consts, externs, not globals
   send_position(reason, "report " + str(count))
-  return count + 1              # the result goes back to the handler
-
-any_state:                      # handlers that apply in every state
-  on boot:                      # runs once at start
-    start report every 30s      # time units: ms, s, min, h
-    since = now()               # the host's clock
+  return count + 1, reason      # several results go back to the handler
 
 initial state parked:           # the program starts here (required with 2+ states)
+  on boot:                      # runs once at start, before parked is entered
+    since = now()               # the host's clock
+
+  on enter:
+    start report every 30s      # time units: ms, s, min, h
+
   on ignition(active):
     if active:
       goto_state driving        # ends the handler; runs exit/enter handlers
 
-state driving:
+state driving:                  # only states handle events: a state lists all it reacts to
   int slow_reports = 0          # state variable: only visible here, reset on each entry
+  int last_reason = 0
 
-  on report:                    # replaces an any_state 'on report' here
+  on enter:
+    start report every 30s      # same period: the timer keeps running across the transition
+
+  on report:
     float kmh = gps_speed() * 1.0   # local variable; ints promote to float
     if kmh > LIMIT and not reports > 100:
-      reports = notify(2, reports)
+      reports, last_reason = notify(2, reports)   # several results, assigned in order
     elif kmh == 0 and now() - since > 10min:
       raise_event ignition(0)   # queued for the script + host notified
     else:
       slow_reports = slow_reports + 1
-      reports = notify(1, reports)
+      reports, last_reason = notify(1, reports)
 ```
 
 Blocks are defined by indentation, as in Python: a header line ends with `:` and its
@@ -144,7 +159,8 @@ Four types — `int` (int32), `float` (double), `str`, `time` (UTC, ms) — chec
 time, with int → float promotion and nothing else implicit; built-in conversions
 (`int() float() str() time()`), string (`len substr find`), time (`now date year … weekday`)
 and math functions (`abs min max floor ceil round sqrt exp log pow`). Statements:
-`if/elif/else`, `while`, `goto_state`, `raise_event`, `start/stop`, `return`, functions,
+`if/elif/else`, `while`, `goto_state`, `raise_event`, `start/stop`, `return`, functions
+(with several results: `a, b = f(x)`),
 and the operators `or xor and not == != < <= > >= | ^ & << >> + - * / % ~`. That is the
 whole language. See [SPEC.md](https://github.com/RubenNorgaard/flowscript/blob/main/SPEC.md) for the exact semantics and the bytecode format.
 
@@ -156,7 +172,7 @@ larger program (a PID-steered market-making controller) using floats and times.
 | Statement | Flowchart symbol |
 |---|---|
 | `on EVENT` | event (hexagon) |
-| `state S` / `any_state` | state container / dashed container around all states |
+| `state S` | state container (each state holds every handler it runs) |
 | `x = …`, `var x = …` | process (rectangle) |
 | state `var` | "state variables" card inside the state container |
 | `extern_fn(…)` | I/O (parallelogram) |

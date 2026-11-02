@@ -21,7 +21,7 @@ func describe(int n) -> str:
     return "pos " + str(n)
   return "non-pos"
 
-any_state:
+state main:
   on boot:
     f = half(3)
     note(describe(2) + describe(0), f, stamp(), 7)

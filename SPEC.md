@@ -18,9 +18,12 @@ Design goals, in priority order:
 Non-goals: it is *not* a general-purpose language. There are no arrays, no heap, no
 closures and no blocking calls.
 
-v2 (this document) adds the types `float`, `str` and `time` to v1's single int type;
-variables are declared with their type (`int x = 0`) instead of `var`. v1 images are
-rejected by v2 VMs (format version 2).
+v2 added the types `float`, `str` and `time` to v1's single int type; variables are
+declared with their type (`int x = 0`) instead of `var`. v3 (this document) is a strict
+state machine: only states handle events (`any_state` is gone, `on boot` lives in the
+initial state), functions can return several results (`a, b = f(x)`), and a periodic
+timer restarted with the same period keeps running across transitions. Older images
+are rejected (format version 3).
 
 ---
 
@@ -92,7 +95,7 @@ state driving:
 * String literals `"..."` (with `\n \t \" \\` escapes) are `str` values.
 * `->` introduces a return type.
 
-Keywords: `flow version extern event timer const int float str time func on state initial any_state
+Keywords: `flow version extern event timer const int float str time func on state initial
 pass if elif else while goto_state raise_event start every stop return and or xor not true false`.
 `int`, `float`, `str` and `time` also name the conversion functions (`float(n)`).
 
@@ -173,14 +176,15 @@ the same machine).
 | `timer NAME` | A VM-managed timer. A timer is also an event with the same name. |
 | `const NAME = expr` | Compile-time constant of any type (the expression must be constant; pure built-ins fold, e.g. `time(2026, 1, 1)`). |
 | `TYPE NAME [= expr]` | Global variable (`int`, `float`, `str` or `time`); the initial value must be constant (default: the zero value). Only event handlers can use it, not functions. |
-| `func NAME(int a, float b) [-> TYPE]:` + block | User function (sub-process). It cannot read or write globals: data comes in as parameters and goes out with `return` (or `raise_event`), so only event handlers change program state. Falling off the end returns the zero value of `TYPE`. |
-| `any_state:` + block | Handlers that apply in every state (`on boot` lives here). At most one. |
+| `func NAME(int a, float b) [-> TYPE, ...]:` + block | User function (sub-process). It cannot read or write globals: data comes in as parameters and goes out with `return` (or `raise_event`), so only event handlers change program state. It may return several results (up to 8, see 4.4). Falling off the end returns the zero value of each result type. |
 | `initial state NAME:` + block | The state the program starts in (required when there are 2+ states). |
 | `state NAME:` + block | A state: its variables (`TYPE NAME = value`, first), then its `on` handlers (or just `pass`). |
 
-Every event handler is inside a `state` or inside `any_state`; there are no loose
-top-level handlers. `any_state` is the implicit outer state that contains all states and
-is never left, so the program is always a two-level hierarchical state machine.
+Every event handler is inside a `state`: the program is always in exactly one state,
+and only that state's handlers run. Logic several states share goes in a `func` (with
+several results when it updates several variables), and each state calls it; so every
+state lists exactly what it reacts to, and every `goto_state` is an edge from the state
+that holds it.
 
 ### 4.1 States and dispatch
 
@@ -188,20 +192,17 @@ is never left, so the program is always a two-level hierarchical state machine.
   states exactly one must be marked, so reordering states never changes where the
   program starts; a lone state needs no marker. The compiler gives the initial state
   index 0 in the state table (the VM always starts in state 0); the other states keep
-  source order. `on boot` may still `goto_state` elsewhere, in which case the initial
-  state is never entered. A program without states is a
-  plain event-handler program whose handlers all live in `any_state`.
-* When an event arrives, the handler in the **current state** runs if it exists;
-  otherwise the `any_state` handler for that event runs. Events without a handler are
-  dropped. The compiler **warns** when a state handler replaces an `any_state` handler
-  for the same event (the program still compiles: overriding is allowed, the warning
-  just makes it visible). The debugger's States view shows a state × event table with
-  the handler that runs for every combination.
+  source order. A program with handlers has at least one state (a single
+  `state main:` is a plain event-handler program).
+* When an event arrives, the handler for it in the **current state** runs; if the
+  state has none, the event is dropped. The debugger's States view shows a state ×
+  event table of which state handles which event.
 * Built-in events:
-  * `boot` – `any_state` only; runs once when the VM is started, before the initial
-    state is entered.
-  * `enter` / `exit` – states only (`any_state` is never entered or left); run when
-    the state is entered / left.
+  * `boot` – only in the initial state; runs once when the VM is started, before the
+    initial state is entered. It may `goto_state` elsewhere, in which case the initial
+    state is never entered. It cannot use the initial state's variables (entering the
+    state resets them right after); timers it starts belong to the initial state.
+  * `enter` / `exit` – run when the state is entered / left.
 * Handlers **run to completion**. There is no blocking `wait`; use timers.
 
 ### 4.2 State variables
@@ -215,7 +216,7 @@ state driving:
 ```
 
 * A variable declared at the top of a state block belongs to that state. Only that state's
-  handlers can read or write it; functions and `any_state` handlers cannot (pass it as
+  handlers can read or write it; functions cannot (pass it as
   an argument if a function needs it). Prefer state variables over globals for data
   that only matters while the program is in one state.
 * It is **reset to its initial value every time the state is entered** (including
@@ -224,7 +225,7 @@ state driving:
   stops its timers.
 * The name must not clash with any top-level declaration, and locals and handler
   parameters may not hide it. Two different states may use the same name.
-* `any_state` has no variables: data shared by every state is an ordinary global.
+* Data shared by every state is an ordinary global.
 * Implementation: each state variable is a global slot (debug name `STATE.NAME`), so
   the VM and bytecode are unchanged. The compiler emits the reset (`PUSH value;
   STOREG slot` per variable) at the start of the state's `on enter` handler, and
@@ -236,11 +237,37 @@ state driving:
 declaration). If the parameter list is omitted the names from the `event` declaration
 are used. A handler may not declare more parameters than the event has.
 
+### 4.4 Functions with several results
+
+```flowscript
+func pid_step(float error, float hours, float integral) -> float, float:
+  float next = integral + error * hours
+  return clamp(next, 0, 1), next
+
+state trading:
+  on control:
+    aggression, integral = pid_step(error, hours, integral)
+```
+
+* `-> T1, T2, ...` declares up to 8 results; `return a, b, ...` returns exactly that
+  many, each checked against its type (an int converts to a float). Falling off the
+  end returns the zero value of each result.
+* The results are assigned with `a, b, ... = f(...)`: a whole statement, the number of
+  names must match, each name once, each assignment type-checked like `=` (int to
+  float allowed). A function with several results cannot be used inside an expression,
+  and called as a plain statement its results are discarded. There are no tuples.
+* This is how shared logic updates several variables while functions still cannot
+  touch variables: the function returns the new values, the handler stores them.
+* Externs return at most one value.
+* Bytecode: `RETN n` returns the n results in order; the caller stores them from the
+  top of the stack (the last result first).
+
 ## 5. Statements (= flowchart nodes)
 
 | Statement | Flowchart symbol |
 |---|---|
 | `x = expr` | **Process** rectangle |
+| `a, b = f(args)` | **Predefined process** (the call, its results assigned) |
 | `TYPE x [= expr]` | **Process** rectangle (declares a local) |
 | `name(args)` (extern) | **I/O** parallelogram |
 | `name(args)` (func) | **Predefined process** (double-sided rectangle) |
@@ -263,10 +290,14 @@ Notes:
   processed before any queued event.
 * `raise_event` queues the event for the script **and** notifies the host through the
   `on_emit` callback (so the script can signal the system, e.g. `raise_event alarm(3)`).
-* `start` restarts a timer if it is already running. A timer belongs to the state whose
-  handler started it (also when started from a function that handler calls) and is
-  stopped automatically when that state is left (see 8.3). Timers started by global
-  handlers in `any_state` keep running across states.
+* `start T ms` (one-shot) restarts a timer that is already running: the deadline moves
+  out again (the watchdog/debounce pattern). `start T every ms` on a timer that is
+  already running periodically with the same `ms` does nothing (it keeps its phase);
+  with another period, or on a one-shot, it restarts. A timer belongs to the state
+  whose handler started it (also when started from a function that handler calls) and
+  stops when that state is left, unless the new state's `enter` handler starts it
+  again (see 8.3). So a periodic timer that every state starts in `on enter` with the
+  same period keeps one rhythm across all transitions.
 * Locals (`float x = …`) are function-scoped; a name can only be declared once
   per function/handler, and is visible from its declaration on. Every local starts at
   its type's zero value, so one declared in a branch that did not run still holds a
@@ -338,12 +369,16 @@ Every run to idle is therefore bounded: at most `MAX_CHAIN` handler runs of at m
 `start()` sets `boot_pending` and, if the program has states, `pending = 0` (the
 initial state). A *dispatch* does the first applicable of:
 
-1. `boot_pending`: clear it; if a `boot` handler exists (in `any_state`), start it and stop here.
+0. Stop every active timer whose owner is LEAVING (see 8.3), then go on.
+1. `boot_pending`: clear it; if the initial state has a `boot` handler, start it and stop here.
 2. `pending` set: `transition = pending`, clear `pending`. If there is a current
    state with an `exit` handler, start it (`goto_state` inside it is ignored) and stop here.
-3. `transition` set: `state = transition`, clear `transition`, start the state's
-   `enter` handler if it has one. Stop here (counts as a dispatch even without handler).
-4. Pop queued events until one has a handler (state handler, else global); start it.
+3. `transition` set: mark the active timers owned by the old state LEAVING (before the
+   first entry the old state is the initial state, the owner of `boot`'s timers;
+   nothing is marked when the first entry is into the initial state itself), then
+   `state = transition`, clear `transition`, start the state's `enter` handler if it
+   has one. Stop here (counts as a dispatch even without handler).
+4. Pop queued events until the current state has a handler for one; start it.
 5. Otherwise the VM is idle.
 
 Because `boot` runs before the initial transition, a `goto_state` in `boot` chooses the
@@ -422,7 +457,7 @@ can point straight into the buffer.
 ```
 Header (32 bytes)
   0  u8[4]  magic "FSB1"
-  4  u16    format version (2)
+  4  u16    format version (3)
   6  u16    flags            bit0: debug section present
                               bit1: needs float values     (refused by FS_NO_FLOAT builds)
                               bit2: needs time values      (refused by FS_NO_TIME builds)
@@ -502,6 +537,7 @@ Every instruction is a 1-byte opcode followed by its operands.
 | CALL | 50 | u16 | args → result | user function |
 | RET | 51 | – | v → | return v (ends handler at base frame) |
 | RET0 | 52 | – | – | return 0 |
+| RETN | 55 | u8 n | v1 … vn → | return n results, in order (n > 16: fault 5); the caller gets v1 … vn |
 | XCALL | 53 | u16 | args → result | extern (int 0 if it returns nothing) |
 | BUILTIN | 54 | u8 | args → result | built-in function by id (`values.BUILTINS`; overloads have their own id) |
 | GOTO | 60 | u16 | – | request transition, end handler |
@@ -524,10 +560,13 @@ is started like a call with the event arguments as its first locals.
 ### 8.3 Timers
 
 Each timer has `active`, `periodic`, `period`, `remaining` and `owner`. `start`/`start
-every` set them and `owner` = the state of the running handler (none for a global
-handler). When a dispatch leaves a state (step 3 of the dispatch rules, just before
-`state = transition`, so after its `exit` handler and also for a transition back to
-the same state), every active timer owned by that state is stopped.
+every` set them and `owner` = the state of the running handler (`boot`: the initial
+state). `start every ms` on an active periodic timer with `period == ms` changes only
+`owner` (no host call). When a dispatch leaves a state (step 3 of the dispatch rules,
+after its `exit` handler, also for a transition back to the same state), the active
+timers it owns get the owner LEAVING. The new state's `enter` handler runs; a `start`
+there gives a timer the new owner. The next dispatch (step 0) stops every timer still
+LEAVING. In C, LEAVING is owner -2.
 
 There are two ways to run the timers; the host picks one before `start()`:
 

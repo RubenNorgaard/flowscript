@@ -270,7 +270,7 @@ typedef struct {
 typedef struct {
     uint8_t active;
     uint8_t periodic;
-    int16_t owner;              /* state whose handler started it, -1 = global */
+    int16_t owner;              /* state whose handler started it (-2 while that state is being left) */
     int32_t period;
     int64_t remaining;
 } fs_timer;

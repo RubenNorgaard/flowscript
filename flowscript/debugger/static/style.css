@@ -194,11 +194,6 @@ tr.sz-rt:hover td { background: var(--bg3); }
 .sz-hints li { margin: 2px 0; }
 
 /* any_state */
-#chart .any-box { fill: rgba(160, 130, 255, .04); stroke: #7a68b8; stroke-dasharray: 6 4; }
-#chart .any-title { font: bold 14px var(--mono); fill: #c3b5ff; }
-#chart .any-frame { fill: rgba(160, 130, 255, .025); stroke: #7a68b8; stroke-width: 1.5; stroke-dasharray: 6 4; }
-#chart .any-tag { fill: #2c2742; stroke: #7a68b8; }
-#chart text.any-tag-text { font: bold 12px var(--mono); fill: #c3b5ff; }
 /* state x event table (States view) */
 .se-wrap { padding: 4px 16px 24px; font-size: 12px; }
 .se-title { font-weight: 600; margin: 4px 0 6px; }
@@ -207,9 +202,6 @@ tr.sz-rt:hover td { background: var(--bg3); }
 .se-table th { background: var(--bg2); font-family: var(--mono); font-weight: 600; }
 .se-table td.se-ev { text-align: left; font-family: var(--mono); }
 .se-table td.se-own { color: #9ec5ff; cursor: pointer; }
-.se-table td.se-over { background: rgba(255, 204, 77, .08); }
-.se-table td.se-over span { color: var(--cur); font-size: 11px; }
-.se-table td.se-any { color: #c3b5ff; cursor: pointer; }
 .se-table td.se-none { color: var(--muted); }
 .se-table td[data-sel]:hover { background: var(--bg3); }
 .se-table td.sel { outline: 2px solid var(--accent); }
