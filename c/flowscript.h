@@ -248,6 +248,16 @@ typedef void (*fs_fault_fn)(fs_vm *vm, int code, int pc, void *user);
  *   start = 0: stop it (ms and periodic are 0).  Called for `stop T` and when
  *              the state that started the timer is left. */
 typedef void (*fs_timer_fn)(fs_vm *vm, int timer, int start, int32_t ms, int periodic, void *user);
+/* A log statement (`warning "x is {x}"`): level FS_LOG_DEBUG..FS_LOG_ERROR, the message
+ * template (len bytes, inside the image: '{}' per value, '{{' and '}}' for braces) and its
+ * n values.  The VM builds no text, so this works in every build; fs_format_log() renders
+ * the message for hosts that want it.  The values are valid during the call. */
+typedef void (*fs_log_fn)(fs_vm *vm, int level, const char *tmpl, uint16_t len,
+                          const fs_value *values, int n, void *user);
+#define FS_LOG_DEBUG   0
+#define FS_LOG_INFO    1
+#define FS_LOG_WARNING 2
+#define FS_LOG_ERROR   3
 
 typedef struct {
     int32_t ret_pc;             /* -1 for the handler's base frame */
@@ -307,6 +317,7 @@ struct fs_vm {
     fs_emit_fn   on_emit;
     fs_fault_fn  on_fault;
     fs_timer_fn  on_timer;      /* NULL: built-in timers driven by fs_tick() */
+    fs_log_fn    on_log;        /* NULL: log statements do nothing           */
 #if FS_HAS_TIME
     fs_clock_fn  clock;         /* NULL: now() is 0                          */
 #endif
@@ -383,6 +394,14 @@ void fs_tick(fs_vm *vm, int32_t ms);    /* built-in timers only (no-op with a ti
  * Returns FS_OK (timer event queued), FS_TIMER_STOPPED (the script stopped the
  * timer meanwhile: ignored), FS_ERR_FULL (fault 7 reported) or FS_ERR_ARG. */
 void fs_set_timer_handler(fs_vm *vm, fs_timer_fn fn);
+/* Where log statements go (NULL: nowhere).  Kept across fs_load(). */
+void fs_set_log_handler(fs_vm *vm, fs_log_fn fn);
+/* The message of a log statement: each '{}' replaced by its value (a str as itself,
+ * others as fs_format() shows them), '{{' '}}' as braces.  Writes at most size-1 bytes
+ * + NUL; returns the full length.  Host-side: a device that never calls it can leave it
+ * out of the link (-ffunction-sections -Wl,--gc-sections). */
+int  fs_format_log(const fs_vm *vm, const char *tmpl, uint16_t len, const fs_value *values, int n,
+                   char *buf, int size);
 int  fs_timer_expired(fs_vm *vm, int timer);
 int  fs_timer_count(const fs_vm *vm);
 const char *fs_timer_name(const fs_vm *vm, int timer);  /* NULL if unknown */

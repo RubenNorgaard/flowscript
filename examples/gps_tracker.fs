@@ -9,7 +9,6 @@ extern gps_speed() -> int
 extern battery_mv() -> int
 extern send_position(int reason)
 extern set_led(int pattern)
-extern log(str msg, int value)
 
 # --- events raised by the firmware ---
 event ignition(int active)
@@ -51,7 +50,7 @@ func send_report(int reason) -> int:
 
 initial state parked:
   on boot:
-    log("tracker logic started", 3)
+    info "tracker logic started, {reports} reports so far"
     set_led(1)
 
   on enter:
@@ -76,7 +75,7 @@ initial state parked:
     start fix_timeout 2min
 
   on fix_timeout:
-    log("no gps fix", 0)
+    warning "no gps fix for 2 minutes"
 
 state driving:
   # Belongs to driving: starts at 0 every time the state is entered
@@ -110,7 +109,7 @@ state driving:
     start fix_timeout 2min
 
   on fix_timeout:
-    log("no gps fix", 0)
+    warning "no gps fix for 2 minutes"
 
 state theft:
   on enter:
@@ -128,4 +127,4 @@ state theft:
     start fix_timeout 2min
 
   on fix_timeout:
-    log("no gps fix", 0)
+    warning "no gps fix for 2 minutes"

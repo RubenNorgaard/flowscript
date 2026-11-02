@@ -191,7 +191,7 @@ const FC = (function () {
       draw(cx, y) {
         const x0 = cx - w / 2;
         const ids = opts.ids || subIds(node);
-        P(`<g class="nd k-${kind}${bpCls(node)}" data-ids="${ids.join(" ")}" data-sel="${node.id}" data-line="${node.line}"` +
+        P(`<g class="nd k-${kind}${opts.cls ? " " + opts.cls : ""}${bpCls(node)}" data-ids="${ids.join(" ")}" data-sel="${node.id}" data-line="${node.line}"` +
           (opts.head ? ` data-head="${opts.head}"` : "") + `><title>${esc(text)}</title>${shapePath(kind, x0, y, w, h)}` +
           `<text x="${f1(cx)}" y="${y + 21}" text-anchor="middle">${esc(label)}</text>` +
           (bpCls(node) ? `<circle class="bpdot" cx="${f1(x0 - 7)}" cy="${y + h / 2}" r="4"/>` : "") + `</g>`);
@@ -235,6 +235,7 @@ const FC = (function () {
   function stmtLayout(s) {
     switch (s.type) {
       case "assign": return nodeLayout(s, "proc", s.target + " = " + exprStr(s.value));
+      case "log": return nodeLayout(s, "io", s.level + " " + JSON.stringify(s.text), { cls: "log lv-" + s.level });
       case "massign": {
         const isFunc = (OPTS.funcs || new Set()).has(s.value.name);
         return nodeLayout(s, isFunc ? "sub" : "io", s.targets.join(", ") + " = " + exprStr(s.value));

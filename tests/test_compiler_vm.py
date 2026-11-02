@@ -79,6 +79,26 @@ class Errors(unittest.TestCase):
         _ast, prog, _ = compile_source("state a:\n  pass\ninitial state b:\n  on boot:\n    pass\n")
         self.assertEqual([h[0] for h in prog.handlers], [0])
 
+    def test_log_statement_rules(self):
+        self.bad('state s:\n  on boot:\n    info "x is {x"\n', "'{' without a closing '}'")
+        self.bad('state s:\n  on boot:\n    info "x}"\n', "'}' without an opening '{'")
+        self.bad('state s:\n  on boot:\n    info "x {}"\n', "empty '{}' in the message")
+        self.bad('state s:\n  on boot:\n    info "{1 +}"\n', "in {1 +}:")
+        self.bad('state s:\n  on boot:\n    info "{nope}"\n', "unknown name 'nope'")
+        self.bad('func f():\n  pass\nstate s:\n  on boot:\n    info "{f()}"\n', "returns nothing")
+        self.bad('state s:\n  on boot:\n    info "' + "{1}" * 9 + '"\n', "at most 8 values")
+        self.bad('state s:\n  on boot:\n    error("oops")\n', 'to log, write error "message {value}"')
+        # the level words stay usable as names; the error points at the statement's line
+        logs = []
+        prog = compile_source('int error = 1\nstate s:\n  on boot:\n    error = error + 1\n'
+                              '    warning "error is {error}, {{}} {1.5 * 2}"\n')[1]
+        vm = VM(prog, on_log=lambda vm, lv, t, vals: logs.append((lv, t, vals)))
+        vm.start(); vm.run()
+        self.assertEqual(logs, [(2, "error is {}, {{}} {}", [2, 3.0])])
+        with self.assertRaises(FlowError) as cm:
+            compile_source('state s:\n  on boot:\n    pass\n    info "{nope}"\n')
+        self.assertEqual(cm.exception.line, 4)
+
     def test_several_results_rules(self):
         f = "func f(int x) -> int, float:\n  return x, 2.5\n"
         self.bad(f + "int a\nstate s:\n  on boot:\n    a = f(1)\n", "'f' returns 2 values: assign them with a, b = f(...)")

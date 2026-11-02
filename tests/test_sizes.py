@@ -36,7 +36,7 @@ class Report(unittest.TestCase):
         mins = {r["macro"]: r["minimum"] for r in rep["ram"]["rows"]}
         self.assertEqual(mins["FS_STACK_SIZE"], 4)
         self.assertEqual(mins["FS_MAX_FRAMES"], 2)
-        self.assertEqual(mins["FS_MAX_EXTERNS"], 6)
+        self.assertEqual(mins["FS_MAX_EXTERNS"], 5)
         self.assertIsNone(mins["FS_QUEUE_SIZE"])
         self.assertIn("-DFS_STACK_SIZE=4", rep["ram"]["cflags"])
         self.assertEqual(rep["ram"]["default_bytes"], 6080)

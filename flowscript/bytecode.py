@@ -8,7 +8,7 @@ import struct
 from .values import pack_value, unpack_value, TYPE_NAMES, NONE_TYPE, show, BUILTINS
 
 MAGIC = b"FSB1"
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 FLAG_DEBUG = 1
 # Features the program needs from the VM.  A C VM built without one (FS_NO_FLOAT,
 # FS_NO_TIME, FS_NO_STR) refuses images that set its flag.
@@ -41,6 +41,8 @@ OPCODES = {
     "BUILTIN": (0x54, "u8"), "RETN": (0x55, "u8"),
     "GOTO": (0x60, "u16"), "EMIT": (0x61, "u16"), "TSTART": (0x62, "u16"),
     "TEVERY": (0x63, "u16"), "TSTOP": (0x64, "u16"),
+    # log statements: u16 = the message template (a string); its '{}' slots say how many values
+    "LOGD": (0x65, "u16"), "LOGI": (0x66, "u16"), "LOGW": (0x67, "u16"), "LOGE": (0x68, "u16"),
 }
 BY_CODE = {code: (name, kind) for name, (code, kind) in OPCODES.items()}
 OPERAND_SIZE = {None: 0, "i8": 1, "u8": 1, "u16": 2, "i32": 4, "f64": 8, "i64": 8}
@@ -278,7 +280,7 @@ def decode(code, pc):
 
 def operand_comment(prog, name, val, local_names=None):
     try:
-        if name == "PUSHS":
+        if name in ("PUSHS", "LOGD", "LOGI", "LOGW", "LOGE"):
             return show_str(prog.strings[val])
         if name == "PUSHT":
             from .values import Time

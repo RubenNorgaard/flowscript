@@ -22,7 +22,8 @@ enum {
     OP_NOT = 0x36, OP_BOOL = 0x37,
     OP_JMP = 0x40, OP_JZ = 0x41, OP_JNZ = 0x42,
     OP_CALL = 0x50, OP_RET = 0x51, OP_RET0 = 0x52, OP_XCALL = 0x53, OP_BUILTIN = 0x54, OP_RETN = 0x55,
-    OP_GOTO = 0x60, OP_EMIT = 0x61, OP_TSTART = 0x62, OP_TEVERY = 0x63, OP_TSTOP = 0x64
+    OP_GOTO = 0x60, OP_EMIT = 0x61, OP_TSTART = 0x62, OP_TEVERY = 0x63, OP_TSTOP = 0x64,
+    OP_LOGD = 0x65, OP_LOGI = 0x66, OP_LOGW = 0x67, OP_LOGE = 0x68
 };
 
 #define EV_BOOT  0
@@ -622,6 +623,7 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     fs_emit_fn on_emit;
     fs_fault_fn on_fault;
     fs_timer_fn on_timer;
+    fs_log_fn on_log;
 #if FS_HAS_TIME
     fs_clock_fn clock;
 #endif
@@ -636,6 +638,7 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     on_emit = vm->on_emit;
     on_fault = vm->on_fault;
     on_timer = vm->on_timer;
+    on_log = vm->on_log;
 #if FS_HAS_TIME
     clock = vm->clock;
 #endif
@@ -644,6 +647,7 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     vm->on_emit = on_emit;
     vm->on_fault = on_fault;
     vm->on_timer = on_timer;
+    vm->on_log = on_log;
 #if FS_HAS_TIME
     vm->clock = clock;
 #endif
@@ -657,7 +661,7 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
         return img ? FS_ERR_MAGIC : FS_ERR_ARG;
     if (memcmp(img, "FSB1", 4) != 0)
         return FS_ERR_MAGIC;
-    if (rd16(img + 4) != 3)
+    if (rd16(img + 4) != 4)
         return FS_ERR_VERSION;
     flags = rd16(img + 6);
     if (((flags & 2u) && !FS_HAS_FLOAT) || ((flags & 4u) && !FS_HAS_TIME) ||
@@ -1240,6 +1244,72 @@ static void timer_stop(fs_vm *vm, unsigned i)
         vm->on_timer(vm, (int)i, 0, 0, 0, vm->user);
 }
 
+void fs_set_log_handler(fs_vm *vm, fs_log_fn fn)
+{
+    if (vm)
+        vm->on_log = fn;
+}
+
+/* '{}' slots in a log template (values.template_args) */
+static int template_args(const char *t, unsigned len)
+{
+    unsigned i = 0;
+    int n = 0;
+    while (i < len) {
+        if (i + 1 < len && ((t[i] == '{' && t[i + 1] == '{') || (t[i] == '}' && t[i + 1] == '}'))) {
+            i += 2;
+        } else if (i + 1 < len && t[i] == '{' && t[i + 1] == '}') {
+            n++;
+            i += 2;
+        } else {
+            i++;
+        }
+    }
+    return n;
+}
+
+int fs_format_log(const fs_vm *vm, const char *tmpl, uint16_t len, const fs_value *values, int n,
+                  char *buf, int size)
+{
+    char tmp[64];
+    int out = 0, k = 0;
+    unsigned i = 0;
+#define LPUT(c) do { if (out < size - 1) buf[out] = (c); out++; } while (0)
+    if (!buf || size <= 0 || !tmpl)
+        return 0;
+    while (i < len) {
+        if (i + 1 < len && ((tmpl[i] == '{' && tmpl[i + 1] == '{') || (tmpl[i] == '}' && tmpl[i + 1] == '}'))) {
+            LPUT(tmpl[i]);
+            i += 2;
+        } else if (i + 1 < len && tmpl[i] == '{' && tmpl[i + 1] == '}') {
+            if (k < n) {
+                const char *p = NULL;
+                uint16_t pl = 0;
+                int j, m;
+                if (values[k].type == FS_STR) {
+                    p = fs_str(vm, values[k], &pl);
+                    m = p ? (int)pl : 0;
+                } else {
+                    m = fs_format(vm, values[k], tmp, (int)sizeof(tmp));
+                    p = tmp;
+                    if (m > (int)sizeof(tmp) - 1)
+                        m = (int)sizeof(tmp) - 1;
+                }
+                for (j = 0; j < m; j++)
+                    LPUT(p[j]);
+            }
+            k++;
+            i += 2;
+        } else {
+            LPUT(tmpl[i]);
+            i++;
+        }
+    }
+#undef LPUT
+    buf[out < size ? out : size - 1] = 0;
+    return out;
+}
+
 void fs_set_timer_handler(fs_vm *vm, fs_timer_fn fn)
 {
     if (vm)
@@ -1794,6 +1864,7 @@ static int execute(fs_vm *vm)
     case OP_PUSHS: case OP_LOADG: case OP_STOREG: case OP_JMP: case OP_JZ: case OP_JNZ:
     case OP_CALL: case OP_XCALL: case OP_GOTO: case OP_EMIT:
     case OP_TSTART: case OP_TEVERY: case OP_TSTOP:
+    case OP_LOGD: case OP_LOGI: case OP_LOGW: case OP_LOGE:
         if ((uint32_t)pc + 3 > csize)
             FAULT(FS_FAULT_BAD_OPCODE);
         arg = rd16(code + pc + 1);
@@ -2086,6 +2157,28 @@ static int execute(fs_vm *vm)
             FAULT(FS_FAULT_BAD_OPCODE);
         timer_stop(vm, arg);
         break;
+    case OP_LOGD: case OP_LOGI: case OP_LOGW: case OP_LOGE: {
+        fs_value tmp[MAX_CALL_ARGS];
+        const fs_value *args;
+        const char *t;
+        uint16_t tl = 0;
+        int n;
+        if (arg >= vm->n_strings)
+            FAULT(FS_FAULT_BAD_OPCODE);
+        t = fs_string(vm, (int)arg, &tl);
+        n = template_args(t, tl);
+        if (n > 16)                         /* MAX_LOG_ARGS (the compiler allows 8) */
+            FAULT(FS_FAULT_BAD_OPCODE);
+        if (vm->sp < n)
+            FAULT(FS_FAULT_STACK_UNDERFLOW);
+        args = arg_view(vm, n, tmp);
+        if (!args)
+            FAULT(FS_FAULT_STACK_OVERFLOW);
+        if (vm->on_log)
+            vm->on_log(vm, op - OP_LOGD, t, tl, args, n, vm->user);
+        vm->sp -= n;
+        break;
+    }
     default:
         FAULT(FS_FAULT_BAD_OPCODE);
     }

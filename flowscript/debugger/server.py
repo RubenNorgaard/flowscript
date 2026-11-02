@@ -110,7 +110,7 @@ class Session:
             self.vm = None
             return
         externs = {e[0]: self.make_extern(i, e[0], e[3]) for i, e in enumerate(self.prog.externs)}
-        self.vm = VM(self.prog, externs, on_emit=self.on_emit, on_fault=self.on_fault,
+        self.vm = VM(self.prog, externs, on_emit=self.on_emit, on_fault=self.on_fault, on_log=self.on_log,
                      clock=lambda vm: int(time.time() * 1000))
         self.vm.start()
         self.add_log("sys", "VM started" + (" — initial state '%s'" % self.prog.states[0] if self.prog.states else ""))
@@ -137,6 +137,10 @@ class Session:
             self.add_log("call", "%s(%s) → %s" % (name, shown, V.show(r)))
             return r.b if isinstance(r, V.Str) and text not in (None, "") else r
         return fn
+
+    def on_log(self, vm, level, template, values):
+        text = V.format_log(template, values).decode("utf-8", "replace")
+        self.add_log("log", "%s: %s" % (V.LOG_LEVELS[level], text))
 
     def on_emit(self, vm, name, args):
         self.add_log("emit", "emit %s(%s)" % (name, ", ".join(V.show(a) for a in args)))

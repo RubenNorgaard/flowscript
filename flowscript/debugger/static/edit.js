@@ -91,6 +91,7 @@ const Edit = (function () {
       case "start": return Object.assign(base, { timer: timers.length ? timers[0].name : "t", every: false, ms: { id: nid(), type: "num", line: 0, value: 1000, text: "1s" } });
       case "stop": return Object.assign(base, { timer: timers.length ? timers[0].name : "t" });
       case "return": return Object.assign(base, { value: null });
+      case "log": return Object.assign(base, { level: "info", text: "message", args: [] });
       case "comment": return Object.assign(base, { text: "note" });
     }
   }
@@ -99,7 +100,7 @@ const Edit = (function () {
     ["assign", "Process", "x = value"], ["local", "Local variable", "int tmp = 0"], ["call", "Call (I/O / sub-process)", "f(args)"],
     ["if", "Decision", "if … else"], ["while", "Loop", "while …"], ["goto", "State transition", "goto_state S"],
     ["emit", "Raise event", "raise_event E"], ["start", "Start timer", "start T 1s"], ["stop", "Stop timer", "stop T"],
-    ["return", "End / return", "return"], ["comment", "Annotation", "# note"],
+    ["return", "End / return", "return"], ["log", "Log a message", 'info "x is {x}"'], ["comment", "Annotation", "# note"],
   ];
 
   // --------------------------------------------------------------- commit
@@ -239,6 +240,7 @@ const Edit = (function () {
       case "start": title = "Start timer"; f.push(field("timer", "timer", n.timer, "select", timers.includes(n.timer) ? timers : [n.timer].concat(timers)), field("milliseconds (e.g. 500ms, 30s, 5min)", "ms", S(n.ms)), field("periodic (every)", "every", n.every, "check")); break;
       case "stop": title = "Stop timer"; f.push(field("timer", "timer", n.timer, "select", timers.includes(n.timer) ? timers : [n.timer].concat(timers))); break;
       case "return": title = "Return"; f.push(field("value(s), comma-separated (functions only, optional)", "value", listStr(n.values || (n.value ? [n.value] : [])))); break;
+      case "log": title = "Log message"; f.push(field("level", "level", n.level, "select", ["debug", "info", "warning", "error"]), field("message ({expression} shows a value, {{ }} a brace)", "text", n.text)); break;
       case "massign": title = "Assign results"; f.push(field("variables (a, b, c)", "targets", n.targets.join(", ")), field("function call", "value", S(n.value))); break;
       case "comment": title = "Annotation"; f.push(field("text", "text", n.text, "area")); break;
       case "on": {
@@ -264,14 +266,14 @@ const Edit = (function () {
           f.push(field("operand for AND / OR / XOR", "operand", "true"));
         }
     }
-    if (["assign", "massign", "local", "call", "if", "while", "goto", "emit", "start", "stop", "return", "on", "func", "state", "extern", "event", "timer", "const", "var"].includes(n.type)) {
+    if (["assign", "massign", "log", "local", "call", "if", "while", "goto", "emit", "start", "stop", "return", "on", "func", "state", "extern", "event", "timer", "const", "var"].includes(n.type)) {
       f.push(field("annotation (note)", "note", n.note || "", "area"));
     }
     return { title, html: f.join("") };
   }
 
   function isExpr(n) { return ["binary", "unary", "num", "name", "callx", "bool", "str"].includes(n.type); }
-  function isStmt(n) { return ["assign", "massign", "local", "call", "if", "while", "goto", "emit", "start", "stop", "return", "comment"].includes(n.type); }
+  function isStmt(n) { return ["assign", "massign", "log", "local", "call", "if", "while", "goto", "emit", "start", "stop", "return", "comment"].includes(n.type); }
 
   function select(id, branch) {
     reindex();
@@ -339,6 +341,29 @@ const Edit = (function () {
     keys.forEach((k, i) => { if (!res[i].ok) throw new Error(`${k}: ${res[i].error}`); out[k] = res[i].expr; });
     return out;
   }
+  // the {expressions} of a log message (same rules as values.split_template)
+  async function logArgs(text) {
+    const found = [];
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i], d = text[i + 1];
+      if ((c === "{" && d === "{") || (c === "}" && d === "}")) { i++; continue; }
+      if (c === "}") throw new Error("'}' without an opening '{' (write '}}' for a brace)");
+      if (c === "{") {
+        const j = text.indexOf("}", i + 1);
+        if (j < 0) throw new Error("'{' without a closing '}' (write '{{' for a brace)");
+        const e = text.slice(i + 1, j).trim();
+        if (!e) throw new Error("empty {} in the message: put an expression in it, e.g. {x}");
+        found.push(e);
+        i = j;
+      }
+    }
+    if (!found.length) return [];
+    const map = {};
+    found.forEach((e, k) => (map["a" + k] = e));
+    const parsed = await exprs(map);
+    return found.map((_e, k) => parsed["a" + k]);
+  }
+
   async function exprList(text) {
     const t = (text || "").trim();
     if (!t) return [];
@@ -385,6 +410,12 @@ const Edit = (function () {
         const vs = val("value").trim() ? await exprList(val("value")) : [];
         n.value = vs.length === 1 ? vs[0] : null;
         if (vs.length > 1) n.values = vs; else delete n.values;
+        break;
+      }
+      case "log": {
+        n.level = val("level");
+        n.text = val("text");
+        n.args = await logArgs(n.text);
         break;
       }
       case "massign": {

@@ -242,7 +242,7 @@ class _Chart:
         self.P('<path class="note-line" d="M%s %s H%s"/>' % (_f(from_x), _f(from_y), _f(x)))
         self.note_block(nl, x, y)
 
-    def node(self, node, kind, text, ids=None, term=False, min_w=96, head=False):
+    def node(self, node, kind, text, ids=None, term=False, min_w=96, head=False, cls=""):
         label = _clip(text, 46)
         pad = 34 if kind == "sub" else 32 if kind in ("io", "emit") else 24
         w = max(min_w, _tw(label) + pad)
@@ -254,7 +254,8 @@ class _Chart:
             x0 = cx - w / 2
             self.P('<g class="nd k-%s%s" data-ids="%s" data-line="%s"><title>%s</title>%s'
                    '<text x="%s" y="%s" text-anchor="middle">%s</text></g>'
-                   % (kind, " head" if head else "", " ".join(map(str, ids)), node.get("line", 0),
+                   % (kind, (" head" if head else "") + (" " + cls if cls else ""),
+                      " ".join(map(str, ids)), node.get("line", 0),
                       _esc(text), self.shape(kind, x0, y, w, NH), _f(cx), _f(y + 21), _esc(label)))
             if nl:
                 self.draw_note(nl, cx + w / 2 + 18, y, cx + w / 2, y + NH / 2)
@@ -292,6 +293,9 @@ class _Chart:
         E = expr_to_str
         if t == "assign":
             return self.node(s, "proc", "%s = %s" % (s["target"], E(s["value"])))
+        if t == "log":
+            from .printer import _quote
+            return self.node(s, "io", "%s %s" % (s["level"], _quote(s["text"])), cls="log lv-" + s["level"])
         if t == "massign":
             v = s["value"]
             return self.node(s, "sub" if v["name"] in self.funcs else "io",
@@ -643,6 +647,9 @@ _RULES = """
 .fs-chart .k-ev>.sh{fill:var(--fs-n-ev)}.fs-chart .k-end>.sh{fill:var(--fs-n-end)}
 .fs-chart .k-leaf>.sh{fill:var(--fs-n-leaf)}.fs-chart .k-gate>.sh{fill:var(--fs-n-gate)}
 .fs-chart .k-note>.sh{fill:var(--fs-n-note);stroke-dasharray:3 2}
+.fs-chart .log.lv-warning>.sh{stroke:var(--fs-ev);stroke-width:1.8}
+.fs-chart .log.lv-error>.sh{stroke:var(--fs-bad);stroke-width:1.8}
+.fs-chart .log.lv-debug>.sh{stroke-dasharray:4 2}
 .fs-chart .k-note text{fill:var(--fs-cmt);font-style:italic}
 .fs-chart .note-line{stroke:var(--fs-cmt);stroke-dasharray:2 3;fill:none}
 .fs-chart .gate-op{font-size:10px;fill:var(--fs-gate-text)}.fs-chart .end{font-size:10px;fill:var(--fs-muted)}

@@ -122,8 +122,10 @@ initial state trading:
     day, integral, last_error, deriv, aggression, loss_pct = control_step(t, day, last, integral, last_error, deriv, false)
     last = t
     if loss_pct >= param("stop_pct"):
+      error "lost {loss_pct}% of capital today: stopped, only reducing the position"
       goto_state stopped
     elif loss_pct >= param("brake_pct"):
+      warning "lost {loss_pct}% of capital today: braking (aggression 0)"
       goto_state braking
 
   on tick:
@@ -144,8 +146,10 @@ state braking:
     day, integral, last_error, deriv, aggression, loss_pct = control_step(t, day, last, integral, last_error, deriv, true)
     last = t
     if loss_pct >= param("stop_pct"):
+      error "lost {loss_pct}% of capital today: stopped, only reducing the position"
       goto_state stopped
     elif loss_pct < param("brake_pct"):
+      info "loss {loss_pct}% of capital: back to trading"
       goto_state trading
 
   on tick:
@@ -166,8 +170,10 @@ state stopped:
     last = t
     # a new day starts from zero: back to braking or trading
     if loss_pct < param("brake_pct"):
+      info "loss {loss_pct}% of capital: back to trading"
       goto_state trading
     elif loss_pct < param("stop_pct"):
+      info "loss {loss_pct}% of capital: braking again instead of stopped"
       goto_state braking
 
   on tick:

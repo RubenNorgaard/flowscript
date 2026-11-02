@@ -93,6 +93,9 @@ def run_scenario(prog, scenario_text, out):
     def on_emit(vm, name, args):
         out("emit %s(%s)" % (name, show_args(args)))
 
+    def on_log(vm, level, template, values):
+        out("log %s %s" % (V.LOG_LEVELS[level], V.quote(V.format_log(template, values))))
+
     def on_fault(vm, code, pc):
         out("fault %d at %d" % (code, pc))
 
@@ -106,7 +109,7 @@ def run_scenario(prog, scenario_text, out):
     cmds = parse_scenario(scenario_text)
     host_timers = any(c == "host_timers" for c, _a in cmds)
 
-    vm = VM(prog, externs, on_emit=on_emit, on_fault=on_fault,
+    vm = VM(prog, externs, on_emit=on_emit, on_fault=on_fault, on_log=on_log,
             on_timer=on_timer if host_timers else None, clock=lambda vm: clock[0])
     last_state = [None]
 

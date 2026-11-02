@@ -138,6 +138,10 @@ class Machine:
     on_event: callable(name, args) for every ``raise_event`` (args as Python values), before
               the event is queued for the script itself.
     on_fault: callable(Fault).  Faults are also kept in ``faults`` (the last 100).
+    on_log:   callable(level, message, template, values) for every log statement
+              (``warning "x is {x}"``): level "debug"/"info"/"warning"/"error", the rendered
+              message, the template ('{}' per value) and the values as Python.  Without it,
+              log statements do nothing (e.g. ``on_log=lambda lv, msg, *_: logger.log(...)``).
     on_timer: None: timers run inside the machine, driven by ``advance(ms)``.  Or
               callable(name, start, ms, periodic): the host runs the timers (start=False stops
               one) and calls ``timer_expired(name)`` when one fires.
@@ -146,7 +150,7 @@ class Machine:
     """
 
     def __init__(self, program, *, externs=None, clock=None, on_event=None, on_fault=None,
-                 on_timer=None, **limits):
+                 on_timer=None, on_log=None, **limits):
         if isinstance(program, (bytes, bytearray, memoryview)):
             program = load(program)
         self.program = program
@@ -161,6 +165,7 @@ class Machine:
         self._on_fault = on_fault
         self._on_event = on_event
         self._on_timer = on_timer
+        self._on_log = on_log
         if clock is None:
             import time
             clock = time.time
@@ -169,7 +174,8 @@ class Machine:
         self._globals = {n: i for i, n in enumerate(names) if n}
         self.vm = VM(program, {name: self._wrap(fn) for name, fn in externs.items()},
                      on_emit=self._emit, on_fault=self._fault,
-                     on_timer=self._timer if on_timer else None, clock=self._now, **limits)
+                     on_timer=self._timer if on_timer else None, clock=self._now,
+                     on_log=self._log if on_log else None, **limits)
 
     # -- glue ---------------------------------------------------------------------------
     @staticmethod
@@ -185,6 +191,10 @@ class Machine:
     def _emit(self, vm, name, args):
         if self._on_event:
             self._on_event(name, [_to_py(a) for a in args])
+
+    def _log(self, vm, level, template, values):
+        message = V.format_log(template, values).decode("utf-8", "surrogateescape")
+        self._on_log(V.LOG_LEVELS[level], message, template, [_to_py(v) for v in values])
 
     def _timer(self, vm, timer, start, ms, periodic):
         self._on_timer(self.program.events[self.program.timers[timer]][0], bool(start), ms, bool(periodic))

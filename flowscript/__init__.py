@@ -33,4 +33,4 @@ __all__ = [
     # lower level
     "FlowError", "parse", "parse_expression", "expr_to_str", "compile_source", "compile_ast", "VM",
 ]
-__version__ = "0.2.0"
+__version__ = "0.3.0"

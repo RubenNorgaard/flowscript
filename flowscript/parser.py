@@ -9,6 +9,7 @@ carry a ``note`` (comment text shown as an annotation).
 import sys
 
 from .lexer import tokenize, FlowError, TYPE_KEYWORDS
+from .values import LOG_LEVELS, split_template
 
 BINARY_LEVELS = [
     ("or",),
@@ -407,10 +408,51 @@ class Parser:
                 continue
             body.append(self.attach(self.parse_stmt(), note))
 
+    def parse_log(self):
+        """debug/info/warning/error "message with {expressions}": a log statement."""
+        t = self.advance()
+        st = self.advance()
+        try:
+            pieces, texts = split_template(st.value)
+        except ValueError as e:
+            raise FlowError(str(e), st.line, st.col)
+        args = []
+        for text in texts:
+            sub = Parser(text)
+            sub.next_id = self.next_id
+            try:
+                while sub.tok.kind == "NEWLINE":
+                    sub.advance()
+                e = sub.parse_expr()
+                if sub.tok.kind not in ("NEWLINE", "DEDENT", "EOF"):
+                    raise sub.error("unexpected %s after the expression" % sub.describe(sub.tok))
+            except FlowError as err:
+                raise FlowError("in {%s}: %s" % (text, err.msg), st.line, st.col)
+            self.next_id = sub.next_id
+            self._relocate(e, st.line)
+            args.append(e)
+        n = self.node("log", t, level=t.value, text=st.value, args=args)
+        self.end_of_line(n)
+        return n
+
+    @staticmethod
+    def _relocate(e, line):
+        """Nodes parsed from inside a string literal: they are on the statement's line."""
+        if isinstance(e, dict):
+            if "line" in e:
+                e["line"] = line
+            for v in e.values():
+                Parser._relocate(v, line)
+        elif isinstance(e, list):
+            for v in e:
+                Parser._relocate(v, line)
+
     def parse_stmt(self):
         t = self.tok
         if t.kind == "INDENT":
             raise self.error("unexpected indentation")
+        if t.kind == "NAME" and t.value in LOG_LEVELS and self.peek().kind == "STR":
+            return self.parse_log()
         self.check_end()
         self.var_hint()
         if t.kind == "KW":

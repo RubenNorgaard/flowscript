@@ -10,7 +10,7 @@ Three separate budgets matter on a device:
 """
 
 from .bytecode import Program, decode, BUILTIN_EVENTS, features, FEATURES, FLAG_STR
-from .values import BUILTINS
+from .values import BUILTINS, template_args
 
 # C VM defaults (c/flowscript.h)
 DEFAULTS = {
@@ -100,7 +100,7 @@ def fs_vm_size(cfg, ptr=4):
     timer, talign = _layout([u8, u8, (2, 2), i32, (8, 8)])
     strslot, salign = _layout([u16, u8, u8, (cfg["FS_STR_LEN"] + 1, 1)])
     fields = [P, P] + [P] * 9 + [i32] + [u16] * 10 + [u8]
-    fields += [(ptr * cfg["FS_MAX_EXTERNS"], ptr), P, P, P]   # bound, on_emit/fault/timer
+    fields += [(ptr * cfg["FS_MAX_EXTERNS"], ptr), P, P, P, P]   # bound, on_emit/fault/timer/log
     fields += [] if cfg.get("FS_NO_TIME") else [P]               # clock
     fields += [P]                                                # user
     fields += [(csize * cfg["FS_MAX_GLOBALS"], calign), (csize * cfg["FS_STACK_SIZE"], calign), i32,
@@ -202,6 +202,10 @@ def _local_peak(prog, start, nlocals, results=None):
                 if arg >= len(prog.events):
                     break
                 d -= prog.events[arg][1]
+            elif name in ("LOGD", "LOGI", "LOGW", "LOGE"):
+                if arg >= len(prog.strings):
+                    break
+                d -= template_args(prog.strings[arg])
             else:
                 d += _EFFECT.get(name, 0)
             peak = max(peak, d)

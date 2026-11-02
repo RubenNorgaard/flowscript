@@ -61,6 +61,8 @@ machine = flowscript.Machine(
              "diag": diagnostics.__setitem__},
     clock=time.time,                           # what now() returns (seconds, or a datetime)
     on_event=lambda name, args: ...,           # every raise_event
+    on_log=lambda level, message, template, values: log.log(LEVELS[level], message),
+                                               # every log statement (warning "x is {x}")
     on_fault=lambda fault: log.warning(fault), # also kept in machine.faults
 )
 machine.start()                                # on boot, then enter the initial state
@@ -143,6 +145,7 @@ state driving:                  # only states handle events: a state lists all i
   on report:
     float kmh = gps_speed() * 1.0   # local variable; ints promote to float
     if kmh > LIMIT and not reports > 100:
+      warning "speeding: {kmh} km/h, limit {LIMIT}"   # a log message: the host formats it
       reports, last_reason = notify(2, reports)   # several results, assigned in order
     elif kmh == 0 and now() - since > 10min:
       raise_event ignition(0)   # queued for the script + host notified
@@ -159,7 +162,8 @@ Four types — `int` (int32), `float` (double), `str`, `time` (UTC, ms) — chec
 time, with int → float promotion and nothing else implicit; built-in conversions
 (`int() float() str() time()`), string (`len substr find`), time (`now date year … weekday`)
 and math functions (`abs min max floor ceil round sqrt exp log pow`). Statements:
-`if/elif/else`, `while`, `goto_state`, `raise_event`, `start/stop`, `return`, functions
+`if/elif/else`, `while`, `goto_state`, `raise_event`, `start/stop`, `return`, log messages
+(`warning "x is {x}"`: the host gets a template and the values, so they work in every build), functions
 (with several results: `a, b = f(x)`),
 and the operators `or xor and not == != < <= > >= | ^ & << >> + - * / % ~`. That is the
 whole language. See [SPEC.md](https://github.com/RubenNorgaard/flowscript/blob/main/SPEC.md) for the exact semantics and the bytecode format.
@@ -182,6 +186,7 @@ larger program (a PID-steered market-making controller) using floats and times.
 | `and` `or` `xor` `not` | AND / OR / XOR / NOT gates |
 | `goto_state S` | state transition (red terminator) |
 | `raise_event E` | signal (flag) |
+| `warning "x is {x}"` (`debug` `info` `warning` `error`) | I/O, outlined by level: a log message for the host |
 | `start` / `stop` | timer (hourglass) |
 | `return` | terminator |
 | `# comment` | annotation (attached to the node below it) |
@@ -262,6 +267,22 @@ void main_loop(void) {                              /* or an RTOS task */
 
 /* in logic_init, before fs_start(): */
 fs_set_timer_handler(&vm, on_timer);
+```
+
+Log statements (`warning "battery at {mv} mV"`) reach the host as a template and typed
+values; the VM never builds the text, so they work in the smallest build. Render them, or
+ship the template's position in the image and the raw values to be formatted elsewhere:
+
+```c
+static void on_log(fs_vm *vm, int level, const char *tmpl, uint16_t len,
+                   const fs_value *v, int n, void *u) {
+    char line[128];
+    fs_format_log(vm, tmpl, len, v, n, line, sizeof line);   /* "battery at 3412 mV" */
+    uart_printf("[%d] %s\n", level, line);
+}
+
+/* in logic_init: */
+fs_set_log_handler(&vm, on_log);
 ```
 
 Like every VM call, `fs_timer_expired` and `fs_run` must not interrupt a running

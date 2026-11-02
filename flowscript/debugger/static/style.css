@@ -109,6 +109,9 @@ input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
 #chart .k-timer > .sh { fill: var(--n-timer); } #chart .k-ret > .sh { fill: var(--n-ret); }
 #chart .k-ev > .sh { fill: var(--n-ev); } #chart .k-end > .sh { fill: #444; }
 #chart .k-note > .sh { fill: var(--n-note); stroke-dasharray: 3 2; }
+#chart .log.lv-warning > .sh { stroke: var(--ev); stroke-width: 1.8; }
+#chart .log.lv-error > .sh { stroke: var(--bad); stroke-width: 1.8; }
+#chart .log.lv-debug > .sh { stroke-dasharray: 4 2; }
 #chart .k-note text { fill: var(--cmt); font-style: italic; }
 #chart .k-leaf > .sh { fill: #222833; }
 #chart .k-gate > .sh { fill: #2a303c; }
@@ -166,7 +169,7 @@ input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
 .kv .v.chg { color: var(--cur); }
 .kv input { width: 80px; padding: 0 4px; font: 12px var(--mono); }
 #log { font: 12px/17px var(--mono); }
-#log .call { color: var(--ok); } #log .emit { color: #7fdbff; } #log .state { color: var(--cur); font-weight: bold; }
+#log .call { color: var(--ok); } #log .emit { color: #7fdbff; } #log .log { color: var(--ev); } #log .state { color: var(--cur); font-weight: bold; }
 #log .fault { color: var(--bad); font-weight: bold; } #log .dispatch { color: var(--ev); } #log .sys { color: var(--muted); }
 #log .post, #log .tick { color: var(--kw); }
 .stackv { font: 12px var(--mono); color: var(--fg); }

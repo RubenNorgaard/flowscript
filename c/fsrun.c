@@ -179,6 +179,38 @@ static fs_value stub(fs_vm *v, const fs_value *args, int argc, void *user)
     return r;
 }
 
+/* values.quote: "..." with \" \\ \n \t and \xNN escapes */
+static void print_quoted(const char *b, int n)
+{
+    int i;
+    putchar('"');
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)b[i];
+        if (c == '"') fputs("\\\"", stdout);
+        else if (c == '\\') fputs("\\\\", stdout);
+        else if (c == '\n') fputs("\\n", stdout);
+        else if (c == '\t') fputs("\\t", stdout);
+        else if (c >= 0x20 && c < 0x7f) putchar(c);
+        else printf("\\x%02x", c);
+    }
+    putchar('"');
+}
+
+static void on_log(fs_vm *v, int level, const char *tmpl, uint16_t len, const fs_value *values, int n,
+                   void *user)
+{
+    static const char *const names[] = {"debug", "info", "warning", "error"};
+    static char buf[4096];
+    int m;
+    (void)user;
+    m = fs_format_log(v, tmpl, len, values, n, buf, (int)sizeof(buf));
+    if (m > (int)sizeof(buf) - 1)
+        m = (int)sizeof(buf) - 1;
+    printf("log %s ", names[level & 3]);
+    print_quoted(buf, m);
+    putchar('\n');
+}
+
 static void on_emit(fs_vm *v, int event, const fs_value *args, int argc, void *user)
 {
     (void)user;
@@ -500,6 +532,7 @@ int main(int argc, char **argv)
     for (i = 0; i < vm.n_externs; i++)
         fs_bind_index(&vm, i, stub);
     fs_set_callbacks(&vm, on_emit, on_fault, NULL);
+    fs_set_log_handler(&vm, on_log);
     fs_set_clock(&vm, on_clock);
     if (argc == 3)
         sc = read_file(argv[2], &slen);

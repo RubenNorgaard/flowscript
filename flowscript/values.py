@@ -466,6 +466,86 @@ def to_text(v):
     return show(v).encode("ascii")
 
 
+# ---- log statements -----------------------------------------------------------------------
+LOG_LEVELS = ("debug", "info", "warning", "error")
+MAX_LOG_ARGS = 8          # {expressions} in one message (the VMs accept up to 16)
+
+
+def split_template(text):
+    """A log message as written ("x is {x}, {{literal}}") -> (pieces, expression texts).
+
+    len(pieces) == len(exprs) + 1; '{{' and '}}' are literal braces.  Raises ValueError."""
+    pieces, exprs, cur, i = [], [], [], 0
+    while i < len(text):
+        c = text[i]
+        if c == "{" and text[i + 1:i + 2] == "{":
+            cur.append("{")
+            i += 2
+        elif c == "}" and text[i + 1:i + 2] == "}":
+            cur.append("}")
+            i += 2
+        elif c == "{":
+            j = text.find("}", i + 1)
+            if j < 0:
+                raise ValueError("'{' without a closing '}' in the message (write '{{' for a brace; "
+                                 "a string inside {...} is written with \\\" quotes: {\\\"text\\\"})")
+            expr = text[i + 1:j].strip()
+            if not expr:
+                raise ValueError("empty '{}' in the message: put an expression in it, e.g. {x}")
+            pieces.append("".join(cur))
+            exprs.append(expr)
+            cur = []
+            i = j + 1
+        elif c == "}":
+            raise ValueError("'}' without an opening '{' in the message (write '}}' for a brace)")
+        else:
+            cur.append(c)
+            i += 1
+    pieces.append("".join(cur))
+    return pieces, exprs
+
+
+def log_template(pieces):
+    """The template stored in the image: the literal pieces, braces doubled, '{}' per value."""
+    return "{}".join(p.replace("{", "{{").replace("}", "}}") for p in pieces)
+
+
+def template_args(template):
+    """Number of '{}' slots in a stored template (bytes or str)."""
+    t = template if isinstance(template, bytes) else template.encode("utf-8", "surrogateescape")
+    n, i = 0, 0
+    while i < len(t):
+        if t[i:i + 2] in (b"{{", b"}}"):
+            i += 2
+        elif t[i:i + 2] == b"{}":
+            n += 1
+            i += 2
+        else:
+            i += 1
+    return n
+
+
+def format_log(template, values):
+    """The message: each '{}' replaced by its value's text (a str as itself, others as in the
+    traces), '{{' '}}' as braces.  bytes in, bytes out (fs_format_log in C)."""
+    t = template if isinstance(template, bytes) else template.encode("utf-8", "surrogateescape")
+    out, i, k = bytearray(), 0, 0
+    while i < len(t):
+        two = t[i:i + 2]
+        if two == b"{{" or two == b"}}":
+            out += two[:1]
+            i += 2
+        elif two == b"{}":
+            if k < len(values):
+                out += to_text(values[k])
+            k += 1
+            i += 2
+        else:
+            out.append(t[i])
+            i += 1
+    return bytes(out)
+
+
 def unquote(text):
     """Inverse of quote() for scenario files / the debugger. Returns bytes or None."""
     if len(text) < 2 or text[0] != '"' or text[-1] != '"':

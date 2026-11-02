@@ -19,11 +19,12 @@ Non-goals: it is *not* a general-purpose language. There are no arrays, no heap,
 closures and no blocking calls.
 
 v2 added the types `float`, `str` and `time` to v1's single int type; variables are
-declared with their type (`int x = 0`) instead of `var`. v3 (this document) is a strict
-state machine: only states handle events (`any_state` is gone, `on boot` lives in the
-initial state), functions can return several results (`a, b = f(x)`), and a periodic
-timer restarted with the same period keeps running across transitions. Older images
-are rejected (format version 3).
+declared with their type (`int x = 0`) instead of `var`. v3 made it a strict state
+machine: only states handle events (`any_state` is gone, `on boot` lives in the initial
+state), functions can return several results (`a, b = f(x)`), and a periodic timer
+restarted with the same period keeps running across transitions. v4 (this document)
+adds log statements (`warning "x is {x}"`, see 5.1). Older images are rejected (format
+version 4).
 
 ---
 
@@ -275,6 +276,7 @@ state trading:
 | `while c:` … | **Loop** diamond with back edge |
 | `goto_state STATE` | **Transition** connector (circle) – ends the handler |
 | `raise_event EVENT[(args)]` | **Signal** (flag / pentagon) |
+| `debug`/`info`/`warning`/`error` `"text {expr}"` | **I/O** parallelogram (outlined by level) |
 | `start TIMER ms` / `start TIMER every ms` | **Timer** (hourglass) – one-shot / periodic |
 | `stop TIMER` | **Timer** (hourglass, crossed) |
 | `return [expr]` | **Terminator** |
@@ -298,6 +300,8 @@ Notes:
   stops when that state is left, unless the new state's `enter` handler starts it
   again (see 8.3). So a periodic timer that every state starts in `on enter` with the
   same period keeps one rhythm across all transitions.
+* A log statement hands the host a message (5.1); like `raise_event` it changes no
+  variable, so functions may log too.
 * Locals (`float x = …`) are function-scoped; a name can only be declared once
   per function/handler, and is visible from its declaration on. Every local starts at
   its type's zero value, so one declared in a branch that did not run still holds a
@@ -305,6 +309,30 @@ Notes:
 * `start T ms`: `ms` is an int.
 * `while` loops are allowed; every handler run has an **instruction budget**
   (default 10 000) that faults runaway loops.
+
+### 5.1 Log statements
+
+```flowscript
+warning "aggression {aggression} exceeds the maximum of {MAX_AGGRESSION}"
+info "entered braking at a loss of {loss_pct}%"
+```
+
+* Four levels: `debug`, `info`, `warning`, `error`. The word is a log statement only at
+  the start of a statement and followed directly by a string literal, so the four words
+  stay usable as names (`error = target - daily` is an assignment).
+* `{expr}` shows the value of any expression of any type (up to 8 per message), checked
+  like any other expression; `{{` and `}}` are literal braces. A string inside `{...}` is
+  written with `\"` quotes (the message is itself a string literal).
+* The compiler turns the text into a **template** stored once in the image: the literal
+  pieces, braces doubled, and `{}` for each value (`"aggression {} exceeds the maximum of
+  {}"`). At run time the VM evaluates the values and calls the host with the level, the
+  template and the values; it never builds the message. A log statement therefore
+  costs no string slot and no float or time formatting in the VM, and works in every C
+  build (`FS_NO_STR`, `FS_NO_TEXT` ...). Formatting is the host's choice: render it
+  (`fs_format_log`, Python's `format_log`: a str as itself, other values as in the traces),
+  print the template and the values, or send the template's index and the raw values
+  somewhere to be rendered later. Without a handler a log statement does nothing.
+* Traces show `log LEVEL "rendered message"`.
 
 ## 6. Expressions (= logic gates)
 
@@ -457,7 +485,7 @@ can point straight into the buffer.
 ```
 Header (32 bytes)
   0  u8[4]  magic "FSB1"
-  4  u16    format version (3)
+  4  u16    format version (4)
   6  u16    flags            bit0: debug section present
                               bit1: needs float values     (refused by FS_NO_FLOAT builds)
                               bit2: needs time values      (refused by FS_NO_TIME builds)
@@ -549,6 +577,7 @@ Operand types other than those listed fault with 10. An int is promoted to float
 `BUILTIN 0` (`float(int)`); the compiler emits a small integral float constant as
 `PUSH8`/`PUSH` + `BUILTIN 0` (4–7 bytes instead of 9).
 | TSTOP | 64 | u16 | – | |
+| LOGD LOGI LOGW LOGE | 65–68 | u16 | v1 … vn → | log at level debug/info/warning/error: the u16 is the template string; its `{}` slots give n (n > 16: fault 5); the host's log handler gets the template and v1 … vn |
 
 ### 8.2 Frames
 

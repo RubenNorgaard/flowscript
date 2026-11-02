@@ -190,6 +190,8 @@ class Printer:
         self.note(d, s)
         if t == "assign":
             self.emit(d, "%s = %s" % (s["target"], expr_to_str(s["value"])))
+        elif t == "log":
+            self.emit(d, "%s %s" % (s["level"], _quote(s["text"])))
         elif t == "massign":
             self.emit(d, "%s = %s" % (", ".join(s["targets"]), expr_to_str(s["value"])))
         elif t == "local":

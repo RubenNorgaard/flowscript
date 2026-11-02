@@ -697,6 +697,20 @@ class Compiler:
         self.routine.declared.add(s["name"])
         self.emit("STOREL", idx, s)
 
+    LOG_OPS = {"debug": "LOGD", "info": "LOGI", "warning": "LOGW", "error": "LOGE"}
+
+    def stmt_log(self, s):
+        """warning "text {expr} ...": the values go to the host with the message template.
+        The VM never builds the text (it works without run-time strings or float formatting)."""
+        pieces, _texts = V.split_template(s["text"])
+        args = s.get("args") or []
+        if len(args) > V.MAX_LOG_ARGS:
+            raise self.err("a message can show at most %d values" % V.MAX_LOG_ARGS, s)
+        for e in args:
+            self.value_type(e)                        # any type, but it must be a value
+            self.expr(e)
+        self.emit(self.LOG_OPS[s["level"]], self.string(V.log_template(pieces).encode("utf-8", "surrogateescape")), s)
+
     def stmt_call(self, s):
         _kind, _idx, _pt, ret = self.call_target(s)
         self.call(s, s)
@@ -1000,6 +1014,8 @@ class Compiler:
         else:
             hit = self.resolve_builtin(name, [self.value_type(a) for a in args], e)
             if hit is None:
+                if name in V.LOG_LEVELS:
+                    raise self.err("to log, write %s \"message {value}\" without parentheses" % name, e)
                 raise self.err("unknown function '%s' (declare host functions with 'extern %s(...)')" % (name, name), e)
             return ("BUILTIN", hit[0], hit[1], hit[2])
         if len(args) != argc:

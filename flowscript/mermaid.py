@@ -65,6 +65,8 @@ class _M:
             return self.node("term", "return" + (" " + ", ".join(expr_to_str(v) for v in vs) if vs else "")), []
         if t == "assign":
             n = self.node("proc", "%s = %s" % (s["target"], expr_to_str(s["value"])))
+        elif t == "log":
+            n = self.node("io", "%s %s" % (s["level"], s["text"]))
         elif t == "massign":
             n = self.node("sub" if s["value"]["name"] in funcs else "io",
                           "%s = %s" % (", ".join(s["targets"]), expr_to_str(s["value"])))

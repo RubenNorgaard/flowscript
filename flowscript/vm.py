@@ -41,12 +41,15 @@ class VM:
     clock:    callable(vm) -> int ms since 1970 (UTC) for now(); default: always 0
     on_emit:  callable(vm, event_name, args) or None
     on_fault: callable(vm, code, pc) or None
+    on_log:   callable(vm, level, template, values) or None: a log statement (level 0 debug,
+              1 info, 2 warning, 3 error; template a str with '{}' per value, '{{' '}}' braces;
+              values.format_log renders it).  Without it, log statements do nothing.
     on_timer: callable(vm, timer, start, ms, periodic) or None. When set the host runs the
               timers: the VM asks it to start/stop them and the host calls
               timer_expired() when one fires; tick() then does nothing.
     """
 
-    def __init__(self, prog, externs=None, on_emit=None, on_fault=None, on_timer=None,
+    def __init__(self, prog, externs=None, on_emit=None, on_fault=None, on_timer=None, on_log=None,
                  stack_size=STACK_SIZE, max_frames=MAX_FRAMES, queue_size=QUEUE_SIZE, budget=BUDGET,
                  max_chain=MAX_CHAIN, str_slots=STR_SLOTS, str_len=STR_LEN, clock=None):
         if isinstance(prog, (bytes, bytearray)):
@@ -57,6 +60,7 @@ class VM:
         self.on_emit = on_emit
         self.on_fault = on_fault
         self.on_timer = on_timer
+        self.on_log = on_log
         self.stack_size = stack_size
         self.max_frames = max_frames
         self.queue_size = queue_size
@@ -567,6 +571,19 @@ class VM:
             t[4] = self.handler[0]
             if self.on_timer:
                 self.on_timer(self, arg, 1, ms, 1 if t[1] else 0)
+        elif name in ("LOGD", "LOGI", "LOGW", "LOGE"):
+            if arg >= len(self.prog.strings):
+                raise Fault(5)
+            template = self.prog.strings[arg]
+            n = V.template_args(template)
+            if n > 16:                              # MAX_LOG_ARGS in the C VM
+                raise Fault(5)
+            if len(self.stack) < n:
+                raise Fault(2)
+            if self.on_log:
+                self.on_log(self, ("LOGD", "LOGI", "LOGW", "LOGE").index(name), template,
+                            self.stack[len(self.stack) - n:] if n else [])
+            del self.stack[len(self.stack) - n:]
         elif name == "TSTOP":
             if arg >= len(self.timers):
                 raise Fault(5)
