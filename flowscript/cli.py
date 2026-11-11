@@ -10,10 +10,12 @@
   ast      FILE.fs                      print the visual model (AST JSON)
   run      FILE.fs|FILE.fsb [SCENARIO] [--record OUT.rec]
                                         run with stubbed externs, print trace (and record it)
-  replay   FILE.fs|FILE.fsb REC|- [--svg OUT.svg]
+  replay   FILE.fs|FILE.fsb REC|- [--svg OUT.svg] [--image DEVICE.fsb]
                                         replay a recording (- : stream it from stdin, e.g. a
                                         serial port) and print the trace; --svg redraws the
-                                        state diagram, current state highlighted, on changes
+                                        state diagram, current state highlighted, on changes;
+                                        --image replays the device's exact image (a -g build)
+                                        while FILE.fs draws the diagram
   mermaid  FILE.fs                      print a Mermaid flowchart
   migrate  FILE.fs [-w]                 rewrite a 0.1 program (any_state) for 0.2
   debug    FILE.fs [--port N]           start the 3-view web debugger
@@ -68,6 +70,8 @@ def main(argv=None):
     p.add_argument("file")
     p.add_argument("recording")
     p.add_argument("--svg", help="keep this SVG file showing the current state")
+    p.add_argument("--image", help="the .fsb the device runs (e.g. a -g build): replay that image, "
+                                   "and use FILE.fs only to draw --svg")
     p = sub.add_parser("migrate")
     p.add_argument("file")
     p.add_argument("-w", "--write", action="store_true")
@@ -140,6 +144,21 @@ def main(argv=None):
                     source = f.read()
             if args.svg and source is None:
                 raise FlowError("--svg needs the source (FILE.fs): bytecode has no flowchart")
+            if args.image:
+                # Replay the image the device runs (e.g. a -g build: keyframes are checked
+                # against its CRC-32); the source only draws the state diagram.
+                if source is None:
+                    raise FlowError("--image goes with the source (FILE.fs): FILE is already bytecode")
+                with open(args.image, "rb") as f:
+                    raw = f.read()
+                try:
+                    image_prog = Program.from_bytes(raw)
+                except ValueError as e:
+                    raise FlowError("%s: %s" % (args.image, e))
+                if raw not in (prog.to_bytes(debug=False), prog.to_bytes(debug=True)):
+                    print("%s: warning: %s was not compiled from this source; replaying the image, "
+                          "the state diagram may not match it" % (args.file, args.image), file=sys.stderr)
+                prog = image_prog
 
             def redraw(state):
                 tmp = args.svg + ".tmp"

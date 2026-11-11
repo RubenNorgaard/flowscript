@@ -108,6 +108,19 @@ From a terminal, `flowscript replay FILE.fs REC` prints the trace a recording re
 `cat /dev/ttyUSB0 | flowscript replay FILE.fs - --svg live.svg` follows a device live and
 keeps an SVG of its state diagram. The formats are in SPEC section 10.
 
+**Replay the exact image the device runs.** A recording is tied to its image by the
+image's CRC-32, and a `-g` image (with names) is a different image from the stripped one.
+`Replay` accepts START frames from either variant, but a KEYFRAME restores a snapshot,
+which is checked against the replay VM's own image. So if the device runs a `-g` image
+and the viewer compiled the source (stripped), every keyframe fails with "the snapshot
+belongs to another image", and a viewer that joined late never syncs. Give `Replay` the
+bytes the device loaded: its `.fsb`, or `program.to_bytes(debug=True)` when the firmware
+embeds a `-g` build (which also gives the viewer the names for `viewer.globals`).
+`flowscript replay FILE.fs` compiles the source stripped, so for a `-g` device add the
+image it runs: `flowscript replay FILE.fs REC --image DEVICE.fsb [--svg live.svg]`
+replays that image and uses the source only to draw the state diagram (with a warning if
+the image was not compiled from that source).
+
 ### Upgrading scripts from 0.1
 
 0.2 dropped `any_state`: only states handle events, `on boot` lives in the initial state,

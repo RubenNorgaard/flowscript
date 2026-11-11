@@ -213,5 +213,54 @@ class Recording(unittest.TestCase):
         with self.assertRaisesRegex(ReplayError, "another image"):
             Replay(self.p.to_bytes()).feed(b"".join(frames))
 
+    def test_cli_replay_with_device_image(self):
+        """flowscript replay FILE.fs REC --image DEVICE.fsb: a -g device, joined at a keyframe,
+        with the state diagram drawn from the source."""
+        import subprocess
+        import tempfile
+        frames, host = [], Host()
+        dev = host.machine(self.p.to_bytes(debug=True), record=frames.append)
+        dev.start()
+        dev.send("go", 3, "ann")
+        dev.advance(200)
+        cut = len(frames)
+        dev.record_keyframe()
+        dev.advance(300)
+        dev.record_flush()
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        env = dict(os.environ, PYTHONPATH=root)
+        with tempfile.TemporaryDirectory() as d:
+            src, fsb, rec, svg = (os.path.join(d, n) for n in ("p.fs", "p.fsb", "p.rec", "p.svg"))
+            with open(src, "w") as f:
+                f.write(SRC)
+            with open(fsb, "wb") as f:
+                f.write(self.p.to_bytes(debug=True))
+            with open(rec, "wb") as f:
+                f.write(b"".join(frames[cut:]))          # a viewer that joins late
+
+            def replay(file, *extra):
+                return subprocess.run([sys.executable, "-m", "flowscript", "replay", file, rec] + list(extra),
+                                      capture_output=True, text=True, env=env)
+            r = replay(src)                               # the source alone is compiled stripped
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("another image", r.stderr)
+            r = replay(src, "--image", fsb, "--svg", svg)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stderr, "")
+            self.assertIn("global[1] = %d" % dev["count"], r.stdout)
+            with open(svg) as f:
+                self.assertIn('data-state="busy"', f.read())
+            # a source the image was not compiled from: still replays (the image decides),
+            # with a warning that the state diagram may not match
+            with open(src, "w") as f:
+                f.write(SRC.replace("LIMIT = 4.0", "LIMIT = 5.0"))
+            r = replay(src, "--image", fsb)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("not compiled from", r.stderr)
+            # FILE is already bytecode: --image makes no sense
+            r = replay(fsb, "--image", fsb)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("--image", r.stderr)
+
 if __name__ == "__main__":
     unittest.main()
