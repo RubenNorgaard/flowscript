@@ -9,6 +9,7 @@ from .bytecode import Program, BY_CODE, OPERAND_SIZE, EV_BOOT, EV_ENTER, EV_EXIT
 from .intops import wrap, DivZero
 from . import values as V
 from .values import INT, FLOAT, STR, TIME, NONE_TYPE, Str, Time
+from .blocks import compile_block
 
 STACK_SIZE = 64
 MAX_FRAMES = 16
@@ -49,6 +50,10 @@ class VM:
               timer_expired() when one fires; tick() then does nothing.
     """
 
+    blocks = True    # run straight-line code compiled to Python (blocks.py); False: interpret
+                     # every instruction (the results are the same, only slower)
+    block_after = 16  # times the interpreter reaches a pc before the block there is compiled
+
     def __init__(self, prog, externs=None, on_emit=None, on_fault=None, on_timer=None, on_log=None, record=None,
                  stack_size=STACK_SIZE, max_frames=MAX_FRAMES, queue_size=QUEUE_SIZE, budget=BUDGET,
                  max_chain=MAX_CHAIN, str_slots=STR_SLOTS, str_len=STR_LEN, clock=None, observe=None):
@@ -69,6 +74,9 @@ class VM:
         self.code = prog.code
         self._decoded = {}         # pc -> (opcode, name, operand, next pc)
         self._strs = {}            # string index -> its Str (PUSHS)
+        self._blocks = {}          # pc -> times reached (int), its block (fn, length) or None
+        self._handler_for = {}     # (state, event) -> prog.find_handler(state, event)
+        self._event_ids = {}       # event name -> index
         self.externs = externs or {}
         self.on_emit = on_emit
         self.on_fault = on_fault
@@ -183,9 +191,12 @@ class VM:
         is accepted for a float, a Python str/bytes for a str). Returns False if the queue
         or the string memory is full (a fault is reported). Raises TypeError for a wrong type."""
         if isinstance(event, str):
-            idx = self.prog.event_index(event)
-            if idx < 0:
-                raise KeyError("unknown event %r" % event)
+            idx = self._event_ids.get(event)
+            if idx is None:
+                idx = self.prog.event_index(event)
+                if idx < 0:
+                    raise KeyError("unknown event %r" % event)
+                self._event_ids[event] = idx
             event = idx
         return self._post(event, args, record=bool(self.rec))
 
@@ -319,19 +330,58 @@ class VM:
     def run(self, max_steps=1000000):
         """Run until idle. Returns number of steps (each exactly as step() would do it)."""
         n = 0
-        execute = self.execute
         while n < max_steps:
             if self.handler is None:
                 if self.step() == IDLE:
                     break
+                n += 1
             else:
-                if self.rec:
-                    self.rec.steps += 1
-                try:
-                    execute()
-                except Fault as f:
-                    self.report_fault(f.code, self.cur_pc)
-                    self.finish()
+                n += self.run_handler(max_steps - n)
+        return n
+
+    def run_handler(self, max_steps=1000000):
+        """Run the active handler until it ends (done or fault), at most max_steps
+        instructions.  Returns the number run: the same as that many step() calls."""
+        n = 0
+        rec = self.rec
+        blocks = self._blocks if self.blocks and self.obs is None else None  # observing: one at a time
+        execute = self.execute
+        while n < max_steps and self.handler is not None:
+            if blocks is not None:
+                pc = self.pc
+                b = blocks.get(pc, 0)
+                if b.__class__ is int:              # not hot yet: count
+                    if b < self.block_after:
+                        blocks[pc] = b + 1
+                        b = None
+                    else:
+                        b = blocks[pc] = compile_block(self, pc)
+                if b is not None:
+                    room = min(max_steps - n, self.budget - self.steps)
+                    if room >= b[1]:
+                        r = b[0](self, self.stack, room)
+                        if r >= 0:
+                            k = r & 0xFFFFFFFF
+                            self.pc = r >> 32
+                        else:                       # the interpreter runs instruction i next
+                            x = -1 - r
+                            k = x >> 16
+                            self.pc = b[0].pcs[x & 0xFFFF]
+                        self.steps += k
+                        n += k
+                        if rec:
+                            rec.steps += k
+                        if r >= 0:
+                            continue
+                        if n >= max_steps:
+                            break
+            if rec:
+                rec.steps += 1
+            try:
+                execute()
+            except Fault as f:
+                self.report_fault(f.code, self.cur_pc)
+                self.finish()
             n += 1
         return n
 
@@ -361,7 +411,7 @@ class VM:
                 self.stop_timer(i)
         if self.boot_pending:
             self.boot_pending = False
-            h = p.find_handler(0 if p.states else None, EV_BOOT)   # 'on boot' lives in the initial state
+            h = self.find_handler(0 if p.states else None, EV_BOOT)   # 'on boot' lives in the initial state
             if h is not None:
                 self.begin(h, [])
                 return True
@@ -369,7 +419,7 @@ class VM:
             self.transition = self.pending
             self.pending = None
             if self.state is not None:
-                h = p.find_handler(self.state, EV_EXIT)
+                h = self.find_handler(self.state, EV_EXIT)
                 if h is not None and h[0] == self.state:
                     self.in_exit = True
                     self.begin(h, [])
@@ -388,17 +438,25 @@ class VM:
             self.transition = None
             if self.obs:
                 self.obs.state()
-            h = p.find_handler(self.state, EV_ENTER)
+            h = self.find_handler(self.state, EV_ENTER)
             if h is not None and h[0] == self.state:
                 self.begin(h, [])
             return True
         while self.queue:
             ev, args = self.queue.pop(0)
-            h = p.find_handler(self.state, ev)
+            h = self.find_handler(self.state, ev)
             if h is not None:
                 self.begin(h, args)
                 return True
         return False
+
+    def find_handler(self, state, event):
+        """prog.find_handler, remembered (the program does not change)."""
+        key = (state, event)
+        h = self._handler_for.get(key, False)
+        if h is False:
+            h = self._handler_for[key] = self.prog.find_handler(state, event)
+        return h
 
     def finish(self):
         self.handler = None

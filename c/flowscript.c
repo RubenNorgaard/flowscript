@@ -2397,7 +2397,10 @@ void fs_set_observe_sink(fs_vm *vm, fs_record_fn fn) { (void)vm; (void)fn; }
                     vm->sp--; (v) = SLOT(vm->sp); } while (0)
 #define PUSH(v) do { fs_value pv_ = (v); if (vm->sp >= FS_STACK_SIZE) FAULT(FS_FAULT_STACK_OVERFLOW); \
                      sset(vm, vm->sp++, pv_); } while (0)
-#define POPINT(v) do { fs_value pi_; POP(pi_); if (pi_.type != FS_INT) FAULT(FS_FAULT_TYPE); (v) = pi_.as.i; } while (0)
+#define POPINT(v) do { if (vm->sp <= 0) FAULT(FS_FAULT_STACK_UNDERFLOW); vm->sp--; \
+                       if (vm->sp >= FS_STACK_SIZE) (v) = 0; \
+                       else if (vm->stypes[vm->sp] != FS_INT) FAULT(FS_FAULT_TYPE); \
+                       else (v) = vm->stack[vm->sp].i; } while (0)
 
 /* externs take at most 16 arguments (fs_load), built-ins 6, events FS_MAX_EVENT_ARGS */
 #define MAX_CALL_ARGS (FS_MAX_EVENT_ARGS > 16 ? FS_MAX_EVENT_ARGS : 16)
@@ -2432,6 +2435,46 @@ static const char *sbytes(const fs_vm *vm, fs_value v, int *len)
     return p ? p : "";
 }
 
+/* Opcode op (an arithmetic, bitwise or comparison one, not CONCAT) on two ints. */
+static int int_binop(uint8_t op, int32_t x, int32_t y, int32_t *out)
+{
+    uint32_t ux = (uint32_t)x, uy = (uint32_t)y;
+    int32_t v;
+    switch (op) {
+    case OP_ADD: v = s32(ux + uy); break;
+    case OP_SUB: v = s32(ux - uy); break;
+    case OP_MUL: v = s32(ux * uy); break;
+    case OP_DIV:
+        if (y == 0)
+            return FS_FAULT_DIV_ZERO;
+        v = (x == INT32_MIN && y == -1) ? INT32_MIN : x / y;
+        break;
+    case OP_MOD:
+        if (y == 0)
+            return FS_FAULT_DIV_ZERO;
+        v = (y == -1) ? 0 : x % y;
+        break;
+    case OP_BAND: v = s32(ux & uy); break;
+    case OP_BOR:  v = s32(ux | uy); break;
+    case OP_BXOR: v = s32(ux ^ uy); break;
+    case OP_SHL:  v = s32(ux << (uy & 31u)); break;
+    case OP_SHR: {
+        unsigned n = uy & 31u;
+        /* arithmetic shift without relying on implementation-defined >> */
+        v = x >= 0 ? (int32_t)((uint32_t)x >> n) : -(int32_t)((uint32_t)(-(x + 1)) >> n) - 1;
+        break;
+    }
+    case OP_EQ: v = x == y; break;
+    case OP_NE: v = x != y; break;
+    case OP_LT: v = x < y; break;
+    case OP_LE: v = x <= y; break;
+    case OP_GT: v = x > y; break;
+    default:    v = x >= y; break;
+    }
+    *out = v;
+    return 0;
+}
+
 /* values.binary for opcode op on a and b (still on the stack). */
 static int binop(fs_vm *vm, uint8_t op, fs_value a, fs_value b, fs_value *r)
 {
@@ -2441,41 +2484,11 @@ static int binop(fs_vm *vm, uint8_t op, fs_value a, fs_value b, fs_value *r)
     if (op == OP_CONCAT && !(a.type == FS_STR && b.type == FS_STR))
         return FS_FAULT_TYPE;            /* strings are joined by CONCAT, numbers by ADD */
     if (a.type == FS_INT && b.type == FS_INT) {
-        int32_t x = a.as.i, y = b.as.i, v;
-        uint32_t ux = (uint32_t)x, uy = (uint32_t)y;
-        switch (op) {
-        case OP_ADD: v = s32(ux + uy); break;
-        case OP_SUB: v = s32(ux - uy); break;
-        case OP_MUL: v = s32(ux * uy); break;
-        case OP_DIV:
-            if (y == 0)
-                return FS_FAULT_DIV_ZERO;
-            v = (x == INT32_MIN && y == -1) ? INT32_MIN : x / y;
-            break;
-        case OP_MOD:
-            if (y == 0)
-                return FS_FAULT_DIV_ZERO;
-            v = (y == -1) ? 0 : x % y;
-            break;
-        case OP_BAND: v = s32(ux & uy); break;
-        case OP_BOR:  v = s32(ux | uy); break;
-        case OP_BXOR: v = s32(ux ^ uy); break;
-        case OP_SHL:  v = s32(ux << (uy & 31u)); break;
-        case OP_SHR: {
-            unsigned n = uy & 31u;
-            /* arithmetic shift without relying on implementation-defined >> */
-            v = x >= 0 ? (int32_t)((uint32_t)x >> n) : -(int32_t)((uint32_t)(-(x + 1)) >> n) - 1;
-            break;
-        }
-        case OP_EQ: v = x == y; break;
-        case OP_NE: v = x != y; break;
-        case OP_LT: v = x < y; break;
-        case OP_LE: v = x <= y; break;
-        case OP_GT: v = x > y; break;
-        default:    v = x >= y; break;
-        }
-        *r = fs_int(v);
-        return 0;
+        int32_t v;
+        int err = int_binop(op, a.as.i, b.as.i, &v);
+        if (!err)
+            *r = fs_int(v);
+        return err;
     }
 #if FS_HAS_FLOAT
     if (a.type == FS_FLOAT && b.type == FS_FLOAT) {
@@ -2720,17 +2733,48 @@ static int builtin(fs_vm *vm, unsigned id, const fs_value *a, fs_value *r)
     }
 }
 
-static int execute(fs_vm *vm)
+/* Instruction length (opcode and operand) by opcode; 0 = no such opcode. */
+static const uint8_t OP_LEN[OP_LOGE + 1] = {
+    [OP_NOP] = 1, [OP_PUSH] = 5, [OP_PUSH8] = 2, [OP_PUSHS] = 3, [OP_POP] = 1, [OP_DUP] = 1,
+    [OP_PUSHF] = 9, [OP_PUSHT] = 9,
+    [OP_LOADG] = 3, [OP_STOREG] = 3, [OP_LOADL] = 2, [OP_STOREL] = 2,
+    [OP_ADD] = 1, [OP_SUB] = 1, [OP_MUL] = 1, [OP_DIV] = 1, [OP_MOD] = 1, [OP_NEG] = 1,
+    [OP_BAND] = 1, [OP_BOR] = 1, [OP_BXOR] = 1, [OP_BNOT] = 1, [OP_SHL] = 1, [OP_SHR] = 1,
+    [OP_CONCAT] = 1,
+    [OP_EQ] = 1, [OP_NE] = 1, [OP_LT] = 1, [OP_LE] = 1, [OP_GT] = 1, [OP_GE] = 1,
+    [OP_NOT] = 1, [OP_BOOL] = 1,
+    [OP_JMP] = 3, [OP_JZ] = 3, [OP_JNZ] = 3,
+    [OP_CALL] = 3, [OP_RET] = 1, [OP_RET0] = 1, [OP_XCALL] = 3, [OP_BUILTIN] = 2, [OP_RETN] = 2,
+    [OP_GOTO] = 3, [OP_EMIT] = 3, [OP_TSTART] = 3, [OP_TEVERY] = 3, [OP_TSTOP] = 3,
+    [OP_LOGD] = 3, [OP_LOGI] = 3, [OP_LOGW] = 3, [OP_LOGE] = 3
+};
+
+/* Execute up to max (>= 1) instructions of the active handler, each one a step
+ * exactly as fs_step takes it, without returning in between; stops early when
+ * the handler finishes or faults.  *count = instructions executed (steps);
+ * returns the result of the last one. */
+static int execute(fs_vm *vm, int max, int *count)
 {
     const uint8_t *code = vm->code;
     uint32_t csize = vm->code_size;
-    int32_t pc = vm->pc, npc;
-    unsigned arg = 0;
+    int32_t pc, npc;
+    unsigned arg, len;
     fs_value v, r;
     int32_t iv;
-    int fault, err;
+    int fault, err, ran = 0;
     uint8_t op;
 
+next:
+    if (ran >= max || vm->handler < 0) {
+        *count = ran;
+        return FS_RUNNING;
+    }
+    ran++;
+#if FS_HAS_RECORD
+    if (vm->on_record)
+        vm->rec_steps++;
+#endif
+    pc = vm->pc;
     vm->cur_pc = pc;
     vm->steps++;
     if (vm->steps > FS_BUDGET)
@@ -2738,46 +2782,11 @@ static int execute(fs_vm *vm)
     if (pc < 0 || (uint32_t)pc >= csize)
         FAULT(FS_FAULT_BAD_OPCODE);
     op = code[pc];
-
-    /* decode operand */
-    switch (op) {
-    case OP_NOP: case OP_POP: case OP_DUP:
-    case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_NEG:
-    case OP_BAND: case OP_BOR: case OP_BXOR: case OP_BNOT: case OP_SHL: case OP_SHR:
-    case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE:
-    case OP_NOT: case OP_BOOL: case OP_RET: case OP_RET0: case OP_CONCAT:
-        npc = pc + 1;
-        break;
-    case OP_PUSH8: case OP_LOADL: case OP_STOREL: case OP_BUILTIN: case OP_RETN:
-        if ((uint32_t)pc + 2 > csize)
-            FAULT(FS_FAULT_BAD_OPCODE);
-        arg = code[pc + 1];
-        npc = pc + 2;
-        break;
-    case OP_PUSH:
-        if ((uint32_t)pc + 5 > csize)
-            FAULT(FS_FAULT_BAD_OPCODE);
-        arg = 0;
-        npc = pc + 5;
-        break;
-    case OP_PUSHF: case OP_PUSHT:
-        if ((uint32_t)pc + 9 > csize)
-            FAULT(FS_FAULT_BAD_OPCODE);
-        arg = 0;
-        npc = pc + 9;
-        break;
-    case OP_PUSHS: case OP_LOADG: case OP_STOREG: case OP_JMP: case OP_JZ: case OP_JNZ:
-    case OP_CALL: case OP_XCALL: case OP_GOTO: case OP_EMIT:
-    case OP_TSTART: case OP_TEVERY: case OP_TSTOP:
-    case OP_LOGD: case OP_LOGI: case OP_LOGW: case OP_LOGE:
-        if ((uint32_t)pc + 3 > csize)
-            FAULT(FS_FAULT_BAD_OPCODE);
-        arg = rd16(code + pc + 1);
-        npc = pc + 3;
-        break;
-    default:
+    len = op <= OP_LOGE ? OP_LEN[op] : 0;
+    if (len == 0 || (uint32_t)pc + len > csize)      /* unknown, or operand cut off */
         FAULT(FS_FAULT_BAD_OPCODE);
-    }
+    arg = len == 2 ? code[pc + 1] : len == 3 ? rd16(code + pc + 1) : 0;
+    npc = pc + (int32_t)len;
     vm->pc = npc;
 
     switch (op) {
@@ -2817,33 +2826,53 @@ static int execute(fs_vm *vm)
         PUSH(v);
         PUSH(v);
         break;
+    /* Loads and stores copy the payload cell and its type tag as they are. */
     case OP_LOADG:
         if (arg >= vm->n_globals)
             FAULT(FS_FAULT_BAD_OPCODE);
-        PUSH(gget(vm, (int)arg));
+        if (vm->sp >= FS_STACK_SIZE)
+            FAULT(FS_FAULT_STACK_OVERFLOW);
+        vm->stypes[vm->sp] = vm->gtypes[arg];
+        vm->stack[vm->sp++] = vm->globals[arg];
         break;
     case OP_STOREG:
         if (arg >= vm->n_globals)
             FAULT(FS_FAULT_BAD_OPCODE);
-        POP(v);
-        OBS(vm, store, (vm, (int)arg, v));
-        gset(vm, (int)arg, v);
+        if (vm->sp <= 0)
+            FAULT(FS_FAULT_STACK_UNDERFLOW);
+        vm->sp--;
+        OBS(vm, store, (vm, (int)arg, SLOT(vm->sp)));
+        if (vm->sp < FS_STACK_SIZE) {
+            vm->gtypes[arg] = vm->stypes[vm->sp];
+            vm->globals[arg] = vm->stack[vm->sp];
+        } else {
+            gset(vm, (int)arg, fs_int(0));          /* a virtual slot */
+        }
         break;
     case OP_LOADL: {
         int i = vm->frames[vm->nframes - 1].base + (int)arg;
         if (i >= vm->sp)
             FAULT(FS_FAULT_BAD_OPCODE);
-        PUSH(SLOT(i));
+        if (vm->sp >= FS_STACK_SIZE)
+            FAULT(FS_FAULT_STACK_OVERFLOW);
+        vm->stypes[vm->sp] = vm->stypes[i];         /* i < sp: a real slot */
+        vm->stack[vm->sp++] = vm->stack[i];
         break;
     }
     case OP_STOREL: {
         int i;
-        POP(v);
+        if (vm->sp <= 0)
+            FAULT(FS_FAULT_STACK_UNDERFLOW);
+        vm->sp--;
         i = vm->frames[vm->nframes - 1].base + (int)arg;
         if (i >= vm->sp)
             FAULT(FS_FAULT_BAD_OPCODE);
-        if (i < FS_STACK_SIZE)
-            sset(vm, i, v);
+        if (vm->sp < FS_STACK_SIZE) {
+            vm->stypes[i] = vm->stypes[vm->sp];
+            vm->stack[i] = vm->stack[vm->sp];
+        } else if (i < FS_STACK_SIZE) {
+            sset(vm, i, fs_int(0));                  /* from a virtual slot */
+        }
         break;
     }
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
@@ -2851,6 +2880,15 @@ static int execute(fs_vm *vm)
     case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE: case OP_CONCAT:
         if (vm->sp < 2)
             FAULT(FS_FAULT_STACK_UNDERFLOW);
+        if (vm->sp <= FS_STACK_SIZE && op != OP_CONCAT &&
+            vm->stypes[vm->sp - 2] == FS_INT && vm->stypes[vm->sp - 1] == FS_INT) {
+            /* two ints: the result replaces them in place */
+            if ((err = int_binop(op, vm->stack[vm->sp - 2].i, vm->stack[vm->sp - 1].i, &iv)) != 0)
+                FAULT(err);
+            vm->sp--;
+            sset(vm, vm->sp - 1, fs_int(iv));
+            break;
+        }
         /* the operands stay on the stack (string roots) until the result exists */
         if ((err = binop(vm, op, SLOT(vm->sp - 2), SLOT(vm->sp - 1), &r)) != 0)
             FAULT(err);
@@ -2930,7 +2968,7 @@ static int execute(fs_vm *vm)
             vm->sp = fr->base;
         if (vm->nframes == 0) {
             finish(vm);
-            return FS_DONE;
+            goto done;
         }
         vm->pc = fr->ret_pc;
         for (i = 0; i < n; i++)
@@ -2948,7 +2986,7 @@ static int execute(fs_vm *vm)
             vm->sp = fr->base;
         if (vm->nframes == 0) {
             finish(vm);
-            return FS_DONE;
+            goto done;
         }
         vm->pc = fr->ret_pc;
         PUSH(v);
@@ -3037,7 +3075,7 @@ static int execute(fs_vm *vm)
         if (!vm->in_exit)
             vm->pending = (int)arg;
         finish(vm);
-        return FS_DONE;
+        goto done;
     case OP_EMIT: {
         fs_value tmp[MAX_CALL_ARGS], copy[FS_MAX_EVENT_ARGS];
         const fs_value *args;
@@ -3114,54 +3152,64 @@ static int execute(fs_vm *vm)
     default:
         FAULT(FS_FAULT_BAD_OPCODE);
     }
-    return FS_RUNNING;
+    goto next;
+
+done:
+    *count = ran;
+    return FS_DONE;
 
 faulted:
     report_fault(vm, fault, (int)vm->cur_pc);
     finish(vm);
     /* pending is kept: only the initial entry queued by fs_start can be pending here */
+    *count = ran;
     return FS_FAULT;
 }
 
 int fs_step(fs_vm *vm)
 {
+    int n;
     if (!vm || !vm->loaded)
         return FS_IDLE;
+    if (vm->handler >= 0)
+        return execute(vm, 1, &n);
 #if FS_HAS_RECORD
     if (vm->on_record)
         vm->rec_steps++;
 #endif
-    if (vm->handler < 0) {
-        if (vm->chain >= FS_MAX_CHAIN && (vm->boot_pending || vm->pending >= 0 ||
-                                          vm->transition >= 0 || vm->q_count > 0 ||
-                                          leaving_timers(vm))) {
-            /* the script keeps itself busy (goto_state/emit loop): drop the pending work */
-            vm->boot_pending = 0;
-            vm->pending = vm->transition = -1;
-            vm->q_head = vm->q_count = 0;
-            vm->chain = 0;
-            report_fault(vm, FS_FAULT_CHAIN, -1);
-            OBS(vm, flush, (vm));
-            return FS_IDLE;
-        }
-        if (dispatch(vm)) {
-            vm->chain++;
-            return FS_DISPATCHED;
-        }
+    if (vm->chain >= FS_MAX_CHAIN && (vm->boot_pending || vm->pending >= 0 ||
+                                      vm->transition >= 0 || vm->q_count > 0 ||
+                                      leaving_timers(vm))) {
+        /* the script keeps itself busy (goto_state/emit loop): drop the pending work */
+        vm->boot_pending = 0;
+        vm->pending = vm->transition = -1;
+        vm->q_head = vm->q_count = 0;
         vm->chain = 0;
+        report_fault(vm, FS_FAULT_CHAIN, -1);
         OBS(vm, flush, (vm));
         return FS_IDLE;
     }
-    return execute(vm);
+    if (dispatch(vm)) {
+        vm->chain++;
+        return FS_DISPATCHED;
+    }
+    vm->chain = 0;
+    OBS(vm, flush, (vm));
+    return FS_IDLE;
 }
 
 int fs_run(fs_vm *vm, int max_steps)
 {
-    int n = 0;
+    int n = 0, k;
     while (n < max_steps) {
-        if (fs_step(vm) == FS_IDLE)
+        if (vm && vm->loaded && vm->handler >= 0) {
+            execute(vm, max_steps - n, &k);    /* the handler's instructions, a step each */
+            n += k;
+        } else if (fs_step(vm) == FS_IDLE) {
             break;
-        n++;
+        } else {
+            n++;
+        }
     }
     return n;
 }

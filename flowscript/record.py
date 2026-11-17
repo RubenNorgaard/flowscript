@@ -452,8 +452,13 @@ class Replay:
         elif tag == CLOCK:
             self.results.append(("clock", V.wrap64(r.svarint())))
         elif tag == STEPS:
-            for _ in range(r.varint()):
+            left = r.varint()
+            while left > 0:
+                if self.on_step is None and vm.handler is not None:
+                    left -= vm.run_handler(left)     # the same steps, faster
+                    continue
                 rv = vm.step()
+                left -= 1
                 if self.on_step:
                     self.on_step(rv)
         elif tag == POST:

@@ -125,6 +125,8 @@ def run_scenario(prog, scenario_text, out, record=None, observe=None):
                 out("state %s" % prog.states[vm.state])
             if r == IDLE:
                 break
+            if vm.handler is not None:
+                vm.run_handler()        # the rest of the handler (the state cannot change)
 
     def dump():
         for i, v in enumerate(vm.globals):

@@ -476,14 +476,14 @@ them should link with `-ffunction-sections -Wl,--gc-sections`, so they and, with
 
 | Switches | VM code (Cortex-M4 `-Os`) | with `FS_NO_RECORD` | RAM per stored value |
 |---|---|---|---|
-| none | 19.0 KB + soft-float and libm | 16.6 KB | 9 bytes |
-| `FS_NO_STR` | 16.7 KB + soft-float and libm | 14.4 KB | 9 bytes |
-| `FS_NO_TEXT` | 15.8 KB + soft-float and libm | 13.4 KB | 9 bytes |
-| `FS_NO_STR FS_NO_TEXT` (e.g. `pct_pid`) | 14.7 KB + soft-float and libm | 12.4 KB | 9 bytes |
-| `FS_NO_TIME` | 15.7 KB + soft-float and libm | 13.3 KB | 9 bytes |
-| `FS_NO_FLOAT` | 16.4 KB | 14.1 KB | 9 bytes |
-| `FS_NO_FLOAT FS_NO_TIME` | 12.2 KB | 10.0 KB | 5 bytes |
-| `FS_NO_FLOAT FS_NO_TIME FS_NO_STR FS_NO_TEXT` (e.g. the GPS tracker) | 11.0 KB | **9.0 KB**, needing only `memcpy memset memcmp strlen` | 5 bytes |
+| none | 19.2 KB + soft-float and libm | 16.6 KB | 9 bytes |
+| `FS_NO_STR` | 16.9 KB + soft-float and libm | 14.4 KB | 9 bytes |
+| `FS_NO_TEXT` | 16.0 KB + soft-float and libm | 13.4 KB | 9 bytes |
+| `FS_NO_STR FS_NO_TEXT` (e.g. `pct_pid`) | 14.9 KB + soft-float and libm | 12.4 KB | 9 bytes |
+| `FS_NO_TIME` | 16.1 KB + soft-float and libm | 13.5 KB | 9 bytes |
+| `FS_NO_FLOAT` | 16.5 KB | 14.2 KB | 9 bytes |
+| `FS_NO_FLOAT FS_NO_TIME` | 12.3 KB | 10.0 KB | 5 bytes |
+| `FS_NO_FLOAT FS_NO_TIME FS_NO_STR FS_NO_TEXT` (e.g. the GPS tracker) | 11.1 KB | **9.1 KB**, needing only `memcpy memset memcmp strlen` | 5 bytes |
 
 Monitor mode (`fs_set_observe_sink`, SPEC 10.5) adds about 2.8 KB to the recording
 builds, and only when the firmware calls it. `python3 c/codesize.py` prints all 32
