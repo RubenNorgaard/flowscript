@@ -51,7 +51,7 @@ class VM:
 
     def __init__(self, prog, externs=None, on_emit=None, on_fault=None, on_timer=None, on_log=None, record=None,
                  stack_size=STACK_SIZE, max_frames=MAX_FRAMES, queue_size=QUEUE_SIZE, budget=BUDGET,
-                 max_chain=MAX_CHAIN, str_slots=STR_SLOTS, str_len=STR_LEN, clock=None):
+                 max_chain=MAX_CHAIN, str_slots=STR_SLOTS, str_len=STR_LEN, clock=None, observe=None):
         from . import record as R
         if isinstance(prog, (bytes, bytearray)):
             self.image_hash = R.image_hash(prog)
@@ -86,8 +86,12 @@ class VM:
         for ext in prog.externs:
             self.bound.append(self.externs.get(ext[0]))
         self.rec = None
+        self.obs = None
         self._reset()
         self.rec = R.Recorder(self, record) if record else None
+        if observe:
+            from .observe import Observer
+            self.obs = Observer(self, observe)
 
     def unbound_externs(self):
         return [self.prog.externs[i][0] for i, f in enumerate(self.bound) if f is None]
@@ -95,6 +99,8 @@ class VM:
     def reset(self):
         """Back to the initial values (globals, no state, empty queue).  Call start() again."""
         self._reset()
+        if self.obs:
+            self.obs.dirty.clear()
         if self.rec:
             self.rec.reset()
 
@@ -129,6 +135,8 @@ class VM:
             self.pending = 0
         if self.rec:
             self.rec.start()
+        if self.obs:
+            self.obs.start()
         return self
 
     # -- snapshots and recording (record.py) ------------------------------------------------
@@ -146,11 +154,18 @@ class VM:
             raise ValueError("the snapshot's strings do not fit (fault %d)" % f.code)
         if self.rec:
             self.rec.keyframe()             # a recording says where the run continues from
+        if self.obs:
+            self.obs.keyframe()
 
     def record_keyframe(self):
-        """Recording: a keyframe (session + snapshot), where a viewer can start replaying."""
+        """Recording: a keyframe (session + snapshot), where a viewer can start replaying.
+        Observing: a full picture (state, every global).  RuntimeError while busy."""
+        if (self.rec or self.obs) and (self.handler is not None or self.has_work()):
+            raise RuntimeError("not idle: take a keyframe after run()")
         if self.rec:
             self.rec.keyframe()
+        if self.obs:
+            self.obs.keyframe()
 
     def record_flush(self):
         """Recording: hand over the steps counted so far (e.g. before sending a packet)."""
@@ -220,7 +235,10 @@ class VM:
 
     def set_global(self, index, value):
         """Debugger/host: set a global (converted to its current type)."""
-        self.globals[index] = self.host_value(value, V.type_of(self.globals[index]))
+        old = self.globals[index]
+        self.globals[index] = self.host_value(value, V.type_of(old))
+        if self.obs:
+            self.obs.changed(index, old, self.globals[index])
         if self.rec:
             self.rec.setg(index, self.globals[index])
 
@@ -330,6 +348,8 @@ class VM:
         self.frames = [[-1, 0]]
         self.pc = off
         self.steps = 0
+        if self.obs:
+            self.obs.handler(h, self.stack[:argc])
 
     def dispatch(self):
         """Start the next handler. Returns True if one was started or a transition progressed."""
@@ -366,6 +386,8 @@ class VM:
                         t[4] = LEAVING
             self.state = self.transition
             self.transition = None
+            if self.obs:
+                self.obs.state()
             h = p.find_handler(self.state, EV_ENTER)
             if h is not None and h[0] == self.state:
                 self.begin(h, [])
@@ -383,9 +405,13 @@ class VM:
         self.frames = []
         self.stack = []
         self.in_exit = False
+        if self.obs:
+            self.obs.flush()
 
     def report_fault(self, code, pc):
         self.faults += 1
+        if self.obs:
+            self.obs.fault(code, pc)
         if self.on_fault:
             self.on_fault(self, code, pc)
 
@@ -405,11 +431,15 @@ class VM:
                 self.queue = []
                 self.chain = 0
                 self.report_fault(9, -1)
+                if self.obs:
+                    self.obs.flush()
                 return IDLE
             if self.dispatch():
                 self.chain += 1
                 return DISPATCHED
             self.chain = 0
+            if self.obs:
+                self.obs.flush()
             return IDLE
         try:
             return self.execute()
@@ -504,7 +534,10 @@ class VM:
         elif name == "STOREG":
             if arg >= len(self.globals):
                 raise Fault(5)
-            self.globals[arg] = pop()
+            v = pop()
+            if self.obs:
+                self.obs.changed(arg, self.globals[arg], v)
+            self.globals[arg] = v
         elif name == "LOADL":
             i = self.frames[-1][1] + arg
             if i >= len(self.stack):
@@ -616,9 +649,13 @@ class VM:
                 except V.ValueFault as f:
                     if self.rec:
                         self.rec.xfault(arg, f.code, r)
+                    if self.obs:
+                        self.obs.call(arg, list(args), refused=f.code, refused_value=r)
                     raise Fault(f.code)
                 if self.rec:
                     self.rec.result(arg, r)
+            if self.obs:
+                self.obs.call(arg, list(args), r)
             del self.stack[len(self.stack) - argc:]
             push(r)
         elif name == "BUILTIN":
@@ -653,6 +690,8 @@ class VM:
                 raise Fault(2)
             args = list(self.stack[len(self.stack) - argc:]) if argc else []
             self.check_types(args, ptypes)
+            if self.obs:
+                self.obs.raised(arg, args)
             if self.on_emit:
                 self.on_emit(self, self.prog.events[arg][0], list(args))
             self._post(arg, args)
@@ -681,6 +720,9 @@ class VM:
                 raise Fault(5)
             if len(self.stack) < n:
                 raise Fault(2)
+            if self.obs:
+                self.obs.log(("LOGD", "LOGI", "LOGW", "LOGE").index(name), template,
+                             self.stack[len(self.stack) - n:] if n else [])
             if self.on_log:
                 self.on_log(self, ("LOGD", "LOGI", "LOGW", "LOGE").index(name), template,
                             self.stack[len(self.stack) - n:] if n else [])
@@ -764,7 +806,10 @@ def _op_storeg(vm, arg):
     st = vm.stack
     if not st:
         raise Fault(2)
-    g[arg] = st.pop()
+    v = st.pop()
+    if vm.obs:
+        vm.obs.changed(arg, g[arg], v)
+    g[arg] = v
     return RUNNING
 
 
@@ -902,9 +947,13 @@ def _op_xcall(vm, arg):
         except V.ValueFault as f:
             if vm.rec:
                 vm.rec.xfault(arg, f.code, r)
+            if vm.obs:
+                vm.obs.call(arg, list(args), refused=f.code, refused_value=r)
             raise Fault(f.code)
         if vm.rec:
             vm.rec.result(arg, r)
+    if vm.obs:
+        vm.obs.call(arg, list(args), r)
     if argc:
         del st[len(st) - argc:]
     return _push(vm, r)

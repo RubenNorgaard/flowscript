@@ -22,6 +22,7 @@ static int64_t clock_ms;
 static int last_state = -1;
 static int prepass;            /* first pass over the scenario: only look for host_timers */
 static FILE *rec_file;         /* -r FILE: the recording */
+static FILE *obs_file;         /* -o FILE: the observation stream (monitor mode) */
 static uint8_t snap[16384];    /* the last snapshot (scenario: snapshot / restore) */
 static int snap_len;
 
@@ -31,6 +32,14 @@ static void on_record(fs_vm *v, const uint8_t *data, int len, int end, void *use
     (void)end;
     (void)user;
     fwrite(data, 1, (size_t)len, rec_file);
+}
+
+static void on_observe(fs_vm *v, const uint8_t *data, int len, int end, void *user)
+{
+    (void)v;
+    (void)end;
+    (void)user;
+    fwrite(data, 1, (size_t)len, obs_file);
 }
 static int host_timers;
 
@@ -543,15 +552,16 @@ int main(int argc, char **argv)
     char *img, *sc = NULL;
     int rc, i;
 
-    if (argc >= 3 && strcmp(argv[1], "-r") == 0) {     /* -r FILE: record the run */
-        rec_file = fopen(argv[2], "wb");
-        if (!rec_file)
-            die("cannot write the recording", argv[2]);
+    while (argc >= 3 && (strcmp(argv[1], "-r") == 0 || strcmp(argv[1], "-o") == 0)) {
+        FILE **f = argv[1][1] == 'r' ? &rec_file : &obs_file;    /* -r: record, -o: observe */
+        *f = fopen(argv[2], "wb");
+        if (!*f)
+            die("cannot write", argv[2]);
         argv += 2;
         argc -= 2;
     }
     if (argc < 2 || argc > 3) {
-        fprintf(stderr, "usage: fsrun [-r recording] program.fsb [scenario]\n");
+        fprintf(stderr, "usage: fsrun [-r recording] [-o observations] program.fsb [scenario]\n");
         return 2;
     }
     img = read_file(argv[1], &len);
@@ -584,6 +594,8 @@ int main(int argc, char **argv)
         fs_set_timer_handler(&vm, on_timer);
     if (rec_file)
         fs_set_record_sink(&vm, on_record);
+    if (obs_file)
+        fs_set_observe_sink(&vm, on_observe);
 
     fs_start(&vm);
     run();
@@ -592,6 +604,8 @@ int main(int argc, char **argv)
     fs_record_flush(&vm);
     if (rec_file)
         fclose(rec_file);
+    if (obs_file)
+        fclose(obs_file);
     dump();
     free(sc);
     free(img);

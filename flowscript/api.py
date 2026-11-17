@@ -148,12 +148,17 @@ class Machine:
     record:   callable(bytes) receiving the recording (one frame per call; SPEC 10), so a
               ``Replay`` elsewhere (another process, the desk, a laptop) can follow the run
               exactly.  Call ``record_keyframe()`` now and then so a viewer can join late.
+    observe:  callable(bytes) receiving the observation stream (one frame per call; SPEC
+              10.5): what the program does (state changes, changed variables, handlers,
+              log statements, raised events, extern calls, faults), for a ``Monitor``.  A
+              viewer needs no matching image, only the source for names.  ``record_keyframe()``
+              also adds a full picture to it.
     limits:   VM limits (stack_size, queue_size, budget, str_slots, str_len, ...), defaulting
               to the C VM's defaults so a script that runs here also runs there.
     """
 
     def __init__(self, program, *, externs=None, clock=None, on_event=None, on_fault=None,
-                 on_timer=None, on_log=None, record=None, **limits):
+                 on_timer=None, on_log=None, record=None, observe=None, **limits):
         if isinstance(program, (bytes, bytearray, memoryview)):
             program = load(program)
         self.program = program
@@ -178,7 +183,7 @@ class Machine:
         self.vm = VM(program, {name: self._wrap(fn) for name, fn in externs.items()},
                      on_emit=self._emit, on_fault=self._fault,
                      on_timer=self._timer if on_timer else None, clock=self._now,
-                     on_log=self._log if on_log else None, record=record, **limits)
+                     on_log=self._log if on_log else None, record=record, observe=observe, **limits)
 
     # -- glue ---------------------------------------------------------------------------
     @staticmethod

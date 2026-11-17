@@ -21,40 +21,41 @@ DEFAULTS = {
 SWITCHES = ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT")   # c/flowscript.h switches
 # VM code + constants in bytes kept by a Cortex-M4 link (clang -Os, --gc-sections; the host
 # does not call fs_format/fs_parse_*), by the switches that are set.  Measured with
-# c/codesize.py.  Builds with floats also link soft-float and libm routines.
+# c/codesize.py.  Builds with floats also link soft-float and libm routines.  Monitor mode
+# (fs_set_observe_sink, SPEC 10.5) adds about 2.8 KB when the host uses it (codesize.py --observe).
 VM_CODE_BYTES = {
-    (): 18928,
-    ("FS_NO_FLOAT",): 16328,
-    ("FS_NO_TIME",): 15634,
-    ("FS_NO_STR",): 16576,
-    ("FS_NO_TEXT",): 15686,
-    ("FS_NO_RECORD",): 16844,
-    ("FS_NO_FLOAT", "FS_NO_TIME"): 12134,
-    ("FS_NO_FLOAT", "FS_NO_STR"): 14534,
-    ("FS_NO_FLOAT", "FS_NO_TEXT"): 14780,
-    ("FS_NO_FLOAT", "FS_NO_RECORD"): 14290,
-    ("FS_NO_TIME", "FS_NO_STR"): 13678,
-    ("FS_NO_TIME", "FS_NO_TEXT"): 13912,
-    ("FS_NO_TIME", "FS_NO_RECORD"): 13512,
-    ("FS_NO_STR", "FS_NO_TEXT"): 14538,
-    ("FS_NO_STR", "FS_NO_RECORD"): 14606,
-    ("FS_NO_TEXT", "FS_NO_RECORD"): 13602,
-    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR"): 10926,
-    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_TEXT"): 12134,
-    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_RECORD"): 10098,
-    ("FS_NO_FLOAT", "FS_NO_STR", "FS_NO_TEXT"): 13408,
-    ("FS_NO_FLOAT", "FS_NO_STR", "FS_NO_RECORD"): 12640,
-    ("FS_NO_FLOAT", "FS_NO_TEXT", "FS_NO_RECORD"): 12746,
-    ("FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT"): 12764,
-    ("FS_NO_TIME", "FS_NO_STR", "FS_NO_RECORD"): 11696,
-    ("FS_NO_TIME", "FS_NO_TEXT", "FS_NO_RECORD"): 11794,
-    ("FS_NO_STR", "FS_NO_TEXT", "FS_NO_RECORD"): 12574,
-    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT"): 10926,
-    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR", "FS_NO_RECORD"): 9058,
-    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_TEXT", "FS_NO_RECORD"): 10098,
-    ("FS_NO_FLOAT", "FS_NO_STR", "FS_NO_TEXT", "FS_NO_RECORD"): 11510,
-    ("FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT", "FS_NO_RECORD"): 10782,
-    ("FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT", "FS_NO_RECORD"): 9058,
+    (): 19409,
+    ('FS_NO_FLOAT',): 16825,
+    ('FS_NO_TIME',): 16081,
+    ('FS_NO_STR',): 17089,
+    ('FS_NO_TEXT',): 16175,
+    ('FS_NO_RECORD',): 16977,
+    ('FS_NO_FLOAT', 'FS_NO_TIME'): 12459,
+    ('FS_NO_FLOAT', 'FS_NO_STR'): 15081,
+    ('FS_NO_FLOAT', 'FS_NO_TEXT'): 15277,
+    ('FS_NO_FLOAT', 'FS_NO_RECORD'): 14423,
+    ('FS_NO_TIME', 'FS_NO_STR'): 14125,
+    ('FS_NO_TIME', 'FS_NO_TEXT'): 14355,
+    ('FS_NO_TIME', 'FS_NO_RECORD'): 13645,
+    ('FS_NO_STR', 'FS_NO_TEXT'): 15051,
+    ('FS_NO_STR', 'FS_NO_RECORD'): 14739,
+    ('FS_NO_TEXT', 'FS_NO_RECORD'): 13735,
+    ('FS_NO_FLOAT', 'FS_NO_TIME', 'FS_NO_STR'): 11277,
+    ('FS_NO_FLOAT', 'FS_NO_TIME', 'FS_NO_TEXT'): 12459,
+    ('FS_NO_FLOAT', 'FS_NO_TIME', 'FS_NO_RECORD'): 10231,
+    ('FS_NO_FLOAT', 'FS_NO_STR', 'FS_NO_TEXT'): 13955,
+    ('FS_NO_FLOAT', 'FS_NO_STR', 'FS_NO_RECORD'): 12773,
+    ('FS_NO_FLOAT', 'FS_NO_TEXT', 'FS_NO_RECORD'): 12879,
+    ('FS_NO_TIME', 'FS_NO_STR', 'FS_NO_TEXT'): 13211,
+    ('FS_NO_TIME', 'FS_NO_STR', 'FS_NO_RECORD'): 11829,
+    ('FS_NO_TIME', 'FS_NO_TEXT', 'FS_NO_RECORD'): 11927,
+    ('FS_NO_STR', 'FS_NO_TEXT', 'FS_NO_RECORD'): 12707,
+    ('FS_NO_FLOAT', 'FS_NO_TIME', 'FS_NO_STR', 'FS_NO_TEXT'): 11277,
+    ('FS_NO_FLOAT', 'FS_NO_TIME', 'FS_NO_STR', 'FS_NO_RECORD'): 9191,
+    ('FS_NO_FLOAT', 'FS_NO_TIME', 'FS_NO_TEXT', 'FS_NO_RECORD'): 10231,
+    ('FS_NO_FLOAT', 'FS_NO_STR', 'FS_NO_TEXT', 'FS_NO_RECORD'): 11643,
+    ('FS_NO_TIME', 'FS_NO_STR', 'FS_NO_TEXT', 'FS_NO_RECORD'): 10915,
+    ('FS_NO_FLOAT', 'FS_NO_TIME', 'FS_NO_STR', 'FS_NO_TEXT', 'FS_NO_RECORD'): 9191,
 }
 
 
@@ -119,7 +120,7 @@ def fs_vm_size(cfg, ptr=4):
     strslot, salign = _layout([u16, u8, u8, (cfg["FS_STR_LEN"] + 1, 1)])
     fields = [P, P] + [P] * 9 + [i32, i32] + [u16] * 10 + [u8]          # ..., code_size, image_hash
     fields += [(ptr * cfg["FS_MAX_EXTERNS"], ptr), P, P, P, P]      # bound, on_emit/fault/timer/log
-    fields += [] if cfg.get("FS_NO_RECORD") else [P]                 # on_record
+    fields += [] if cfg.get("FS_NO_RECORD") else [P, P, P]           # on_record, on_observe, obs_ops
     fields += [] if cfg.get("FS_NO_TIME") else [P]               # clock
     fields += [P]                                                # user
     fields += [(csize * cfg["FS_MAX_GLOBALS"], calign), (csize * cfg["FS_STACK_SIZE"], calign), i32,
@@ -129,6 +130,7 @@ def fs_vm_size(cfg, ptr=4):
     fields += [(qentry * cfg["FS_QUEUE_SIZE"], qalign), i32, i32,
                (timer * cfg["FS_MAX_TIMERS"], talign),
                (cfg["FS_MAX_GLOBALS"], 1), (cfg["FS_STACK_SIZE"], 1)]     # gtypes, stypes
+    fields += [] if cfg.get("FS_NO_RECORD") else [((cfg["FS_MAX_GLOBALS"] + 7) // 8, 1)]   # obs_dirty
     if not cfg.get("FS_NO_STR"):
         fields.append((strslot * cfg["FS_STR_SLOTS"], salign))
     return _layout(fields)[0]

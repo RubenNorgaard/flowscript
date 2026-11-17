@@ -38,6 +38,25 @@ static void rec_simple(fs_vm *vm, int tag, int64_t num, int flush);
 static void rec_keyframe(fs_vm *vm);
 #endif
 static int leaving_timers(const fs_vm *vm);
+/* Monitor mode (SPEC 10.5).  The VM reaches it only through vm->obs_ops, which only
+ * fs_set_observe_sink() sets: a device that never calls it links none of it (with
+ * --gc-sections), only these null checks. */
+typedef struct {
+    void (*header)(fs_vm *vm, int keyframe);
+    void (*flush)(fs_vm *vm);
+    void (*state)(fs_vm *vm);
+    void (*handler)(fs_vm *vm, int h, const fs_value *args, int n);
+    void (*store)(fs_vm *vm, int i, fs_value v);
+    void (*values)(fs_vm *vm, int tag, int idx, const fs_value *args, int n);
+    void (*log)(fs_vm *vm, int level, const char *t, uint16_t tl, const fs_value *args, int n);
+    void (*call)(fs_vm *vm, int ext, const fs_value *args, int n, fs_value result, int refused);
+    void (*fault)(fs_vm *vm, int code, int pc);
+} obs_ops;
+#if FS_HAS_RECORD
+#define OBS(vm, fn, args) do { if ((vm)->obs_ops) ((const obs_ops *)(vm)->obs_ops)->fn args; } while (0)
+#else
+#define OBS(vm, fn, args) ((void)0)
+#endif
 
 #define EV_BOOT  0
 #define EV_ENTER 1
@@ -638,7 +657,8 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     fs_timer_fn on_timer;
     fs_log_fn on_log;
 #if FS_HAS_RECORD
-    fs_record_fn on_record;
+    fs_record_fn on_record, on_observe;
+    const void *obs;
 #endif
 #if FS_HAS_TIME
     fs_clock_fn clock;
@@ -657,6 +677,8 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     on_log = vm->on_log;
 #if FS_HAS_RECORD
     on_record = vm->on_record;
+    on_observe = vm->on_observe;
+    obs = vm->obs_ops;
 #endif
 #if FS_HAS_TIME
     clock = vm->clock;
@@ -669,6 +691,8 @@ int fs_load(fs_vm *vm, const uint8_t *img, size_t len)
     vm->on_log = on_log;
 #if FS_HAS_RECORD
     vm->on_record = on_record;
+    vm->on_observe = on_observe;
+    vm->obs_ops = obs;
 #endif
 #if FS_HAS_TIME
     vm->clock = clock;
@@ -854,6 +878,9 @@ static void reset_vm(fs_vm *vm)
         if (vm->timers[i].active && vm->on_timer)
             vm->on_timer(vm, (int)i, 0, 0, 0, vm->user);
     memset(vm->timers, 0, sizeof(vm->timers));
+#if FS_HAS_RECORD
+    memset(vm->obs_dirty, 0, sizeof(vm->obs_dirty));
+#endif
 }
 
 /* ---- names ---------------------------------------------------------------------- */
@@ -1046,6 +1073,7 @@ void fs_set_callbacks(fs_vm *vm, fs_emit_fn on_emit, fs_fault_fn on_fault, void 
 static void report_fault(fs_vm *vm, int code, int pc)
 {
     vm->faults++;
+    OBS(vm, fault, (vm, code, pc));
     if (vm->on_fault)
         vm->on_fault(vm, code, pc, vm->user);
 }
@@ -1227,7 +1255,8 @@ uint32_t fs_image_hash(const fs_vm *vm) { return vm && vm->loaded ? vm->image_ha
 /* Output: into memory (snapshots), counting only, or streamed to the record sink in
  * small pieces (so no frame-sized buffer is needed). */
 typedef struct {
-    fs_vm *vm;                  /* stream to vm->on_record; NULL: memory / count */
+    fs_vm *vm;                  /* stream to sink; NULL: memory / count */
+    fs_record_fn sink;          /* vm->on_record or vm->on_observe */
     uint8_t *mem;
     size_t cap, n;              /* n: bytes produced, also past cap */
     uint8_t chunk[32];
@@ -1243,7 +1272,7 @@ static void out_put(fs_out *o, const void *data, size_t len)
         if (o->vm) {
             o->chunk[o->c++] = p[i];
             if (o->c == (int)sizeof(o->chunk)) {
-                o->vm->on_record(o->vm, o->chunk, o->c, 0, o->vm->user);
+                o->sink(o->vm, o->chunk, o->c, 0, o->vm->user);
                 o->c = 0;
             }
         } else
@@ -1507,6 +1536,7 @@ int fs_restore(fs_vm *vm, const uint8_t *d, size_t len)
 #if FS_HAS_RECORD
     rec_keyframe(vm);                           /* a recording says where the run continues from */
 #endif
+    OBS(vm, header, (vm, 1));
     return FS_OK;
 }
 
@@ -1584,6 +1614,7 @@ static void rec_emit(fs_vm *vm, const rec_frame *f)
     n = o.n;
     memset(&o, 0, sizeof(o));
     o.vm = vm;
+    o.sink = vm->on_record;
     out_varint(&o, n);
     out_payload(&o, vm, f);
     vm->on_record(vm, o.chunk, o.c, 1, vm->user);
@@ -1604,6 +1635,7 @@ static void rec_keyframe(fs_vm *vm)
         memset(&o, 0, sizeof(o));
         if (pass) {
             o.vm = vm;
+            o.sink = vm->on_record;
             out_varint(&o, n);
         }
         out_byte(&o, TAG_KEYFRAME);
@@ -1663,6 +1695,30 @@ static void rec_simple(fs_vm *vm, int tag, int64_t num, int flush)
 void fs_record_flush(fs_vm *vm) { (void)vm; }
 #endif
 
+int fs_record_text(const uint8_t *data, int len, int end, int *in_frame, char *out)
+{
+    static const char hex[] = "0123456789abcdef";
+    int i, n = 0;
+    if (!out)
+        return 0;
+    if (in_frame && !*in_frame) {
+        memcpy(out, "#FS:", 4);
+        n = 4;
+        *in_frame = 1;
+    }
+    for (i = 0; data && i < len; i++) {
+        out[n++] = hex[data[i] >> 4];
+        out[n++] = hex[data[i] & 15];
+    }
+    if (end) {
+        out[n++] = '\n';
+        if (in_frame)
+            *in_frame = 0;
+    }
+    out[n] = 0;
+    return n;
+}
+
 void fs_set_record_sink(fs_vm *vm, fs_record_fn fn)
 {
 #if FS_HAS_RECORD
@@ -1685,6 +1741,7 @@ int fs_record_keyframe(fs_vm *vm)
 #if FS_HAS_RECORD
     rec_keyframe(vm);
 #endif
+    OBS(vm, header, (vm, 1));
     return FS_OK;
 }
 
@@ -1696,6 +1753,7 @@ void fs_start(fs_vm *vm)
     if (vm->n_states)
         vm->pending = 0;
     rec_simple(vm, TAG_START, 0, 1);
+    OBS(vm, header, (vm, 0));
 }
 
 /* record: a host input (fs_post); not for the VM's own events (raise_event, timers) */
@@ -1948,6 +2006,15 @@ static void begin(fs_vm *vm, int h, const fs_qentry *e)
     vm->nframes = 1;
     vm->pc = rd16(p + 6);
     vm->steps = 0;
+#if FS_HAS_RECORD
+    if (vm->obs_ops) {
+        fs_value a[FS_MAX_EVENT_ARGS];
+        int na = argc < FS_MAX_EVENT_ARGS ? argc : FS_MAX_EVENT_ARGS;
+        for (i = 0; i < na; i++)
+            a[i] = e ? qget(e, i) : fs_int(0);
+        OBS(vm, handler, (vm, h, a, na));
+    }
+#endif
 }
 
 #define OWNER_LEAVING (-2)      /* timer owner while its state is being left (see dispatch) */
@@ -2003,6 +2070,7 @@ static int dispatch(fs_vm *vm)
                     vm->timers[i].owner = OWNER_LEAVING;
         vm->state = vm->transition;
         vm->transition = -1;
+        OBS(vm, state, (vm));
         h = find_handler(vm, vm->state, EV_ENTER);
         if (h >= 0 && handler_state(vm, h) == vm->state)
             begin(vm, h, NULL);
@@ -2028,7 +2096,297 @@ static void finish(fs_vm *vm)
     vm->nframes = 0;
     vm->sp = 0;
     vm->in_exit = 0;
+    OBS(vm, flush, (vm));
 }
+
+/* ---- monitor mode: the observation stream (SPEC 10.5, flowscript/observe.py) ------------- */
+#if FS_HAS_RECORD
+#define OBS_VERSION 1
+enum { OBS_START = 16, OBS_KEYFRAME, OBS_STATE, OBS_GLOBALS, OBS_HANDLER, OBS_LOG, OBS_EMIT,
+       OBS_CALL, OBS_FAULT };
+#define OBS_RESULT_NONE    4
+#define OBS_RESULT_REFUSED 5
+
+typedef struct {
+    int tag;
+    int idx;                    /* HANDLER: handler, EMIT: event, CALL: extern */
+    const fs_value *vals;       /* arguments, log values */
+    int n;
+    int level;                  /* LOG */
+    const char *tmpl;           /* LOG */
+    uint16_t tlen;
+    int code;                   /* FAULT; CALL: the fault that refused the result (0: none) */
+    int pc;                     /* FAULT */
+    fs_value result;            /* CALL */
+} obs_frame;
+
+static void out_text(fs_out *o, const char *p, size_t n)
+{
+    out_varint(o, n);
+    if (n)
+        out_put(o, p, n);
+}
+
+static void out_cstr(fs_out *o, const char *p) { out_text(o, p ? p : "", p ? strlen(p) : 0); }
+
+/* a value with its type tag (values whose type the stream does not declare) */
+static void out_tagged(fs_out *o, const fs_vm *vm, fs_value v)
+{
+#if FS_HAS_STR
+    if (v.type == FS_CSTR) {
+        out_byte(o, FS_STR);
+        out_cstr(o, v.as.c);
+        return;
+    }
+#endif
+    out_byte(o, v.type);
+    out_value(o, vm, v.type, v);
+}
+
+/* the state and event of handler h ("" "" for none) */
+static void out_where(fs_out *o, const fs_vm *vm, int h)
+{
+    int st;
+    if (h < 0) {
+        out_varint(o, 0);
+        out_varint(o, 0);
+        return;
+    }
+    st = handler_state(vm, h);
+    out_cstr(o, st >= 0 ? fs_state_name(vm, st) : "");
+    out_cstr(o, fs_event_name(vm, rd16(vm->handlers_tab + 8 * h + 2)));
+}
+
+static void out_obs_header(fs_out *o, const fs_vm *vm)
+{
+    unsigned i;
+    out_byte(o, OBS_VERSION);
+    out_cstr(o, fs_program_name(vm));
+    out_varint(o, vm->prog_version);
+    out_le(o, vm->image_hash, 4);
+    out_varint(o, vm->n_globals);
+    for (i = 0; i < vm->n_globals; i++)
+        out_byte(o, vm->gtypes[i]);
+    out_cstr(o, vm->state >= 0 ? fs_state_name(vm, vm->state) : "");
+    for (i = 0; i < vm->n_globals; i++)
+        out_value(o, vm, vm->gtypes[i], gget(vm, (int)i));
+}
+
+static void obs_payload(fs_out *o, const fs_vm *vm, const obs_frame *f)
+{
+    int i;
+    out_byte(o, (unsigned)f->tag);
+    switch (f->tag) {
+    case OBS_START: case OBS_KEYFRAME: out_obs_header(o, vm); break;
+    case OBS_STATE: out_cstr(o, fs_state_name(vm, vm->state)); break;
+    case OBS_GLOBALS: {
+        unsigned k, n = 0;
+        for (k = 0; k < vm->n_globals; k++)
+            n += (vm->obs_dirty[k >> 3] >> (k & 7)) & 1u;
+        out_varint(o, n);
+        for (k = 0; k < vm->n_globals; k++)
+            if ((vm->obs_dirty[k >> 3] >> (k & 7)) & 1u) {
+                out_varint(o, k);
+                out_value(o, vm, vm->gtypes[k], gget(vm, (int)k));
+            }
+        break;
+    }
+    case OBS_HANDLER:
+        out_where(o, vm, f->idx);
+        out_varint(o, (uint64_t)f->n);
+        for (i = 0; i < f->n; i++)
+            out_tagged(o, vm, f->vals[i]);
+        break;
+    case OBS_LOG:
+        out_byte(o, (unsigned)f->level);
+        out_text(o, f->tmpl, f->tlen);
+        out_varint(o, (uint64_t)f->n);
+        for (i = 0; i < f->n; i++)
+            out_tagged(o, vm, f->vals[i]);
+        break;
+    case OBS_EMIT: case OBS_CALL:
+        out_cstr(o, f->tag == OBS_EMIT ? fs_event_name(vm, f->idx) : fs_extern_name(vm, f->idx));
+        out_varint(o, (uint64_t)f->n);
+        for (i = 0; i < f->n; i++)
+            out_tagged(o, vm, f->vals[i]);
+        if (f->tag == OBS_CALL) {
+            int ret = vm->externs_tab[8 * f->idx + 3];
+            if (f->code) {
+                out_byte(o, OBS_RESULT_REFUSED);
+                out_varint(o, (uint64_t)f->code);
+                /* a str that was too long / didn't fit is kept, as in XFAULT */
+                if ((f->code == FS_FAULT_STR_LONG || f->code == FS_FAULT_NO_STRINGS) && ret == FS_STR) {
+#if FS_HAS_STR
+                    if (f->result.type == FS_CSTR)
+                        out_cstr(o, f->result.as.c);
+                    else
+#endif
+                        out_value(o, vm, FS_STR, f->result);
+                }
+            } else if (ret == FS_NONE_TYPE) {
+                out_byte(o, OBS_RESULT_NONE);
+            } else {
+                out_tagged(o, vm, f->result);
+            }
+        }
+        break;
+    case OBS_FAULT:
+        out_varint(o, (uint64_t)f->code);
+        out_where(o, vm, vm->handler);
+        out_zig(o, f->pc);
+        break;
+    default: break;
+    }
+}
+
+static void obs_emit(fs_vm *vm, const obs_frame *f)
+{
+    fs_out o;
+    size_t n;
+    memset(&o, 0, sizeof(o));
+    obs_payload(&o, vm, f);                     /* count */
+    n = o.n;
+    memset(&o, 0, sizeof(o));
+    o.vm = vm;
+    o.sink = vm->on_observe;
+    out_varint(&o, n);
+    obs_payload(&o, vm, f);
+    vm->on_observe(vm, o.chunk, o.c, 1, vm->user);
+}
+
+static void obs_tag(fs_vm *vm, int tag)
+{
+    obs_frame f;
+    memset(&f, 0, sizeof(f));
+    f.tag = tag;
+    obs_emit(vm, &f);
+}
+
+static void obs_header(fs_vm *vm, int keyframe)
+{
+    memset(vm->obs_dirty, 0, sizeof(vm->obs_dirty));
+    obs_tag(vm, keyframe ? OBS_KEYFRAME : OBS_START);
+}
+
+static void obs_flush(fs_vm *vm)
+{
+    unsigned i, any = 0;
+    for (i = 0; i < (vm->n_globals + 7u) / 8u; i++)
+        any |= vm->obs_dirty[i];
+    if (!any)
+        return;
+    obs_tag(vm, OBS_GLOBALS);
+    memset(vm->obs_dirty, 0, sizeof(vm->obs_dirty));
+}
+
+static void obs_state(fs_vm *vm)
+{
+    obs_flush(vm);
+    obs_tag(vm, OBS_STATE);
+}
+
+static void obs_handler(fs_vm *vm, int h, const fs_value *args, int n)
+{
+    obs_frame f;
+    obs_flush(vm);
+    memset(&f, 0, sizeof(f));
+    f.tag = OBS_HANDLER;
+    f.idx = h;
+    f.vals = args;
+    f.n = n;
+    obs_emit(vm, &f);
+}
+
+/* a global is changed only if the value differs: floats bit for bit, strings byte for byte */
+static int obs_same(const fs_vm *vm, fs_value a, fs_value b)
+{
+    if (a.type != b.type)
+        return 0;
+    switch (a.type) {
+    case FS_INT: return a.as.i == b.as.i;
+#if FS_HAS_FLOAT
+    case FS_FLOAT: return memcmp(&a.as.f, &b.as.f, sizeof(double)) == 0;
+#endif
+#if FS_HAS_TIME
+    case FS_TIME: return a.as.t == b.as.t;
+#endif
+    case FS_STR: {
+        uint16_t la = 0, lb = 0;
+        const char *pa = fs_str(vm, a, &la), *pb = fs_str(vm, b, &lb);
+        return pa && pb && la == lb && memcmp(pa, pb, la) == 0;
+    }
+    default: return 0;
+    }
+}
+
+static void obs_store(fs_vm *vm, int i, fs_value v)
+{
+    if (!obs_same(vm, gget(vm, i), v))
+        vm->obs_dirty[i >> 3] |= (uint8_t)(1u << (i & 7));
+}
+
+static void obs_values(fs_vm *vm, int tag, int idx, const fs_value *args, int n)
+{
+    obs_frame f;
+    memset(&f, 0, sizeof(f));
+    f.tag = tag;
+    f.idx = idx;
+    f.vals = args;
+    f.n = n;
+    obs_emit(vm, &f);
+}
+
+static void obs_log(fs_vm *vm, int level, const char *t, uint16_t tl, const fs_value *args, int n)
+{
+    obs_frame f;
+    memset(&f, 0, sizeof(f));
+    f.tag = OBS_LOG;
+    f.level = level;
+    f.tmpl = t;
+    f.tlen = tl;
+    f.vals = args;
+    f.n = n;
+    obs_emit(vm, &f);
+}
+
+static void obs_call(fs_vm *vm, int ext, const fs_value *args, int n, fs_value result, int refused)
+{
+    obs_frame f;
+    memset(&f, 0, sizeof(f));
+    f.tag = OBS_CALL;
+    f.idx = ext;
+    f.vals = args;
+    f.n = n;
+    f.result = result;
+    f.code = refused;
+    obs_emit(vm, &f);
+}
+
+static void obs_fault(fs_vm *vm, int code, int pc)
+{
+    obs_frame f;
+    memset(&f, 0, sizeof(f));
+    f.tag = OBS_FAULT;
+    f.code = code;
+    f.pc = pc;
+    obs_emit(vm, &f);
+}
+
+static const obs_ops OBS_OPS = {
+    obs_header, obs_flush, obs_state, obs_handler, obs_store, obs_values, obs_log, obs_call, obs_fault
+};
+
+void fs_set_observe_sink(fs_vm *vm, fs_record_fn fn)
+{
+    if (vm) {
+        vm->on_observe = fn;
+        vm->obs_ops = fn ? &OBS_OPS : NULL;
+        memset(vm->obs_dirty, 0, sizeof(vm->obs_dirty));
+    }
+}
+#else
+void fs_set_observe_sink(fs_vm *vm, fs_record_fn fn) { (void)vm; (void)fn; }
+#endif
 
 /* ---- execution --------------------------------------------------------------------------- */
 /* Stack slot access; slots >= FS_STACK_SIZE are virtual int zeros (see fs_vm.sp). */
@@ -2468,6 +2826,7 @@ static int execute(fs_vm *vm)
         if (arg >= vm->n_globals)
             FAULT(FS_FAULT_BAD_OPCODE);
         POP(v);
+        OBS(vm, store, (vm, (int)arg, v));
         gset(vm, (int)arg, v);
         break;
     case OP_LOADL: {
@@ -2633,6 +2992,7 @@ static int execute(fs_vm *vm)
                 rec_emit(vm, &f);
             }
 #endif
+            OBS(vm, call, (vm, (int)arg, args, xargc, v, err));
             FAULT(err);
         }
 #if FS_HAS_RECORD
@@ -2645,6 +3005,7 @@ static int execute(fs_vm *vm)
             rec_emit(vm, &f);
         }
 #endif
+        OBS(vm, call, (vm, (int)arg, args, xargc, r, 0));
         vm->sp -= xargc;
         PUSH(r);
         break;
@@ -2693,6 +3054,7 @@ static int execute(fs_vm *vm)
             FAULT(err);
         for (i = 0; i < eargc; i++)
             copy[i] = args[i];    /* the callback may not see stack slots change */
+        OBS(vm, values, (vm, 22, (int)arg, copy, eargc));     /* OBS_EMIT */
         if (vm->on_emit)
             vm->on_emit(vm, (int)arg, copy, eargc, vm->user);
         /* queue-full is reported but does not abort the handler (as vm.py) */
@@ -2743,6 +3105,7 @@ static int execute(fs_vm *vm)
         args = arg_view(vm, n, tmp);
         if (!args)
             FAULT(FS_FAULT_STACK_OVERFLOW);
+        OBS(vm, log, (vm, op - OP_LOGD, t, tl, args, n));
         if (vm->on_log)
             vm->on_log(vm, op - OP_LOGD, t, tl, args, n, vm->user);
         vm->sp -= n;
@@ -2778,6 +3141,7 @@ int fs_step(fs_vm *vm)
             vm->q_head = vm->q_count = 0;
             vm->chain = 0;
             report_fault(vm, FS_FAULT_CHAIN, -1);
+            OBS(vm, flush, (vm));
             return FS_IDLE;
         }
         if (dispatch(vm)) {
@@ -2785,6 +3149,7 @@ int fs_step(fs_vm *vm)
             return FS_DISPATCHED;
         }
         vm->chain = 0;
+        OBS(vm, flush, (vm));
         return FS_IDLE;
     }
     return execute(vm);

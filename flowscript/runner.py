@@ -71,8 +71,9 @@ def show_args(args):
     return ",".join(V.show(a) for a in args)
 
 
-def run_scenario(prog, scenario_text, out, record=None):
-    """Run a scenario, writing the trace with out(line).  record: a sink for the recording."""
+def run_scenario(prog, scenario_text, out, record=None, observe=None):
+    """Run a scenario, writing the trace with out(line).  record: a sink for the recording,
+    observe: one for the observation stream (SPEC 10.5)."""
     stubs = {}
     clock = [0]
 
@@ -111,7 +112,8 @@ def run_scenario(prog, scenario_text, out, record=None):
     host_timers = any(c == "host_timers" for c, _a in cmds)
 
     vm = VM(prog, externs, on_emit=on_emit, on_fault=on_fault, on_log=on_log,
-            on_timer=on_timer if host_timers else None, clock=lambda vm: clock[0], record=record)
+            on_timer=on_timer if host_timers else None, clock=lambda vm: clock[0], record=record,
+            observe=observe)
     snap = [None]
     last_state = [None]
 
@@ -217,3 +219,44 @@ def replay_recording(prog, data, out, on_state=None):
     for i, v in enumerate(rp.vm.globals):
         out("global[%d] = %s" % (i, V.show(v)))
     return rp
+
+
+def monitor_trace(prog, frames, out, on_state=None):
+    """Print an observation stream (SPEC 10.5) as the trace lines it shows (state, call,
+    emit, log, fault; the final globals), as run_scenario does for the same run.
+    frames: an iterable of frames (bytes).  Timer lines are not observed."""
+    from .observe import Monitor, Refused
+    last = [None]
+
+    def state(name):
+        # the stream also reports re-entering the same state (goto_state to itself); a trace
+        # line is a change of state, as run_scenario prints it
+        if name != last[0]:
+            last[0] = name
+            out("state %s" % name)
+            if on_state:
+                on_state(name)
+
+    def joined(start):
+        last[0] = mon.state             # a keyframe (restore): the state it is in, no line
+
+    def call(name, args, result):
+        if result is None:
+            out("call %s(%s)" % (name, show_args(args)))
+        elif isinstance(result, Refused):
+            out("call %s(%s) -> %s" % (name, show_args(args),
+                                       V.show(result.value) if result.value is not None else "?"))
+        else:
+            out("call %s(%s) -> %s" % (name, show_args(args), V.show(result)))
+
+    mon = Monitor(prog, raw=True, on_state=state, on_call=call, on_start=joined,
+                  on_event=lambda name, args: out("emit %s(%s)" % (name, show_args(args))),
+                  on_log=lambda level, msg, template, values: out(
+                      "log %s %s" % (level, V.quote(msg.encode("utf-8", "surrogateescape")))),
+                  on_fault=lambda code, st, ev, pc: out("fault %d at %d" % (code, pc)))
+    for f in frames:
+        mon.feed(f)
+    for i, v in enumerate(mon.raw):
+        out("global[%d] = %s" % (i, V.show(v)))
+    return mon
+

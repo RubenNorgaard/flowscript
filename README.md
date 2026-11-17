@@ -18,7 +18,7 @@ model, so you can edit either one.
  └──────────────────────────────────┘       └──────────────────────────────┘
                  │ compile
                  ▼
- bytecode (.fsb) ──▶  C VM (firmware)   flowscript.c, no malloc, ~16 KB Thumb-2
+ bytecode (.fsb) ──▶  C VM (firmware)   flowscript.c, no malloc, ~17 KB Thumb-2
                  └─▶  Python VM          reference implementation + debugger
 ```
 
@@ -33,6 +33,7 @@ python3 -m flowscript fmt examples/gps_tracker.fs       # canonical formatting
 python3 -m flowscript mermaid examples/gps_tracker.fs   # Mermaid flowchart export
 python3 -m flowscript size examples/gps_tracker.fs      # where the bytes go + RAM needed
 python3 -m flowscript ast examples/gps_tracker.fs       # the visual model as JSON
+cat /dev/ttyACM0 | python3 -m flowscript view app.fs > run.log   # follow a device live (+ save)
 
 cd c && make && ./fsrun ../examples/gps_tracker.fsb ../examples/gps_tracker.scenario
 ```
@@ -104,22 +105,53 @@ other = flowscript.Machine(program, externs=...)
 other.restore(snap)                            # continues exactly where it was
 ```
 
-From a terminal, `flowscript replay FILE.fs REC` prints the trace a recording reproduces;
-`cat /dev/ttyUSB0 | flowscript replay FILE.fs - --svg live.svg` follows a device live and
-keeps an SVG of its state diagram. The formats are in SPEC section 10.
+A recording is tied to its image by the image's CRC-32, and a `-g` image (with names) is a
+different image from the stripped one. `Replay(program)` with a program compiled from
+source follows either: it takes the image the recording names. Given bytes, it replays
+exactly those, so give it the bytes the device loaded. The formats are in SPEC section 10.
 
-**Replay the exact image the device runs.** A recording is tied to its image by the
-image's CRC-32, and a `-g` image (with names) is a different image from the stripped one.
-`Replay` accepts START frames from either variant, but a KEYFRAME restores a snapshot,
-which is checked against the replay VM's own image. So if the device runs a `-g` image
-and the viewer compiled the source (stripped), every keyframe fails with "the snapshot
-belongs to another image", and a viewer that joined late never syncs. Give `Replay` the
-bytes the device loaded: its `.fsb`, or `program.to_bytes(debug=True)` when the firmware
-embeds a `-g` build (which also gives the viewer the names for `viewer.globals`).
-`flowscript replay FILE.fs` compiles the source stripped, so for a `-g` device add the
-image it runs: `flowscript replay FILE.fs REC --image DEVICE.fsb [--svg live.svg]`
-replays that image and uses the source only to draw the state diagram (with a warning if
-the image was not compiled from that source).
+### Following a device: `flowscript view`
+
+A device usually has one console, so the C VM's recording shares it with everything else:
+one `#FS:<hex>` line per frame (SPEC 10.4), written by `fs_record_text()` in the record
+sink (see *Embedding the C VM*). `flowscript view` reads that output from a pipe, so it
+needs no serial library, and shows the program live in the browser: the state diagram
+with the current state, every variable with a sparkline, log statements, faults, raised
+events, extern calls and the device's other console lines, with a timeline to go back to
+any point.
+
+```sh
+# the port, raw and without echo (stty and cat share one open port: macOS and Linux alike)
+(stty raw -echo; cat) < /dev/cu.usbmodem1 | flowscript view app.fs > run1.log
+
+flowscript view app.fs run1.log          # later: the same page, from the saved copy
+flowscript replay app.fs run1.log        # or the trace, as text
+```
+
+When stdout is redirected, `view` writes its input there as it arrives, with `#T:<ms>`
+lines giving the arrival time, so `> FILE` keeps a timestamped copy (`tee` keeps a raw
+one). A viewer that starts while the device runs joins at its next keyframe: call
+`fs_record_keyframe()` every few seconds. If the device runs bytecode that was not
+compiled from FILE.fs, the page says so (the image hashes differ); `--image DEVICE.fsb`
+replays that image and keeps FILE.fs for the diagram. Reading a binary recording works
+too, and `flowscript replay FILE.fs REC|-` reads both formats.
+
+**Monitor mode.** A recording replays the run, so the viewer needs the device's exact
+image: the same bytecode, from the same compiler. For watching a device that is more than
+needed. With `fs_set_observe_sink()` instead of (or besides) `fs_set_record_sink()` the VM
+streams what happens rather than its inputs (SPEC 10.5): state changes, the variables a
+handler changed, handlers run with their arguments, log statements, raised events,
+extern calls with their results, faults. `flowscript view` shows that directly: the
+source only names the variables (numbered in declaration order, so any compiler's build
+of it fits) and draws the diagrams. You lose what only a re-run can show (stepping,
+locals, timers); switch the sink back to a recording to debug.
+
+| | recording (debug) | observations (monitor) |
+|---|---|---|
+| the viewer needs | the device's exact image | the source (any compiler) |
+| shows | everything, re-run: also stepping, locals, timers | state, variables, handlers, logs, events, calls, faults |
+| C sink | `fs_set_record_sink` | `fs_set_observe_sink` |
+| Python | `Machine(record=...)`, `Replay` | `Machine(observe=...)`, `Monitor` |
 
 ### Upgrading scripts from 0.1
 
@@ -319,8 +351,18 @@ static void on_record(fs_vm *vm, const uint8_t *data, int len, int end, void *u)
     uart_write(data, len);                  /* end = 1: the frame is complete */
 }
 
+/* or on a console shared with other output, as '#FS:' lines for `flowscript view`: */
+static void on_record_text(fs_vm *vm, const uint8_t *data, int len, int end, void *u) {
+    static int in_frame;
+    char line[FS_RECORD_TEXT_MAX];
+    console_write(line, fs_record_text(data, len, end, &in_frame, line));
+}
+
 /* in logic_init, before fs_start(): */
-fs_set_record_sink(&vm, on_record);
+fs_set_record_sink(&vm, on_record);     /* or fs_set_observe_sink(&vm, on_record_text):
+                                           monitor mode, no image needed by the viewer */
+/* in the main loop, now and then while idle: where a viewer can join */
+fs_record_keyframe(&vm);
 
 /* before deep sleep, while idle: */
 static uint8_t snap[256];
@@ -369,6 +411,8 @@ pyproject.toml          the Python package (pip install flowscript-vm)
 flowscript/             Python toolchain
   api.py                host API: compile(), load(), Machine, Replay
   record.py             snapshots, recordings, replay (SPEC 10)
+  observe.py            monitor mode: observation streams, Monitor (SPEC 10.5)
+  transport.py          recordings as '#FS:' text lines on a shared console (SPEC 10.4)
   svg.py                SVG flowcharts and state diagrams (to_svg)
   lexer.py parser.py    source -> AST (= visual model, JSON)
   printer.py            AST -> canonical source
@@ -378,6 +422,7 @@ flowscript/             Python toolchain
   runner.py             scenario runner (canonical trace format)
   mermaid.py            Mermaid export
   debugger/             3-view web debugger (server + static UI)
+  view/                 flowscript view: follow a device live, or a saved run (server + page)
 c/                      C VM (flowscript.c/.h), fsrun CLI, Makefile
 examples/               example programs + scenarios
 tests/                  unit tests, round-trip tests, C/Python conformance, fuzzing
@@ -395,10 +440,10 @@ python3 c/codesize.py                     # VM code size for every switch combin
 cd c && make size                         # code size of the VM
 ```
 
-C VM footprint (default sizes): **about 16 KB** of code for Cortex-M4 (`-Os`, Thumb-2,
+C VM footprint (default sizes): **about 17 KB** of code for Cortex-M4 (`-Os`, Thumb-2,
 what a `--gc-sections` link keeps, measured with `c/codesize.py`; v1, ints only, was
 6.6 KB), plus the C library's double-precision routines (soft-float on a Cortex-M4) and
-`floor ceil sqrt exp log pow fmod`; no data/bss of its own; a `fs_vm` struct of 6,088
+`floor ceil sqrt exp log pow fmod`; no data/bss of its own; a `fs_vm` struct of 6,128
 bytes RAM on a 32-bit target with the default `FS_*` macros in `flowscript.h`. Most of
 that is headroom: see below. Build with `-ffp-contract=off` (fused multiply-add would
 change float results) and link `-lm`.
@@ -431,16 +476,18 @@ them should link with `-ffunction-sections -Wl,--gc-sections`, so they and, with
 
 | Switches | VM code (Cortex-M4 `-Os`) | with `FS_NO_RECORD` | RAM per stored value |
 |---|---|---|---|
-| none | 18.5 KB + soft-float and libm | 16.4 KB | 9 bytes |
-| `FS_NO_STR` | 16.2 KB + soft-float and libm | 14.3 KB | 9 bytes |
-| `FS_NO_TEXT` | 15.3 KB + soft-float and libm | 13.3 KB | 9 bytes |
-| `FS_NO_STR FS_NO_TEXT` (e.g. `pct_pid`) | 14.2 KB + soft-float and libm | 12.3 KB | 9 bytes |
-| `FS_NO_TIME` | 15.3 KB + soft-float and libm | 13.2 KB | 9 bytes |
-| `FS_NO_FLOAT` | 15.9 KB | 14.0 KB | 9 bytes |
-| `FS_NO_FLOAT FS_NO_TIME` | 11.8 KB | 9.9 KB | 5 bytes |
-| `FS_NO_FLOAT FS_NO_TIME FS_NO_STR FS_NO_TEXT` (e.g. the GPS tracker) | 10.7 KB | **8.8 KB**, needing only `memcpy memset memcmp strlen` | 5 bytes |
+| none | 19.0 KB + soft-float and libm | 16.6 KB | 9 bytes |
+| `FS_NO_STR` | 16.7 KB + soft-float and libm | 14.4 KB | 9 bytes |
+| `FS_NO_TEXT` | 15.8 KB + soft-float and libm | 13.4 KB | 9 bytes |
+| `FS_NO_STR FS_NO_TEXT` (e.g. `pct_pid`) | 14.7 KB + soft-float and libm | 12.4 KB | 9 bytes |
+| `FS_NO_TIME` | 15.7 KB + soft-float and libm | 13.3 KB | 9 bytes |
+| `FS_NO_FLOAT` | 16.4 KB | 14.1 KB | 9 bytes |
+| `FS_NO_FLOAT FS_NO_TIME` | 12.2 KB | 10.0 KB | 5 bytes |
+| `FS_NO_FLOAT FS_NO_TIME FS_NO_STR FS_NO_TEXT` (e.g. the GPS tracker) | 11.0 KB | **9.0 KB**, needing only `memcpy memset memcmp strlen` | 5 bytes |
 
-`python3 c/codesize.py` prints all 16 combinations. Every combination compiles
+Monitor mode (`fs_set_observe_sink`, SPEC 10.5) adds about 2.8 KB to the recording
+builds, and only when the firmware calls it. `python3 c/codesize.py` prints all 32
+combinations (`--observe`: with monitor mode). Every combination compiles
 warning-free (`make switches`), and the conformance test runs each program on four
 reduced builds, checking identical traces where the program is allowed and a refusal
 where it is not.
@@ -456,13 +503,13 @@ debugger's bytecode pane) shows the three budgets separately:
 * **RAM** (`sizeof(fs_vm)`): computed for the defaults and for the smallest `FS_*`
   settings this program runs with. Stack and call depth come from a worst-case analysis of
   the bytecode; the report prints ready-to-use `-D` build flags, including the feature
-  switches. For the GPS example that is 392 bytes instead of 6,088: it uses no floats,
+  switches. For the GPS example that is 400 bytes instead of 6,128: it uses no floats,
   times or run-time strings, so those switches apply, a stored value is 5 bytes and
   there are no string slots. These settings are also load-time limits, so size them
   for the largest program you plan to download. Recursion has no static bound and keeps
   the defaults.
 * **C VM code**: independent of the program, but set by the feature switches: about
-  18.5 KB with everything, 8.8 KB with the smallest set without recording (see the table above).
+  19.0 KB with everything, 9.0 KB with the smallest set without recording (see the table above).
 
 It also lists concrete savings: unused externs, functions, events, timers and globals,
 globals that could be constants, the cost of names, and the debug section (`-g`).

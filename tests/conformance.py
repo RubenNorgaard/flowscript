@@ -15,6 +15,8 @@ must be refused at load by the others.
 Recordings (SPEC 10): every run is also recorded; each C runner's recording must be
 byte-identical to the Python one, and replaying it (flowscript replay) must reproduce
 the run: the same trace lines from the program and the same final globals.
+Observation streams (SPEC 10.5, monitor mode) likewise: byte-identical to Python's, and
+shown by flowscript replay as the run's trace (less timer lines, which it does not carry).
 Exit status is non-zero on any mismatch.
 """
 
@@ -81,6 +83,29 @@ def check_recording(name, tag, fsb, crec, precording, pout):
     return True
 
 
+def check_observations(name, tag, fsb, cobs, pobservations, pout):
+    """The C observation stream equals Python's, and it shows the run's trace."""
+    with open(cobs, "rb") as f:
+        cobservations = f.read()
+    if cobservations != pobservations:
+        print("FAIL %s [%s]: the observation stream differs from Python's (%d vs %d bytes)"
+              % (name, tag, len(cobservations), len(pobservations)))
+        return False
+    rrc, rout, rerr = run([sys.executable, "-m", "flowscript", "replay", fsb, cobs])
+    live = pout.splitlines()
+    got = rout.splitlines()
+    n = len([l for l in got if l.startswith("global[")])
+    want = [l for l in live[:len(live) - n] if not l.startswith(HOST_LINES + ("timer ",))] + live[len(live) - n:]
+    if rrc != 0 or got != want:
+        print("FAIL %s [%s]: the observation stream does not show the run" % (name, tag))
+        sys.stdout.writelines(difflib.unified_diff([l + "\n" for l in want], [l + "\n" for l in got],
+                                                   "run", "monitor", n=2))
+        if rerr:
+            print(rerr)
+        return False
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-asan", action="store_true", help="skip the sanitizer build")
@@ -107,16 +132,21 @@ def main():
                 continue
             scen = base + ".scenario"
             extra = [scen] if os.path.exists(scen) else []
-            prec = os.path.join(tmp, "py.rec")
-            prc, pout, perr = run([sys.executable, "-m", "flowscript", "run", fsb] + extra + ["--record", prec])
+            prec, pobs = os.path.join(tmp, "py.rec"), os.path.join(tmp, "py.obs")
+            prc, pout, perr = run([sys.executable, "-m", "flowscript", "run", fsb] + extra +
+                                  ["--record", prec, "--observe", pobs])
             with open(prec, "rb") as f:
                 precording = f.read()
+            with open(pobs, "rb") as f:
+                pobservations = f.read()
             ok = True
             for runner in runners:
-                crec = os.path.join(tmp, "c.rec")
-                crc, cout, cerr = run([runner, "-r", crec, fsb] + extra)
+                crec, cobs = os.path.join(tmp, "c.rec"), os.path.join(tmp, "c.obs")
+                crc, cout, cerr = run([runner, "-r", crec, "-o", cobs, fsb] + extra)
                 tag = os.path.basename(runner)
                 if crc == 0 and not check_recording(name, tag, fsb, crec, precording, pout):
+                    ok = False
+                if crc == 0 and not check_observations(name, tag, fsb, cobs, pobservations, pout):
                     ok = False
                 if cout != pout or (prc == 0) != (crc == 0):
                     ok = False

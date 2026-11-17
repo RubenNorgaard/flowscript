@@ -336,6 +336,8 @@ struct fs_vm {
     fs_log_fn    on_log;        /* NULL: log statements do nothing           */
 #if FS_HAS_RECORD
     fs_record_fn on_record;     /* NULL: not recording                      */
+    fs_record_fn on_observe;    /* NULL: not observing (monitor mode)       */
+    const void  *obs_ops;       /* set by fs_set_observe_sink (internal)    */
 #endif
 #if FS_HAS_TIME
     fs_clock_fn  clock;         /* NULL: now() is 0                          */
@@ -372,6 +374,9 @@ struct fs_vm {
     fs_timer timers[FS_MAX_TIMERS];
     uint8_t  gtypes[FS_MAX_GLOBALS];    /* type tag of each global          */
     uint8_t  stypes[FS_STACK_SIZE];     /* type tag of each stack slot      */
+#if FS_HAS_RECORD
+    uint8_t  obs_dirty[(FS_MAX_GLOBALS + 7) / 8];  /* observing: globals changed, not sent yet */
+#endif
 #if FS_HAS_STR
     fs_strslot strs[FS_STR_SLOTS];
 #endif
@@ -429,11 +434,36 @@ int  fs_snapshot(const fs_vm *vm, uint8_t *buf, size_t size);
 int  fs_restore(fs_vm *vm, const uint8_t *data, size_t len);
 /* Record the VM's inputs (NULL: stop).  Kept across fs_load().  Set it before fs_start():
  * the START frame opens the recording.  fs_record_keyframe() adds a keyframe (session +
- * snapshot) where a viewer can join; FS_ERR_BUSY when not idle.  fs_record_flush() hands
+ * snapshot) where a viewer can join, to the recording and to the observation stream
+ * (fs_set_observe_sink); FS_ERR_BUSY when not idle.  fs_record_flush() hands
  * over the steps counted so far (call it before sending a packet). */
 void fs_set_record_sink(fs_vm *vm, fs_record_fn fn);
 int  fs_record_keyframe(fs_vm *vm);
 void fs_record_flush(fs_vm *vm);
+/* Text transport (SPEC 10.4): a recording on a console shared with other output, one
+ * "#FS:<hex>\n" line per frame, read by `flowscript view` / `flowscript replay`.  Call it
+ * from the record sink with the sink's arguments; it writes this piece as text into out
+ * ("#FS:" before a frame's first piece, "\n" after its last) and returns the number of
+ * characters (out is NUL terminated).  *in_frame carries the position from piece to
+ * piece: start it at 0.  out needs 2 * len + 6 bytes: FS_RECORD_TEXT_MAX for the VM's
+ * pieces.  Write each piece as it comes, as long as nothing else is written in between:
+ *
+ *   static void sink(fs_vm *vm, const uint8_t *d, int len, int end, void *user) {
+ *       static int in_frame;
+ *       char line[FS_RECORD_TEXT_MAX];
+ *       uart_write(line, fs_record_text(d, len, end, &in_frame, line));
+ *   }
+ */
+#define FS_RECORD_TEXT_MAX 70           /* pieces of at most 32 bytes */
+int  fs_record_text(const uint8_t *data, int len, int end, int *in_frame, char *out);
+/* Monitor mode (SPEC 10.5): instead of (or besides) the inputs, stream what the program
+ * does: state changes, the globals a handler changed, handlers run, log statements, raised
+ * events, extern calls and faults.  A viewer shows them without running anything, so it
+ * needs no copy of the image, only the source for names (any compiler's build of it).
+ * Same sink type and pieces as the recording (fs_record_text() works on them); set it
+ * before fs_start().  fs_record_keyframe() adds a full picture (state and every global)
+ * where a viewer can join.  NULL: stop.  Kept across fs_load(); nothing in FS_NO_RECORD. */
+void fs_set_observe_sink(fs_vm *vm, fs_record_fn fn);
 /* Where log statements go (NULL: nowhere).  Kept across fs_load(). */
 void fs_set_log_handler(fs_vm *vm, fs_log_fn fn);
 /* The message of a log statement: each '{}' replaced by its value (a str as itself,

@@ -8,14 +8,21 @@
   disasm   FILE.fs|FILE.fsb             print a disassembly
   fmt      FILE.fs [-w]                 print (or rewrite) in canonical format
   ast      FILE.fs                      print the visual model (AST JSON)
-  run      FILE.fs|FILE.fsb [SCENARIO] [--record OUT.rec]
-                                        run with stubbed externs, print trace (and record it)
+  run      FILE.fs|FILE.fsb [SCENARIO] [--record OUT.rec] [--observe OUT.obs]
+                                        run with stubbed externs, print trace (and record it,
+                                        or write the observation stream: monitor mode)
   replay   FILE.fs|FILE.fsb REC|- [--svg OUT.svg] [--image DEVICE.fsb]
                                         replay a recording (- : stream it from stdin, e.g. a
-                                        serial port) and print the trace; --svg redraws the
-                                        state diagram, current state highlighted, on changes;
-                                        --image replays the device's exact image (a -g build)
-                                        while FILE.fs draws the diagram
+                                        serial port; binary, or text with #FS: lines; a
+                                        recording or an observation stream) and print the
+                                        trace; --svg redraws the state diagram,
+                                        current state highlighted, on changes; --image
+                                        replays that image while FILE.fs draws the diagram
+  view     FILE.fs|FILE.fsb [INPUT|-] [--image DEVICE.fsb] [--port N] [--no-browser]
+                                        follow a device in the browser: state, variables,
+                                        logs, events, with a timeline.  Pipe its output in
+                                        (cat /dev/ttyACM0 | flowscript view app.fs > run.log
+                                        keeps a timestamped copy) or give a saved file
   mermaid  FILE.fs                      print a Mermaid flowchart
   migrate  FILE.fs [-w]                 rewrite a 0.1 program (any_state) for 0.2
   debug    FILE.fs [--port N]           start the 3-view web debugger
@@ -66,12 +73,22 @@ def main(argv=None):
     p.add_argument("file")
     p.add_argument("scenario", nargs="?")
     p.add_argument("--record", help="write the recording (inputs) to this file")
+    p.add_argument("--observe", help="write the observation stream (monitor mode, SPEC 10.5) to this file")
     p = sub.add_parser("replay")
     p.add_argument("file")
     p.add_argument("recording")
     p.add_argument("--svg", help="keep this SVG file showing the current state")
     p.add_argument("--image", help="the .fsb the device runs (e.g. a -g build): replay that image, "
                                    "and use FILE.fs only to draw --svg")
+    p = sub.add_parser("view")
+    p.add_argument("file")
+    p.add_argument("input", nargs="?", default="-",
+                   help="a saved device log / recording, a serial device, or - (stdin, the default)")
+    p.add_argument("--image", help="the .fsb the device runs, if it was not compiled from FILE.fs")
+    p.add_argument("--port", type=int, default=8643)
+    p.add_argument("--no-browser", action="store_true")
+    p.add_argument("--no-echo", action="store_true",
+                   help="don't copy the input to stdout (default: copy it when stdout is redirected)")
     p = sub.add_parser("migrate")
     p.add_argument("file")
     p.add_argument("-w", "--write", action="store_true")
@@ -127,13 +144,18 @@ def main(argv=None):
             if args.scenario:
                 with open(args.scenario) as f:
                     text = f.read()
-            sink = None
+            sink = osink = None
             if args.record:
                 rec = open(args.record, "wb")
                 sink = rec.write
-            run_scenario(prog, text, print, record=sink)
+            if args.observe:
+                obs = open(args.observe, "wb")
+                osink = obs.write
+            run_scenario(prog, text, print, record=sink, observe=osink)
             if args.record:
                 rec.close()
+            if args.observe:
+                obs.close()
         elif args.cmd == "replay":
             from .runner import replay_recording
             from .svg import to_svg
@@ -173,13 +195,27 @@ def main(argv=None):
                         return
                     yield b
 
+            import itertools
+            from .transport import recording_bytes
+            from .observe import is_observation
+            from .runner import monitor_trace
             out = lambda line: print(line, flush=True)
             on_state = redraw if args.svg else None
-            if args.recording == "-":
-                replay_recording(prog, chunks(sys.stdin.fileno()), out, on_state)
+            if args.recording == "-":           # binary or text (#FS: lines, SPEC 10.4)
+                frames = recording_bytes(chunks(sys.stdin.fileno()))
             else:
                 with open(args.recording, "rb") as f:
-                    replay_recording(prog, f.read(), out, on_state)
+                    frames = recording_bytes([f.read()])
+            first = next(frames, None)
+            frames = itertools.chain([first] if first else [], frames)
+            if first and is_observation(first):  # monitor mode (SPEC 10.5): shown, not re-run
+                monitor_trace(prog, frames, out, on_state)
+            else:
+                replay_recording(prog, frames, out, on_state)
+        elif args.cmd == "view":
+            from .view import serve
+            serve(args.file, args.input, image=args.image, port=args.port,
+                  open_browser=not args.no_browser, echo=False if args.no_echo else None)
         elif args.cmd == "migrate":
             from .migrate import migrate
             with open(args.file) as f:

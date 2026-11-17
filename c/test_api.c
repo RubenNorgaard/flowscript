@@ -61,6 +61,26 @@ static fs_value x_wrong(fs_vm *vm, const fs_value *args, int argc, void *user)
 /* recording sink: frames may come in pieces; check each frame's length prefix */
 static uint8_t rec_buf[4096];
 static int rec_len, rec_frames, rec_bad, rec_frame_start;
+static char rec_text[2 * sizeof(rec_buf) + 1024];
+static int rec_text_len;
+
+/* the text transport decoded: every line "#FS:<hex>", their bytes = the binary recording */
+static int text_matches_binary(void)
+{
+    int i = 0, o = 0, lines = 0;
+    while (i < rec_text_len) {
+        if (strncmp(rec_text + i, "#FS:", 4) != 0)
+            return 0;
+        for (i += 4; rec_text[i] != '\n'; i += 2) {
+            unsigned v;
+            if (i + 1 >= rec_text_len || sscanf(rec_text + i, "%2x", &v) != 1 || o >= rec_len || rec_buf[o++] != v)
+                return 0;
+        }
+        i++;
+        lines++;
+    }
+    return o == rec_len && lines == rec_frames;
+}
 static void x_record_sink(fs_vm *vm, const uint8_t *data, int len, int end, void *user)
 {
     (void)vm; (void)user;
@@ -70,6 +90,17 @@ static void x_record_sink(fs_vm *vm, const uint8_t *data, int len, int end, void
     }
     memcpy(rec_buf + rec_len, data, (size_t)len);
     rec_len += len;
+    {                                   /* the same pieces as text lines (SPEC 10.4) */
+        static int in_frame;
+        char line[FS_RECORD_TEXT_MAX];
+        int n = fs_record_text(data, len, end, &in_frame, line);
+        if (n > 2 * len + 5 || (int)strlen(line) != n || rec_text_len + n >= (int)sizeof(rec_text))
+            rec_bad++;
+        else {
+            memcpy(rec_text + rec_text_len, line, (size_t)n + 1);
+            rec_text_len += n;
+        }
+    }
     if (end) {                          /* the whole frame is in: varint length + that many bytes */
         int pos = rec_frame_start, shift = 0;
         unsigned n = 0;
@@ -349,6 +380,12 @@ int main(int argc, char **argv)
         fs_record_flush(&vm);
         /* reset, start, steps, post, steps(+result), keyframe, post, steps */
         CHECK(rec_bad == 0 && rec_frames >= 7 && rec_len > 100);
+        CHECK(text_matches_binary());
+        {                                                             /* no in_frame: no marker */
+            char out[FS_RECORD_TEXT_MAX];
+            const uint8_t b[2] = {0x01, 0xAB};
+            CHECK(fs_record_text(b, 2, 1, NULL, out) == 5 && strcmp(out, "01ab\n") == 0);
+        }
         fs_set_record_sink(&vm, NULL);
     }
 

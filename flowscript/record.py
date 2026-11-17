@@ -343,6 +343,7 @@ class Replay:
                 hashes.add(image_hash(program.to_bytes(debug=True)))
         self.prog = program
         self.hashes = hashes
+        self._source_prog = None if isinstance(program, Program) and program.image else program
         self.results = []            # pending extern results / clock reads, in order
         self.buf = b""
         self.started = False
@@ -400,6 +401,19 @@ class Replay:
             self.apply(body[0], body[1:])
         self.buf = self.buf[r.pos:]
 
+    def _use_image(self, h):
+        """A program compiled from source can be either image (stripped or -g): follow the one
+        the recording names, so its keyframes' snapshots (checked against the image's hash,
+        strings indexed into its string table) restore."""
+        from .bytecode import Program
+        for debug in (False, True):
+            image = self._source_prog.to_bytes(debug=debug)
+            if image_hash(image) == h:
+                self.vm.image_hash = h
+                self.vm.image_strings = Program.from_bytes(image).strings
+                self.vm._image = image
+                return
+
     def apply(self, tag, payload):
         from .vm import Fault as VMFault
         vm = self.vm
@@ -408,6 +422,8 @@ class Replay:
             h, flags = r.unpack("I"), r.byte()
             if h not in self.hashes:
                 raise ReplayError("the recording is of another image (hash %08x)" % h)
+            if h != vm.image_hash:
+                self._use_image(h)
             bits = r.take((len(vm.bound) + 7) // 8)
             for i in range(len(vm.bound)):
                 vm.bound[i] = self._stub(i) if bits[i // 8] >> (i % 8) & 1 else None

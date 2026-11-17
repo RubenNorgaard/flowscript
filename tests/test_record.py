@@ -213,6 +213,26 @@ class Recording(unittest.TestCase):
         with self.assertRaisesRegex(ReplayError, "another image"):
             Replay(self.p.to_bytes()).feed(b"".join(frames))
 
+    def test_source_viewer_follows_a_debug_device_at_keyframes(self):
+        """Replay(program) follows the image a recording names: a -g device's keyframes restore."""
+        for debug in (True, False):
+            frames, host = [], Host()
+            dev = host.machine(self.p.to_bytes(debug=debug), record=frames.append)
+            dev.start()
+            dev.send("go", 3, "ann")
+            dev.advance(200)
+            cut = len(frames)
+            dev.record_keyframe()
+            dev.advance(300)
+            dev.send("halt")
+            dev.record_flush()
+            for chunk in (b"".join(frames), b"".join(frames[cut:])):    # from the start, and late
+                v = Replay(self.p)
+                v.feed(chunk)
+                self.assertEqual(v.state, dev.state)
+                self.assertEqual(v.snapshot(), dev.snapshot())       # every global and timer
+                self.assertEqual(v["count"], 5)                       # names from the source
+
     def test_cli_replay_with_device_image(self):
         """flowscript replay FILE.fs REC --image DEVICE.fsb: a -g device, joined at a keyframe,
         with the state diagram drawn from the source."""
@@ -241,9 +261,9 @@ class Recording(unittest.TestCase):
             def replay(file, *extra):
                 return subprocess.run([sys.executable, "-m", "flowscript", "replay", file, rec] + list(extra),
                                       capture_output=True, text=True, env=env)
-            r = replay(src)                               # the source alone is compiled stripped
-            self.assertNotEqual(r.returncode, 0)
-            self.assertIn("another image", r.stderr)
+            r = replay(src, "--svg", svg)                 # the source alone follows the -g image too
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("global[1] = %d" % dev["count"], r.stdout)
             r = replay(src, "--image", fsb, "--svg", svg)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stderr, "")

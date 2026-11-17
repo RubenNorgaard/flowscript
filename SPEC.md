@@ -24,7 +24,9 @@ machine: only states handle events (`any_state` is gone, `on boot` lives in the 
 state), functions can return several results (`a, b = f(x)`), and a periodic timer
 restarted with the same period keeps running across transitions. v4 (this document)
 adds log statements (`warning "x is {x}"`, see 5.1), and snapshots, recordings and
-replay (section 10). Older images are rejected (format version 4).
+replay (section 10). Older images are rejected (format version 4). The 0.5 tools keep
+format 4 and add ways to follow a device: recordings as text lines on a shared console
+(10.4) and observation streams, monitor mode (10.5).
 
 ---
 
@@ -509,7 +511,7 @@ Header (32 bytes)
 
 Sections, in this order, immediately after the header:
   strings   n_strings × { u16 len; u8 bytes[len]; u8 0 }
-  globals   n_globals × { u8 type; 8 bytes }   initial value (see below)
+  globals   n_globals × { u8 type; 8 bytes }   initial value (see below), numbered as in 10.5
   externs   n_externs × { u16 name; u8 argc; u8 return type; u32 parameter types }
   events    n_events  × { u16 name; u8 argc; u8 reserved; u16 parameter types }
   states    n_states  × { u16 name }
@@ -696,3 +698,74 @@ KEYFRAME are skipped. A frame of another image, or a missing result, is an error
 
 A host input made from inside a callback (e.g. `fs_post` in an extern) is replayed just
 before the step it happened in; the outcome is the same.
+
+### 10.4 Text transport
+
+A device often has a single console, shared by boot messages, its own logs and the
+recording, and a serial terminal may alter raw bytes. The text transport carries a
+recording on such a console as lines (`\n`-terminated; a `\r` before the `\n` is ignored):
+
+| line | meaning |
+|---|---|
+| `#FS:` hex | one frame (10.2): its bytes in hex (either case), the varint length prefix included |
+| `#T:` decimal | the time the lines after it arrived, in ms since 1970-01-01T00:00:00Z (written by a viewer that saves the stream) |
+| anything else | console text, not part of the recording |
+
+* The `#FS:` marker may follow other text on the same line (output written into a
+  console line already begun); that text is console text.
+* A frame line whose hex is invalid, or whose length prefix does not match the bytes on
+  the line (a line cut short, or two run together), is damaged: a reader drops it and
+  goes on, and the replay rejoins at the next START or KEYFRAME.
+* A reader may accept binary recordings (10.2) on the same input: a stream is binary when
+  its first two frames (or all of it, when shorter) parse as frames with known tags.
+* `fs_record_text()` (C) and `flowscript.transport` (Python) write and read this format;
+  `flowscript replay` and `flowscript view` read either format.
+
+### 10.5 Observations (monitor mode)
+
+A recording carries a run's inputs, so a viewer must re-run them on the exact image. An
+**observation stream** carries what the program does, so a viewer only shows it: it needs
+no copy of the image, and the source names what it sees whichever compiler built the
+device's image. The VM writes it to an observe sink (`fs_set_observe_sink`,
+`Machine(observe=...)`), with or without a recording, in the frames of 10.2 (and the text
+transport of 10.4). Tags start at 16, so a reader tells the two streams apart by their
+first frame.
+
+**Numbering.** Globals are numbered in source order: first the top-level variables, then
+the variables of each state, states in source order (not the state table's order, where
+the initial state comes first). Every compiler numbers them so; a viewer gets the names by
+compiling the source and checks the stream's count and types against it.
+
+A *text* is a varint length and that many bytes. A *tagged value* is a `u8` type code and
+the value as in 10.2. Values of globals carry no tag: the header declares their types.
+
+| tag | frame | payload |
+|---|---|---|
+| 16 | START | header: `u8` version (1), text program name, varint program version, `u32` image hash (informational), varint n_globals, n_globals × `u8` type, text current state (empty: none), the globals' values |
+| 17 | KEYFRAME | as START: a full picture where a viewer can join |
+| 18 | STATE | text: the state just entered |
+| 19 | GLOBALS | varint n, n × { varint index, value } in increasing index order |
+| 20 | HANDLER | text state, text event (the handler's), varint n, n × tagged argument |
+| 21 | LOG | `u8` level, text template, varint n, n × tagged value |
+| 22 | EMIT | text event, varint n, n × tagged argument (`raise_event`) |
+| 23 | CALL | text extern, varint n, n × tagged argument, then the result: a tagged value; `4` (the extern returns nothing); or `5`, varint fault, and for fault 11/12 of a str extern the refused text |
+| 24 | FAULT | varint code, text state, text event (of the handler it aborted; empty outside one), zigzag pc |
+
+When they are written:
+
+* START at `start()`; KEYFRAME on `record_keyframe()` (idle only, as for a recording) and
+  `restore()`. Both clear the pending changes.
+* A global is *changed* when a store gives it a value that differs from the one it holds
+  (other type, or int/time value, float bits, str bytes); storing the same value is no
+  change. Changed globals are sent in one GLOBALS frame when a handler ends (normally, by
+  `goto_state` or by a fault), before a STATE or HANDLER frame, and when a step finds
+  nothing to do; nothing is sent if nothing changed. A global the host sets
+  (`set_global`) is compared the same way. `reset()` drops pending changes.
+* STATE when a dispatch enters a state, also the one it is in (`goto_state` to itself:
+  its `exit` and `enter` ran). HANDLER when a handler starts, with its arguments.
+* LOG, EMIT and FAULT where the VM calls the host's `on_log`, `on_emit` and `on_fault`
+  (just before). CALL when an extern returned and its result was accepted, or refused
+  (the FAULT follows).
+
+Timers, the event queue, locals and stepping are not observed: use a recording for those.
+

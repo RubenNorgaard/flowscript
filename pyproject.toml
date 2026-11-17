@@ -38,10 +38,11 @@ Specification = "https://github.com/RubenNorgaard/flowscript/blob/main/SPEC.md"
 flowscript = "flowscript.cli:main"
 
 [tool.setuptools]
-packages = ["flowscript", "flowscript.debugger", "flowscript.debugger.static"]
+packages = ["flowscript", "flowscript.debugger", "flowscript.debugger.static", "flowscript.view", "flowscript.view.static"]
 
 [tool.setuptools.package-data]
 "flowscript.debugger.static" = ["*.html", "*.js", "*.css"]
+"flowscript.view.static" = ["*.html"]
 
 [tool.setuptools.dynamic]
 version = { attr = "flowscript.__version__" }

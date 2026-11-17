@@ -25,6 +25,7 @@ SWITCHES = ["FS_NO_FLOAT", "FS_NO_TIME", "FS_NO_STR", "FS_NO_TEXT", "FS_NO_RECOR
 # host conveniences a device need not link: text helpers, and snapshots unless it uses them
 HOST_TEXT = {"fs_format", "fs_parse_float", "fs_parse_time", "fs_format_log"}
 SNAPSHOTS = {"fs_snapshot", "fs_restore", "fs_record_keyframe"}
+OBSERVE = {"fs_set_observe_sink"}              # monitor mode (SPEC 10.5): only if the host sets it
 
 
 def tool(name):
@@ -40,7 +41,7 @@ def build(flags, obj):
                           ["-c", os.path.join(HERE, "flowscript.c"), "-o", obj])
 
 
-def kept(obj, host_text, snapshots=False):
+def kept(obj, host_text, snapshots=False, observe=False):
     od = tool("llvm-objdump")
     sizes = {}                                      # section name -> size
     for line in subprocess.check_output([od, "-h", obj], text=True).splitlines():
@@ -56,7 +57,7 @@ def kept(obj, host_text, snapshots=False):
         bind, kind, sec, name = m.group(1), m.group(2), m.group(3), m.group(4)
         sym_sec.setdefault(name, sec)
         if bind == "g" and "F" in kind and (host_text or name not in HOST_TEXT) and \
-                (snapshots or name not in SNAPSHOTS):
+                (snapshots or name not in SNAPSHOTS) and (observe or name not in OBSERVE):
             roots.add(sec)
     refs, cur = {}, None
     for line in subprocess.check_output([od, "-r", obj], text=True).splitlines():
@@ -90,6 +91,8 @@ def main():
                     help="count fs_format/fs_parse_*/fs_format_log as used by the host")
     ap.add_argument("--snapshots", action="store_true",
                     help="count fs_snapshot/fs_restore/fs_record_keyframe as used by the host")
+    ap.add_argument("--observe", action="store_true",
+                    help="count monitor mode (fs_set_observe_sink) as used by the host")
     args = ap.parse_args()
     with tempfile.TemporaryDirectory() as tmp:
         obj = os.path.join(tmp, "vm.o")
@@ -97,7 +100,7 @@ def main():
         for n in range(len(SWITCHES) + 1):
             for combo in itertools.combinations(SWITCHES, n):
                 build(combo, obj)
-                rows.append((combo, kept(obj, args.host_text, args.snapshots)))
+                rows.append((combo, kept(obj, args.host_text, args.snapshots, args.observe)))
         for combo, size in rows:
             print("%6d  %s" % (size, " ".join(combo) or "(all features)"))
 

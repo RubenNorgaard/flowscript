@@ -24,13 +24,14 @@ from .compiler import compile_source, compile_ast
 from .mermaid import to_mermaid
 from .sizes import size_report, format_report
 from .vm import VM
+from .observe import Monitor
 
 __all__ = [
     # the host API
-    "compile", "load", "Machine", "Replay", "to_svg", "Program", "CompileError", "Diagnostic", "Fault",
+    "compile", "load", "Machine", "Replay", "Monitor", "to_svg", "Program", "CompileError", "Diagnostic", "Fault",
     # tools
     "migrate", "to_source", "to_mermaid", "size_report", "format_report", "disassemble", "disassemble_text",
     # lower level
     "FlowError", "parse", "parse_expression", "expr_to_str", "compile_source", "compile_ast", "VM",
 ]
-__version__ = "0.4.1"
+__version__ = "0.5.0"
